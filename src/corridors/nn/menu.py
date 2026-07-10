@@ -301,24 +301,28 @@ def nn_menu() -> None:
         table = Table(box=None, show_header=False, pad_edge=False)
         table.add_column(style="bold")
         table.add_column()
-        table.add_row("1", "Generate self-play data")
-        table.add_row("2", "Train a model")
-        table.add_row("3", "Round-robin tournament (Elo)")
-        table.add_row("4", "List / manage datasets")
-        table.add_row("5", "List / manage checkpoints")
-        table.add_row("6", "Back")
+        table.add_row("1", "AlphaZero pipeline")
+        table.add_row("2", "Generate classical self-play data")
+        table.add_row("3", "Train classical value net")
+        table.add_row("4", "Round-robin tournament (Elo)")
+        table.add_row("5", "List / manage datasets")
+        table.add_row("6", "List / manage checkpoints")
+        table.add_row("7", "Back")
         console.print(Panel(table, title="[bold]Neural network training[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6"], default="1")
+        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6", "7"], default="1")
         if choice == "1":
-            _generate_data()
+            from .az_menu import az_menu
+            az_menu()
         elif choice == "2":
-            _train_model()
+            _generate_data()
         elif choice == "3":
-            _tournament()
+            _train_model()
         elif choice == "4":
-            _manage_datasets()
+            _tournament()
         elif choice == "5":
+            _manage_datasets()
+        elif choice == "6":
             _manage_checkpoints()
         else:
             return
