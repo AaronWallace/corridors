@@ -94,18 +94,27 @@ def _selfplay() -> None:
     )
 
     t0 = time.monotonic()
-    total_positions = [0]
+    sp_wins = [0]
+    sp_draws = [0]
+    sp_plies = []
 
     def on_game(done, total, winner, ply, positions):
-        total_positions[0] = positions
+        sp_plies.append(ply)
+        if winner is None:
+            sp_draws[0] += 1
+        else:
+            sp_wins[0] += 1
         tag = f"P{winner}" if winner else "draw"
         elapsed = time.monotonic() - t0
         gps = done / elapsed if elapsed > 0 else 0
+        avg_ply = sum(sp_plies) / len(sp_plies)
         console.print(
             f"  [dim]game[/dim] {done:>5}/{total}  "
-            f"[dim]result[/dim] {tag:<5} "
+            f"{tag:<5} "
             f"[dim]ply[/dim] {ply:>3}  "
-            f"[dim]positions[/dim] {positions:>8,}  "
+            f"[dim]W[/dim] {sp_wins[0]} [dim]D[/dim] {sp_draws[0]}  "
+            f"[dim]avg ply[/dim] {avg_ply:.0f}  "
+            f"[dim]pos[/dim] {positions:>8,}  "
             f"[dim]{gps:.1f} g/s[/dim]"
         )
 
@@ -273,17 +282,23 @@ def _full_loop() -> None:
     device = resolve_device("auto")
     console.print(f"\n[dim]device: {device}, workers: {workers}[/dim]")
 
+    loop_t0 = time.monotonic()
+    cumulative_games = 0
+    cumulative_positions = 0
+    cumulative_wins = {1: 0, 2: 0}
+    cumulative_draws = 0
+
     try:
         for it in range(1, iterations + 1):
             console.print(f"\n[bold]═══ Iteration {it}/{iterations} ═══[/bold]")
 
             # --- Self-play ---
-            console.print(f"\n[dim]Self-play: {games_per_iter} games, {sims} sims[/dim]")
-
-            # Use latest checkpoint if it exists
             from .az_net import CHECKPOINT_ROOT
             checkpoint = ckpt_name if (
                 CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
+            using = checkpoint or "random init"
+            console.print(f"\n  [bold]Self-play[/bold] [dim]· {games_per_iter} games "
+                          f"· {sims} sims · {max_plies} max plies · net: {using}[/dim]")
 
             sp_config = SelfPlayConfig(
                 num_games=games_per_iter, simulations=sims, max_plies=max_plies,
@@ -291,14 +306,28 @@ def _full_loop() -> None:
             )
 
             t0 = time.monotonic()
+            sp_wins = {1: 0, 2: 0}
+            sp_draws = [0]
+            sp_plies = []
 
-            def on_game(done, total, winner, ply, positions, _t0=t0):
+            def on_game(done, total, winner, ply, positions, _t0=t0,
+                        _wins=sp_wins, _draws=sp_draws, _plies=sp_plies):
+                _plies.append(ply)
+                if winner is None:
+                    _draws[0] += 1
+                else:
+                    _wins[winner] = _wins.get(winner, 0) + 1
                 if done % max(1, total // 10) == 0 or done == total:
                     elapsed = time.monotonic() - _t0
                     gps = done / elapsed if elapsed > 0 else 0
+                    avg_ply = sum(_plies) / len(_plies) if _plies else 0
+                    w = _wins.get(1, 0) + _wins.get(2, 0)
                     console.print(
-                        f"    [dim]{done}/{total} games, "
-                        f"{positions:,} positions, {gps:.1f} g/s[/dim]"
+                        f"    [dim]{done:>5}/{total}  "
+                        f"W {w} D {_draws[0]}  "
+                        f"avg ply {avg_ply:.0f}  "
+                        f"{positions:>8,} pos  "
+                        f"{gps:.1f} g/s[/dim]"
                     )
 
             if workers <= 1:
@@ -309,7 +338,18 @@ def _full_loop() -> None:
                 states, policies, outcomes = run_selfplay(sp_config, on_game=on_game)
 
             sp_time = time.monotonic() - t0
-            console.print(f"  [dim]{len(states):,} positions in {sp_time:.0f}s[/dim]")
+            decisive = sp_wins.get(1, 0) + sp_wins.get(2, 0)
+            avg_ply = sum(sp_plies) / len(sp_plies) if sp_plies else 0
+            console.print(
+                f"  [dim]→ {len(states):,} positions in {sp_time:.0f}s  "
+                f"({decisive} decisive, {sp_draws[0]} draws, avg {avg_ply:.0f} ply)[/dim]"
+            )
+
+            cumulative_games += games_per_iter
+            cumulative_positions += len(states)
+            cumulative_wins[1] += sp_wins.get(1, 0)
+            cumulative_wins[2] += sp_wins.get(2, 0)
+            cumulative_draws += sp_draws[0]
 
             if len(states) == 0:
                 console.print("[yellow]no data generated, stopping.[/yellow]")
@@ -321,10 +361,12 @@ def _full_loop() -> None:
             save_training_data(run_name, states, policies, outcomes, existing)
 
             # --- Train ---
-            console.print(f"\n[dim]Training: {epochs_per_iter} epochs[/dim]")
             all_s, all_p, all_o = load_training_data(
                 run_name, max_iterations=max_data_iters if max_data_iters > 0 else 0)
-            console.print(f"  [dim]replay buffer: {len(all_s):,} positions[/dim]")
+            console.print(
+                f"\n  [bold]Training[/bold] [dim]· {epochs_per_iter} epochs "
+                f"· batch {batch_size} · replay buffer: {len(all_s):,} positions[/dim]"
+            )
 
             train_config = AZTrainConfig(
                 epochs=epochs_per_iter, batch_size=batch_size, lr=lr,
@@ -334,29 +376,47 @@ def _full_loop() -> None:
                 CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
 
             def on_epoch(e):
-                if e.is_best or e.epoch == e.epochs:
-                    star = " [green]*best*[/green]" if e.is_best else ""
-                    console.print(
-                        f"    [dim]epoch {e.epoch}/{e.epochs}  "
-                        f"loss {e.train_loss:.4f}  val {e.val_loss:.4f}  "
-                        f"π {e.policy_loss:.4f}  v {e.value_loss:.4f}[/dim]{star}"
-                    )
+                star = " [green]*best*[/green]" if e.is_best else ""
+                console.print(
+                    f"    [dim]epoch {e.epoch:>3}/{e.epochs}  "
+                    f"loss {e.train_loss:.4f}  "
+                    f"π {e.policy_loss:.4f}  v {e.value_loss:.4f}  "
+                    f"val {e.val_loss:.4f}  "
+                    f"lr {e.lr:.2e}  "
+                    f"{e.elapsed:.0f}s[/dim]{star}"
+                )
 
             res = train_az(all_s, all_p, all_o, train_config,
                            resume_from=resume, on_epoch=on_epoch)
             console.print(
-                f"  [dim]best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
-                f"({res['elapsed']:.0f}s)[/dim]"
+                f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
+                f"({res['elapsed']:.0f}s on {res['device']})[/dim]"
+            )
+
+            # Iteration summary
+            loop_elapsed = time.monotonic() - loop_t0
+            eta = loop_elapsed / it * (iterations - it) if it < iterations else 0
+            console.print(
+                f"\n  [dim]cumulative: {cumulative_games} games, "
+                f"{cumulative_positions:,} positions, "
+                f"{cumulative_wins[1]+cumulative_wins[2]} wins, "
+                f"{cumulative_draws} draws  ·  "
+                f"elapsed {loop_elapsed:.0f}s  ·  "
+                f"ETA {eta:.0f}s[/dim]"
             )
 
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]loop interrupted — last best checkpoint is saved.[/dim]")
         return
 
+    loop_elapsed = time.monotonic() - loop_t0
     console.print(Panel(
         Text.assemble(
             ("checkpoint ", "dim"), (ckpt_name, STYLE_HINT),
             ("   iterations ", "dim"), (f"{iterations}", "white"),
+            ("   games ", "dim"), (f"{cumulative_games}", "white"),
+            ("   positions ", "dim"), (f"{cumulative_positions:,}", "white"),
+            ("   ", "dim"), (f"{loop_elapsed:.0f}s total", "white"),
         ),
         title="[bold]Training loop complete[/bold]", border_style=STYLE_GRID,
     ))
