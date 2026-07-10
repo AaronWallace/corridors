@@ -5,19 +5,31 @@ set -euo pipefail
 # Installs dependencies and verifies the install.
 # Skips venv creation when running as root (e.g. inside a container).
 
-PYTHON="${PYTHON:-python3}"
-
 echo "=== Corridors setup ==="
 
-# Find Python
-if ! command -v "$PYTHON" &>/dev/null; then
-    echo "ERROR: $PYTHON not found. Install Python 3.10+ and re-run."
-    echo "  You can also set PYTHON=python3.13 ./setup.sh"
+# Find a suitable Python (3.10+). Check explicit $PYTHON, then common names.
+_find_python() {
+    for candidate in "${PYTHON:-}" python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+        [ -z "$candidate" ] && continue
+        if command -v "$candidate" &>/dev/null; then
+            local ver
+            ver=$("$candidate" -c 'import sys; v=sys.version_info; print(v.major*100+v.minor)' 2>/dev/null) || continue
+            if [ "$ver" -ge 310 ]; then
+                echo "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+PYTHON=$(_find_python) || {
+    echo "ERROR: Python 3.10+ not found. Install it or set PYTHON=/path/to/python3.13"
     exit 1
-fi
+}
 
 PY_VERSION=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-echo "Using Python $PY_VERSION"
+echo "Using $PYTHON ($PY_VERSION)"
 
 # Venv — skip if already in one or running as root (containers)
 if [ -z "${VIRTUAL_ENV:-}" ] && [ "$(id -u)" -ne 0 ]; then
