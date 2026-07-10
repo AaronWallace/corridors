@@ -1,0 +1,195 @@
+"""Multiprocess self-play workers for Corridors.
+
+Each worker process plays complete games independently and reports progress to
+the parent over a multiprocessing Queue. Workers share the persistent SQLite TT
+(WAL mode + busy_timeout make concurrent writers safe).
+
+Message protocol (tuples, first element is the kind):
+
+    ("move", wid, game_num, state, board, move, turn, score, elapsed, nodes, depth)
+    ("game_start", wid, game_num, p1_col, p2_col)
+    ("game_end", wid, game_num, winner, plies, game_time, game_nodes, think_time)
+    ("done", wid)
+    ("error", wid, repr_of_exception)
+
+All payloads are plain picklable values (State/Board are frozen dataclasses of
+tuples/frozensets).
+"""
+
+from __future__ import annotations
+
+import random
+import time
+from dataclasses import dataclass
+from typing import List, Optional
+
+from . import solver
+from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, blocked_mask_for, shortest_dist
+
+
+@dataclass(frozen=True)
+class WorkerConfig:
+    worker_id: int
+    num_games: int
+    starts: str          # "fixed" | "random"
+    p1_col: int
+    p2_col: int
+    depth: int
+    time_limit: float
+    tiebreak_epsilon: int
+    max_plies: int
+    tt_path: Optional[str]
+    seed: int
+    report_moves: bool   # False lets high-worker-count runs skip per-move traffic
+    record_dataset: Optional[str] = None   # dataset name; records training data when set
+    record_shard_index: int = 0            # this worker's shard number
+
+
+NO_PROGRESS_WINDOW = 25
+
+
+def _draw_by_no_progress(prev_states: List[State], board) -> bool:
+    if len(prev_states) <= NO_PROGRESS_WINDOW:
+        return False
+    baseline = prev_states[-NO_PROGRESS_WINDOW - 1]
+    latest = prev_states[-1]
+    m0 = blocked_mask_for(baseline.walls)
+    m1 = blocked_mask_for(latest.walls)
+    d1b = shortest_dist(baseline.p1, board.p1_goal, m0) or 10_000
+    d1a = shortest_dist(latest.p1, board.p1_goal, m1) or 10_000
+    d2b = shortest_dist(baseline.p2, board.p2_goal, m0) or 10_000
+    d2a = shortest_dist(latest.p2, board.p2_goal, m1) or 10_000
+    return d1a >= d1b and d2a >= d2b
+
+
+def run_worker(cfg: WorkerConfig, queue) -> None:
+    """Entry point for a worker process. Plays cfg.num_games games.
+
+    When cfg.record_dataset is set, every non-terminal position is recorded as
+    (encoded_state, outcome_for_mover, normalized_tt_score) and written to this
+    worker's own shard NPZ at the end (also flushed on interrupt).
+    """
+    rng = random.Random(cfg.seed)
+    tt = None
+    rec_tensors: list = []
+    rec_turns: list = []       # side to move at each recorded position
+    rec_scores: list = []      # normalized search score (mover's perspective)
+    rec_outcomes: list = []    # filled at game end
+    games_recorded = 0
+    if cfg.record_dataset:
+        import numpy as np
+        from .nn import encoding
+
+    shard_flushed = False
+
+    def _flush_shard() -> None:
+        nonlocal shard_flushed
+        if shard_flushed or not cfg.record_dataset or not rec_tensors:
+            return
+        import numpy as np
+        from .nn import datasets
+        datasets.write_shard(
+            cfg.record_dataset, cfg.record_shard_index,
+            np.stack(rec_tensors),
+            np.asarray(rec_outcomes, dtype=np.int8),
+            np.asarray(rec_scores, dtype=np.float32),
+        )
+        shard_flushed = True
+        queue.put(("shard", cfg.worker_id, cfg.record_shard_index,
+                   len(rec_tensors), games_recorded))
+
+    try:
+        if cfg.tt_path:
+            tt = solver.TT(sqlite_path=cfg.tt_path)
+        for game_num in range(1, cfg.num_games + 1):
+            if cfg.starts == "random":
+                p1_col = rng.randint(0, NCOLS - 1)
+                p2_col = rng.randint(0, NCOLS - 1)
+            else:
+                p1_col = cfg.p1_col
+                p2_col = cfg.p2_col
+            board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+            queue.put(("game_start", cfg.worker_id, game_num, p1_col, p2_col))
+
+            states_seen: List[State] = [state]
+            game_t0 = time.monotonic()
+            winner: Optional[int] = None
+            plies = 0
+            game_nodes = 0
+            think_time = 0.0
+            while True:
+                w = state.winner(board)
+                if w is not None:
+                    winner = w
+                    break
+                if plies >= cfg.max_plies or _draw_by_no_progress(states_seen, board):
+                    winner = None
+                    break
+
+                tl = cfg.time_limit if cfg.time_limit > 0 else None
+                mover = state.turn
+                mv, score, stats, _pv = solver.best_move(
+                    state, board,
+                    max_depth=cfg.depth, time_limit=tl,
+                    tiebreak_epsilon=cfg.tiebreak_epsilon,
+                    tt=tt, verbose=False,
+                    flush_on_exit=False,  # batch TT writes per game, not per move
+                )
+                if cfg.record_dataset:
+                    rec_tensors.append(encoding.encode_state(state, board))
+                    rec_turns.append(mover)
+                    rec_scores.append(encoding.normalize_score(score))
+                state = apply_move(state, mv)
+                states_seen.append(state)
+                plies += 1
+                game_nodes += stats.nodes
+                think_time += stats.elapsed
+                if cfg.report_moves:
+                    queue.put((
+                        "move", cfg.worker_id, game_num, state, board, mv,
+                        mover, score, stats.elapsed, stats.nodes, stats.max_depth,
+                    ))
+
+            if tt is not None:
+                try:
+                    tt.flush()
+                except Exception:
+                    pass
+            if cfg.record_dataset:
+                # Back-fill outcomes for this game's positions (mover perspective).
+                new_positions = len(rec_turns) - len(rec_outcomes)
+                for t in rec_turns[-new_positions:] if new_positions else []:
+                    rec_outcomes.append(encoding.outcome_for_mover(winner, t))
+                games_recorded += 1
+            game_time = time.monotonic() - game_t0
+            queue.put(("game_end", cfg.worker_id, game_num, winner, plies, game_time,
+                       game_nodes, think_time))
+        _flush_shard()
+        queue.put(("done", cfg.worker_id))
+    except KeyboardInterrupt:
+        # Drop the in-flight game's unlabelled positions, keep completed games.
+        del rec_tensors[len(rec_outcomes):]
+        del rec_scores[len(rec_outcomes):]
+    except Exception as e:  # surface crashes to the parent instead of dying silently
+        del rec_tensors[len(rec_outcomes):]
+        del rec_scores[len(rec_outcomes):]
+        try:
+            queue.put(("error", cfg.worker_id, repr(e)))
+        except Exception:
+            pass
+    finally:
+        try:
+            _flush_shard()
+        except Exception:
+            pass
+        if tt is not None:
+            try:
+                tt.close()
+            except Exception:
+                pass
+
+
+def split_games(total: int, workers: int) -> List[int]:
+    """Distribute total games across workers as evenly as possible."""
+    base, extra = divmod(total, workers)
+    return [base + (1 if i < extra else 0) for i in range(workers)]

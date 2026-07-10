@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Corridors runtime state
+corridors.json
+corridors_tt.sqlite3
+corridors_tt.sqlite3-journal
+corridors_tt.sqlite3-wal
+corridors_tt.sqlite3-shm
+
+# NN artifacts (datasets and checkpoints are large and regenerable)
+nn_data/
+nn_checkpoints/
+
+# Claude Code local settings
+.claude/settings.local.json

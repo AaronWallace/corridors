@@ -1,0 +1,21 @@
+[project]
+name = "corridors"
+version = "0.1.0"
+description = "Quoridor-family board game with alpha-beta solver, playable in the console."
+requires-python = ">=3.10"
+dependencies = ["rich>=13", "numpy>=1.26", "safetensors>=0.4"]
+
+[project.optional-dependencies]
+# torch install is platform-specific; on CUDA machines prefer:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+nn = ["torch>=2.9"]
+
+[project.scripts]
+corridors = "corridors.play:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
