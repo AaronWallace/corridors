@@ -7,13 +7,12 @@ A Quoridor-family board game engine with an alpha-beta solver and neural network
 ```bash
 git clone https://github.com/AaronWallace/corridors.git
 cd corridors
-chmod +x setup.sh
+chmod +x setup.sh corridors.sh
 ./setup.sh
-source .venv/bin/activate
-python -m corridors
+./corridors.sh
 ```
 
-The setup script creates a venv, installs dependencies, detects NVIDIA GPUs and installs PyTorch+CUDA automatically, then verifies the install.
+The setup script installs dependencies, detects NVIDIA GPUs and installs PyTorch+CUDA automatically, then verifies the install. It creates a venv when appropriate (skips it when running as root in a container).
 
 On Windows, use the PowerShell launcher instead:
 
