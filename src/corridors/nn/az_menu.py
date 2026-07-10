@@ -62,6 +62,7 @@ def _selfplay() -> None:
     console.print("\n[bold]AlphaZero self-play[/bold]")
     num_games = _prompt_int("Number of games", 50, 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
+    max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
     ncpu = os.cpu_count() or 4
     default_workers = max(2, ncpu - 2)
     workers = _prompt_int(f"Workers [1-{ncpu}]", default_workers, 1, ncpu)
@@ -86,6 +87,7 @@ def _selfplay() -> None:
     config = SelfPlayConfig(
         num_games=num_games,
         simulations=sims,
+        max_plies=max_plies,
         workers=workers,
         checkpoint=checkpoint,
         device="auto",
@@ -257,6 +259,7 @@ def _full_loop() -> None:
     iterations = _prompt_int("Number of iterations", 5, 1, 1000)
     games_per_iter = _prompt_int("Games per iteration", 50, 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
+    max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
     epochs_per_iter = _prompt_int("Training epochs per iteration", 10, 1, 1000)
     batch_size = _prompt_int("Batch size", 256, 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
@@ -283,8 +286,8 @@ def _full_loop() -> None:
                 CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
 
             sp_config = SelfPlayConfig(
-                num_games=games_per_iter, simulations=sims, workers=workers,
-                checkpoint=checkpoint, device="auto",
+                num_games=games_per_iter, simulations=sims, max_plies=max_plies,
+                workers=workers, checkpoint=checkpoint, device="auto",
             )
 
             t0 = time.monotonic()
