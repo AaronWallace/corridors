@@ -30,15 +30,15 @@ if [ -z "${VIRTUAL_ENV:-}" ] && [ "$(id -u)" -ne 0 ]; then
     source "$VENV_DIR/bin/activate"
 fi
 
-# Install base dependencies
+# Install base dependencies (use $PYTHON -m pip to match the right interpreter)
 echo "Installing dependencies..."
-pip install --upgrade pip -q
-pip install -e . -q
+"$PYTHON" -m pip install --upgrade pip -q
+"$PYTHON" -m pip install -e . -q
 
 # Install PyTorch with CUDA if nvidia-smi is available
 if command -v nvidia-smi &>/dev/null; then
     echo "NVIDIA GPU detected — installing PyTorch with CUDA..."
-    pip install torch --index-url https://download.pytorch.org/whl/cu126 -q
+    "$PYTHON" -m pip install torch --index-url https://download.pytorch.org/whl/cu126 -q
     "$PYTHON" -c 'import torch; print(f"  PyTorch CUDA: {torch.cuda.is_available()}")'
 else
     echo "No NVIDIA GPU detected — skipping PyTorch (install manually if needed)."
