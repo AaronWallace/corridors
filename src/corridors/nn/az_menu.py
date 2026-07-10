@@ -5,8 +5,10 @@ Full loop: self-play → train → repeat. Or run each step individually.
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 from rich import box
@@ -17,6 +19,19 @@ from rich.text import Text
 
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+CHECKPOINT_ROOT = _PROJECT_ROOT / "nn_checkpoints"
+
+
+def _read_meta(name: str) -> dict:
+    p = CHECKPOINT_ROOT / (name + ".meta.json") if not name.endswith(".meta.json") else CHECKPOINT_ROOT / name
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def _console():
@@ -57,7 +72,7 @@ def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
 def _selfplay() -> None:
     console = _console()
     from .az_selfplay import SelfPlayConfig, auto_workers, resolve_device
-    from .az_net import CHECKPOINT_ROOT
+
 
     console.print("\n[bold]AlphaZero self-play[/bold]")
     num_games = _prompt_int("Number of games", 50, 1, 100_000)
@@ -157,8 +172,7 @@ def _selfplay() -> None:
 
 
 def _is_az_checkpoint(name: str) -> bool:
-    from .az_net import read_meta
-    meta = read_meta(name)
+    meta = _read_meta(name)
     return meta.get("arch") == "az"
 
 
@@ -209,7 +223,7 @@ def _train() -> None:
 
     # Resume from existing?
     resume = ""
-    from .az_net import CHECKPOINT_ROOT
+
     if (CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists():
         if Confirm.ask(f"[dim]resume from existing '{ckpt_name}'?[/dim]", default=True):
             resume = ckpt_name
@@ -293,7 +307,7 @@ def _full_loop() -> None:
             console.print(f"\n[bold]═══ Iteration {it}/{iterations} ═══[/bold]")
 
             # --- Self-play ---
-            from .az_net import CHECKPOINT_ROOT
+        
             checkpoint = ckpt_name if (
                 CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
             using = checkpoint or "random init"

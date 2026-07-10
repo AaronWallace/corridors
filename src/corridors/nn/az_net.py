@@ -2,7 +2,7 @@
 
 Architecture: stem conv (9→ch) → N residual blocks → two heads:
   - Policy head: conv 1×1 → BN → ReLU → flatten → FC → 227 logits
-  - Value head:  conv 1×1 → BN → ReLU → GAP → FC → FC → tanh scalar
+  - Value head:  conv 1×1 → BN → ReLU → flatten → FC → FC → tanh scalar
 
 The policy head outputs raw logits; masking + softmax happen outside.
 """
