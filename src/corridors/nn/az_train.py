@@ -87,7 +87,7 @@ def load_training_data(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Load self-play data. If max_iterations > 0, only load the most recent N."""
     d = AZ_DATA_ROOT / name
-    files = sorted(d.glob("iter_*.npz"))
+    files = sorted(f for f in d.glob("*.npz") if not f.name.startswith("."))
     if not files:
         raise FileNotFoundError(f"no training data in {d}")
     if max_iterations > 0:

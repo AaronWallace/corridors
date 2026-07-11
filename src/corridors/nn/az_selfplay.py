@@ -29,6 +29,74 @@ from .encoding import NROWS, NUM_PLANES, encode_state
 # Sentinel values for the inference queue
 _SHUTDOWN = None
 _BATCH_TIMEOUT = 0.005  # 5ms — wait this long to fill a batch
+SHARD_EVERY = 25  # flush to disk every N games
+
+
+class _ShardWriter:
+    """Accumulates game data and flushes shards to disk periodically."""
+
+    def __init__(self, save_dir: Optional[str], flush_every: int = SHARD_EVERY) -> None:
+        self.save_dir = save_dir
+        self.flush_every = flush_every
+        self._states: List[np.ndarray] = []
+        self._policies: List[np.ndarray] = []
+        self._outcomes: List[np.ndarray] = []
+        self._games_since_flush = 0
+        self._shard_idx = 0
+        self._total_positions = 0
+
+        if save_dir:
+            from pathlib import Path
+            d = Path(save_dir)
+            d.mkdir(parents=True, exist_ok=True)
+            existing = sorted(d.glob("shard_*.npz"))
+            if existing:
+                import re
+                nums = [int(re.search(r"shard_(\d+)", f.stem).group(1))
+                        for f in existing if re.search(r"shard_(\d+)", f.stem)]
+                self._shard_idx = max(nums) + 1 if nums else 0
+
+    def add_game(self, states: np.ndarray, policies: np.ndarray,
+                 outcomes: np.ndarray) -> None:
+        self._states.append(states)
+        self._policies.append(policies)
+        self._outcomes.append(outcomes)
+        self._total_positions += len(states)
+        self._games_since_flush += 1
+        if self.save_dir and self._games_since_flush >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.save_dir or not self._states:
+            return
+        from pathlib import Path
+        s = np.concatenate(self._states)
+        p = np.concatenate(self._policies)
+        o = np.concatenate(self._outcomes)
+        path = Path(self.save_dir) / f"shard_{self._shard_idx:04d}.npz"
+        tmp = path.with_name(f".tmp_{path.name}")
+        np.savez_compressed(tmp, states=s, policies=p, outcomes=o)
+        import os as _os
+        _os.replace(tmp, path)
+        self._shard_idx += 1
+        self._states.clear()
+        self._policies.clear()
+        self._outcomes.clear()
+        self._games_since_flush = 0
+
+    def get_all(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return any unflushed data (plus empty arrays if everything was flushed)."""
+        if not self._states:
+            return (np.zeros((0, NUM_PLANES, NROWS, NCOLS), dtype=np.float32),
+                    np.zeros((0, NUM_ACTIONS), dtype=np.float32),
+                    np.zeros((0,), dtype=np.float32))
+        return (np.concatenate(self._states),
+                np.concatenate(self._policies),
+                np.concatenate(self._outcomes))
+
+    @property
+    def total_positions(self) -> int:
+        return self._total_positions
 
 
 @dataclass
@@ -231,11 +299,13 @@ def run_selfplay(
     config: SelfPlayConfig,
     on_game: Optional[Callable[[int, int, Optional[int], int, int], None]] = None,
     on_status: Optional[Callable[[str], None]] = None,
+    save_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run self-play games. Returns (states, policies, outcomes) arrays.
 
     on_game(done, total, winner, ply, positions): called after each game completes.
     on_status(msg): called with status updates.
+    save_dir: if set, flush shards to disk every 25 games (crash-safe).
 
     Returns concatenated arrays ready for training:
       states:   (N, 9, 11, 9) float32
@@ -284,47 +354,40 @@ def run_selfplay(
         workers.append(w)
 
     # Collect results
-    all_states = []
-    all_policies = []
-    all_outcomes = []
+    writer = _ShardWriter(save_dir)
     done_count = 0
     workers_done = 0
-    total_positions = 0
     active_workers = sum(1 for g in games_per if g > 0)
 
-    while workers_done < active_workers:
-        item = result_queue.get()
-        if item[0] == "done":
-            workers_done += 1
-            continue
+    try:
+        while workers_done < active_workers:
+            item = result_queue.get()
+            if item[0] == "done":
+                workers_done += 1
+                continue
 
-        wid, game_num, states, policies, outcomes, winner, ply = item
-        all_states.append(states)
-        all_policies.append(policies)
-        all_outcomes.append(outcomes)
-        done_count += 1
-        total_positions += len(states)
+            wid, game_num, states, policies, outcomes, winner, ply = item
+            writer.add_game(states, policies, outcomes)
+            done_count += 1
 
-        if on_game:
-            on_game(done_count, config.num_games, winner, ply, total_positions)
+            if on_game:
+                on_game(done_count, config.num_games, winner, ply, writer.total_positions)
+    finally:
+        writer.flush()
 
     # Wait for processes
     server.join(timeout=10)
     for w in workers:
         w.join(timeout=10)
 
-    if not all_states:
-        return (np.zeros((0, NUM_PLANES, NROWS, NCOLS), dtype=np.float32),
-                np.zeros((0, NUM_ACTIONS), dtype=np.float32),
-                np.zeros((0,), dtype=np.float32))
-
-    return np.concatenate(all_states), np.concatenate(all_policies), np.concatenate(all_outcomes)
+    return writer.get_all()
 
 
 def run_selfplay_single(
     config: SelfPlayConfig,
     on_game: Optional[Callable] = None,
     on_status: Optional[Callable] = None,
+    save_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Single-process self-play (no multiprocessing). Good for debugging or
     when running inside a container with limited resources."""
@@ -349,58 +412,55 @@ def run_selfplay_single(
         p, v = model(x)
         return p[0].cpu().numpy(), float(v[0])
 
-    all_states, all_policies, all_outcomes = [], [], []
+    writer = _ShardWriter(save_dir)
 
-    for game_num in range(config.num_games):
-        p1_col = random.randint(0, NCOLS - 1)
-        p2_col = random.randint(0, NCOLS - 1)
-        board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+    try:
+        for game_num in range(config.num_games):
+            p1_col = random.randint(0, NCOLS - 1)
+            p2_col = random.randint(0, NCOLS - 1)
+            board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
 
-        states, policies, turns = [], [], []
-        ply = 0
-        winner = None
-        while True:
-            w = state.winner(board)
-            if w is not None:
-                winner = w
-                break
-            if ply >= config.max_plies:
-                break
+            states, policies, turns = [], [], []
+            ply = 0
+            winner = None
+            while True:
+                w = state.winner(board)
+                if w is not None:
+                    winner = w
+                    break
+                if ply >= config.max_plies:
+                    break
 
-            temp = config.temp_high if ply < config.temperature_moves else config.temp_low
-            pi, _, move = run_mcts(state, board, evaluate_fn, config.simulations,
-                                   temp, add_noise=True)
-            if move is None:
-                winner = 2 if state.turn == 1 else 1
-                break
+                temp = config.temp_high if ply < config.temperature_moves else config.temp_low
+                pi, _, move = run_mcts(state, board, evaluate_fn, config.simulations,
+                                       temp, add_noise=True)
+                if move is None:
+                    winner = 2 if state.turn == 1 else 1
+                    break
 
-            states.append(encode_state(state, board))
-            policies.append(pi)
-            turns.append(state.turn)
-            state = apply_move(state, move)
-            ply += 1
+                states.append(encode_state(state, board))
+                policies.append(pi)
+                turns.append(state.turn)
+                state = apply_move(state, move)
+                ply += 1
 
-        outcomes = []
-        for t in turns:
-            if winner is None:
-                outcomes.append(0.0)
-            elif winner == t:
-                outcomes.append(1.0)
-            else:
-                outcomes.append(-1.0)
+            outcomes = []
+            for t in turns:
+                if winner is None:
+                    outcomes.append(0.0)
+                elif winner == t:
+                    outcomes.append(1.0)
+                else:
+                    outcomes.append(-1.0)
 
-        if states:
-            all_states.append(np.stack(states))
-            all_policies.append(np.stack(policies))
-            all_outcomes.append(np.array(outcomes, dtype=np.float32))
+            if states:
+                writer.add_game(np.stack(states), np.stack(policies),
+                                np.array(outcomes, dtype=np.float32))
 
-        if on_game:
-            on_game(game_num + 1, config.num_games, winner, ply,
-                    sum(len(s) for s in all_states))
+            if on_game:
+                on_game(game_num + 1, config.num_games, winner, ply,
+                        writer.total_positions)
+    finally:
+        writer.flush()
 
-    if not all_states:
-        return (np.zeros((0, NUM_PLANES, NROWS, NCOLS), dtype=np.float32),
-                np.zeros((0, NUM_ACTIONS), dtype=np.float32),
-                np.zeros((0,), dtype=np.float32))
-
-    return np.concatenate(all_states), np.concatenate(all_policies), np.concatenate(all_outcomes)
+    return writer.get_all()

@@ -136,34 +136,30 @@ def _selfplay() -> None:
     def on_status(msg):
         console.print(f"[dim]{msg}[/dim]")
 
+    from .az_train import AZ_DATA_ROOT
+    save_dir = str(AZ_DATA_ROOT / run_name)
+
     try:
         if workers <= 1:
             from .az_selfplay import run_selfplay_single
             states, policies, outcomes = run_selfplay_single(
-                config, on_game=on_game, on_status=on_status)
+                config, on_game=on_game, on_status=on_status, save_dir=save_dir)
         else:
             from .az_selfplay import run_selfplay
             states, policies, outcomes = run_selfplay(
-                config, on_game=on_game, on_status=on_status)
+                config, on_game=on_game, on_status=on_status, save_dir=save_dir)
     except (KeyboardInterrupt, EOFError):
-        console.print("\n[dim]interrupted.[/dim]")
+        console.print("\n[dim]interrupted — completed games were saved.[/dim]")
         return
-
-    if len(states) == 0:
-        console.print("[yellow]no positions recorded.[/yellow]")
-        return
-
-    # Save
-    from .az_train import save_training_data, AZ_DATA_ROOT
-    iteration = len(list((AZ_DATA_ROOT / run_name).glob("iter_*.npz"))) if (
-        AZ_DATA_ROOT / run_name).exists() else 0
-    save_training_data(run_name, states, policies, outcomes, iteration)
 
     elapsed = time.monotonic() - t0
+    total_pos = sum(sp_plies)  # each game contributes ~ply positions
     console.print(Panel(
         Text.assemble(
-            ("positions ", "dim"), (f"{len(states):,}", "white"),
-            ("   games ", "dim"), (f"{num_games}", "white"),
+            ("games ", "dim"), (f"{len(sp_plies)}", "white"),
+            ("   positions ", "dim"), (f"~{total_pos:,}", "white"),
+            ("   wins ", "dim"), (f"{sp_wins[0]}", "white"),
+            ("   draws ", "dim"), (f"{sp_draws[0]}", "white"),
             ("   ", "dim"), (f"{elapsed:.0f}s", "white"),
             ("   saved to ", "dim"), (run_name, STYLE_HINT),
         ),
@@ -344,12 +340,15 @@ def _full_loop() -> None:
                         f"{gps:.1f} g/s[/dim]"
                     )
 
+            sp_save_dir = str(AZ_DATA_ROOT / run_name)
             if workers <= 1:
                 from .az_selfplay import run_selfplay_single
-                states, policies, outcomes = run_selfplay_single(sp_config, on_game=on_game)
+                states, policies, outcomes = run_selfplay_single(
+                    sp_config, on_game=on_game, save_dir=sp_save_dir)
             else:
                 from .az_selfplay import run_selfplay
-                states, policies, outcomes = run_selfplay(sp_config, on_game=on_game)
+                states, policies, outcomes = run_selfplay(
+                    sp_config, on_game=on_game, save_dir=sp_save_dir)
 
             sp_time = time.monotonic() - t0
             decisive = sp_wins.get(1, 0) + sp_wins.get(2, 0)
@@ -368,11 +367,6 @@ def _full_loop() -> None:
             if len(states) == 0:
                 console.print("[yellow]no data generated, stopping.[/yellow]")
                 break
-
-            # Save this iteration's data
-            existing = len(list((AZ_DATA_ROOT / run_name).glob("iter_*.npz"))) if (
-                AZ_DATA_ROOT / run_name).exists() else 0
-            save_training_data(run_name, states, policies, outcomes, existing)
 
             # --- Train ---
             all_s, all_p, all_o = load_training_data(
