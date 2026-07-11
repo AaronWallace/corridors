@@ -88,14 +88,30 @@ def _detect_and_show_hw() -> dict:
 
 
 def _prompt_selfplay_params(num_games: int, hw: dict):
-    """Prompt for self-play parallelism using hardware-tuned defaults from `hw`.
-    GPU mode additionally prompts for inference batch size and per-worker
-    concurrency (the levers that feed the GPU). Returns
-    (device, workers, batch_size, concurrency)."""
-    device = hw["device"]
+    """Prompt for the self-play device and parallelism. Returns
+    (device, workers, batch_size, concurrency).
+
+    CPU-local self-play (each worker plays full games with its own model, no
+    inference server) scales with cores, starts instantly, and streams completed
+    games — usually fastest on many-core hosts, where funneling a tiny net's evals
+    through one GPU server queue becomes the bottleneck. GPU batching wins on
+    few-core hosts. So default to CPU when there are plenty of cores."""
+    console = _console()
     ncpu = hw["ncpu"]
+    if hw["device"] == "cpu":
+        device = "cpu"
+    else:
+        default_dev = "cpu" if ncpu >= 32 else "cuda"
+        console.print("[dim]CPU-local self-play scales with cores + instant start; "
+                      "GPU batches evals through one server (better on few cores).[/dim]")
+        device = Prompt.ask("[dim]Self-play device[/dim]",
+                            choices=["cpu", "cuda"], default=default_dev)
+
     hi = min(ncpu, num_games) if num_games > 0 else ncpu
-    default_workers = min(hw["workers"], hi)
+    if device == "cpu":
+        default_workers = min(max(2, ncpu - 1), hi)  # one per core; no GPU server
+    else:
+        default_workers = min(hw["workers"], hi)
     workers = _prompt_int(f"Workers [1-{hi}]", default_workers, 1, hi)
 
     batch_size = 64
@@ -282,7 +298,7 @@ def _selfplay() -> None:
     num_games = _prompt_int("Number of games", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    _device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games, hw)
+    sp_device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games, hw)
 
     # Check for existing checkpoint
     ckpts = []
@@ -309,7 +325,7 @@ def _selfplay() -> None:
         batch_size=batch_size,
         concurrent_games=concurrency,
         checkpoint=checkpoint,
-        device="auto",
+        device=sp_device,
     )
 
     from .az_train import AZ_DATA_ROOT
@@ -508,7 +524,7 @@ def _full_loop() -> None:
     sp_config = SelfPlayConfig(
         num_games=games_per_iter, simulations=sims, max_plies=max_plies,
         workers=workers, batch_size=sp_batch_size,
-        concurrent_games=concurrency, device="auto",
+        concurrent_games=concurrency, device=device,
     )
     pool = SelfPlayPool(sp_config)
 
