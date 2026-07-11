@@ -31,6 +31,32 @@ _SHUTDOWN = None
 _BATCH_TIMEOUT = 0.005  # 5ms — wait this long to fill a batch
 SHARD_EVERY = 25  # flush to disk every N games
 
+# Env vars that native math libraries (OpenMP/MKL/OpenBLAS) read at import time to
+# size their thread pools. We pin these to 1 in each worker so N single-threaded
+# workers don't collectively spawn N*ncpu threads and thrash the CPU.
+_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def _pin_torch_threads(n: int = 1) -> None:
+    """Pin the current process's PyTorch thread pools. Call at worker start,
+    after `import torch`. Safe to call once per process."""
+    try:
+        import torch
+        torch.set_num_threads(n)
+        try:
+            torch.set_num_interop_threads(n)
+        except RuntimeError:
+            # Can only be set before any inter-op work has started; ignore if late.
+            pass
+    except Exception:
+        pass
+
 
 class _ShardWriter:
     """Accumulates game data and flushes shards to disk periodically."""
@@ -104,6 +130,7 @@ class SelfPlayConfig:
     num_games: int = 100
     simulations: int = 200
     workers: int = 0           # 0 = auto-detect
+    concurrent_games: int = 0  # GPU mode: games in flight per worker (0 = auto)
     batch_size: int = 64       # max batch for GPU inference
     temperature_moves: int = 20  # use temp=1 for first N moves, then temp→0.1
     temp_high: float = 1.0
@@ -187,6 +214,80 @@ def _inference_server(
 # Game worker — runs on CPU
 # ---------------------------------------------------------------------------
 
+def _play_one_game(
+    game_num: int,
+    worker_id: int,
+    config: SelfPlayConfig,
+    evaluate_fn: Callable[[State, object], Tuple[np.ndarray, float]],
+    rng: "random.Random",
+    result_queue: mp.Queue,
+) -> None:
+    """Play a single game to completion and push its record to result_queue.
+    `evaluate_fn` may block on the inference server; that's fine — when many of
+    these run as threads, the blocking overlaps and the server sees real batches."""
+    from .mcts import run_mcts
+    import time as _time
+
+    p1_col = rng.randint(0, NCOLS - 1)
+    p2_col = rng.randint(0, NCOLS - 1)
+    board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+
+    record = GameRecord()
+    ply = 0
+    last_heartbeat = _time.monotonic()
+    while True:
+        w = state.winner(board)
+        if w is not None:
+            record.winner = w
+            break
+        if ply >= config.max_plies:
+            record.winner = None
+            break
+
+        temp = config.temp_high if ply < config.temperature_moves else config.temp_low
+        pi, root_val, move = run_mcts(
+            state, board,
+            evaluate_fn=evaluate_fn,
+            num_simulations=config.simulations,
+            temperature=temp,
+            add_noise=True,
+        )
+        if move is None:
+            record.winner = 2 if state.turn == 1 else 1
+            break
+
+        record.states.append(encode_state(state, board))
+        record.policies.append(pi)
+        record.turns.append(state.turn)
+        state = apply_move(state, move)
+        ply += 1
+
+        now = _time.monotonic()
+        if now - last_heartbeat >= 5.0:
+            result_queue.put(("heartbeat", worker_id, game_num, ply))
+            last_heartbeat = now
+
+    outcomes = []
+    for t in record.turns:
+        if record.winner is None:
+            outcomes.append(0.0)
+        elif record.winner == t:
+            outcomes.append(1.0)
+        else:
+            outcomes.append(-1.0)
+
+    if record.states:
+        result_queue.put((
+            worker_id,
+            game_num,
+            np.stack(record.states),
+            np.stack(record.policies),
+            np.array(outcomes, dtype=np.float32),
+            record.winner,
+            ply,
+        ))
+
+
 def _game_worker(
     worker_id: int,
     num_games: int,
@@ -195,99 +296,81 @@ def _game_worker(
     response_queue: mp.Queue,
     result_queue: mp.Queue,
     seed: int,
+    concurrency: int,
 ) -> None:
-    """Plays games using MCTS, sending leaf evaluations to the inference server."""
+    """Plays games using MCTS, sending leaf evaluations to the inference server.
+
+    Runs `concurrency` games at once as threads. Each game's evaluate_fn blocks
+    on the server, but because the threads block independently there are up to
+    `concurrency` requests in flight per worker — that's what lets the server
+    assemble batches instead of servicing one leaf per round-trip.
+    """
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import itertools
+    import threading
 
-    rng = random.Random(seed)
     np.random.seed(seed & 0x7FFFFFFF)
-    req_counter = 0
 
-    # Cache for pending inference responses
-    pending_responses: Dict[int, Tuple[np.ndarray, float]] = {}
+    # Per-request routing. A single reader thread drains the (shared) response
+    # queue and hands each result to the waiting game thread via its Event slot.
+    req_ids = itertools.count()  # next() is atomic in CPython — safe across threads
+    slots: Dict[int, list] = {}          # rid -> [Event, result]
+    slots_lock = threading.Lock()
+    stop_reader = threading.Event()
+
+    def _reader() -> None:
+        while not stop_reader.is_set():
+            try:
+                rid, policy, value = response_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            with slots_lock:
+                slot = slots.get(rid)
+            if slot is not None:
+                slot[1] = (policy, value)
+                slot[0].set()
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
-        nonlocal req_counter
         tensor = encode_state(state, board)
-        rid = req_counter
-        req_counter += 1
+        rid = next(req_ids)
+        ev = threading.Event()
+        slot = [ev, None]
+        with slots_lock:
+            slots[rid] = slot
         request_queue.put((worker_id, rid, tensor))
-        # Wait for our response
-        while rid not in pending_responses:
-            resp_rid, policy, value = response_queue.get()
-            pending_responses[resp_rid] = (policy, value)
-        policy, value = pending_responses.pop(rid)
-        return policy, value
+        ev.wait()
+        with slots_lock:
+            del slots[rid]
+        return slot[1]
 
-    from .mcts import run_mcts
-    import time as _time
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
 
-    for game_num in range(num_games):
-        p1_col = rng.randint(0, NCOLS - 1)
-        p2_col = rng.randint(0, NCOLS - 1)
-        board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+    def _run_range(thread_idx: int, game_nums: List[int]) -> None:
+        rng = random.Random(seed + 1 + thread_idx)
+        for game_num in game_nums:
+            _play_one_game(game_num, worker_id, config, evaluate_fn, rng, result_queue)
 
-        record = GameRecord()
-        ply = 0
-        last_heartbeat = _time.monotonic()
-        while True:
-            w = state.winner(board)
-            if w is not None:
-                record.winner = w
-                break
-            if ply >= config.max_plies:
-                record.winner = None
-                break
+    # Split this worker's games round-robin across `concurrency` threads.
+    concurrency = max(1, min(concurrency, num_games))
+    buckets: List[List[int]] = [[] for _ in range(concurrency)]
+    for g in range(num_games):
+        buckets[g % concurrency].append(g)
 
-            temp = config.temp_high if ply < config.temperature_moves else config.temp_low
+    threads = [
+        threading.Thread(target=_run_range, args=(i, buckets[i]), daemon=True)
+        for i in range(concurrency) if buckets[i]
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
-            pi, root_val, move = run_mcts(
-                state, board,
-                evaluate_fn=evaluate_fn,
-                num_simulations=config.simulations,
-                temperature=temp,
-                add_noise=True,
-            )
+    stop_reader.set()
+    reader.join(timeout=1)
 
-            if move is None:
-                record.winner = 2 if state.turn == 1 else 1
-                break
-
-            record.states.append(encode_state(state, board))
-            record.policies.append(pi)
-            record.turns.append(state.turn)
-
-            state = apply_move(state, move)
-            ply += 1
-
-            now = _time.monotonic()
-            if now - last_heartbeat >= 5.0:
-                result_queue.put(("heartbeat", worker_id, game_num, ply))
-                last_heartbeat = now
-
-        # Back-fill outcomes
-        outcomes = []
-        for t in record.turns:
-            if record.winner is None:
-                outcomes.append(0.0)
-            elif record.winner == t:
-                outcomes.append(1.0)
-            else:
-                outcomes.append(-1.0)
-
-        if record.states:
-            result_queue.put((
-                worker_id,
-                game_num,
-                np.stack(record.states),
-                np.stack(record.policies),
-                np.array(outcomes, dtype=np.float32),
-                record.winner,
-                ply,
-            ))
-
-    # Signal done
+    # Signal done — exactly one shutdown token per worker process.
     request_queue.put(_SHUTDOWN)
     result_queue.put(("done", worker_id))
 
@@ -305,6 +388,7 @@ def _game_worker_local(
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     import torch
+    _pin_torch_threads(1)  # one thread per worker — parallelism comes from processes
     from .az_net import AZNet, load_checkpoint as load_az
     from .mcts import run_mcts
 
@@ -400,8 +484,13 @@ def resolve_device(device: str) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def auto_workers() -> int:
+def auto_workers(mode: str = "gpu") -> int:
     ncpu = os.cpu_count() or 4
+    if mode == "cpu":
+        # Each worker is pinned to a single thread, so one worker per core is
+        # optimal; leave one core for the collecting coordinator.
+        return max(2, ncpu - 1)
+    # GPU mode: leave headroom for the inference server and the coordinator.
     return max(2, ncpu - 2)
 
 
@@ -426,62 +515,85 @@ def run_selfplay(
     import sys
     ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
     device = resolve_device(config.device)
-    num_workers = config.workers if config.workers > 0 else auto_workers()
+    mode = "cpu" if device == "cpu" else "gpu"
+    num_workers = config.workers if config.workers > 0 else auto_workers(mode)
     num_workers = min(num_workers, config.num_games)
 
+    # GPU mode: how many games each worker keeps in flight so the server can batch.
+    # Aim for the whole batch to be fillable across all workers.
+    concurrency = config.concurrent_games
+    if concurrency <= 0:
+        concurrency = min(16, max(1, -(-config.batch_size // max(num_workers, 1))))
+
     if on_status:
-        mode = "local-inference" if device == "cpu" else "gpu-server"
-        on_status(f"device={device}, workers={num_workers}, mode={mode}, "
+        label = "local-inference" if device == "cpu" else "gpu-server"
+        extra_info = f", concurrency={concurrency}" if device != "cpu" else ""
+        on_status(f"device={device}, workers={num_workers}, mode={label}{extra_info}, "
                   f"sims={config.simulations}, games={config.num_games}")
 
     # Distribute games
     base, extra = divmod(config.num_games, num_workers)
     games_per = [base + (1 if i < extra else 0) for i in range(num_workers)]
 
+    # Pin native math-library thread pools to 1 in every child. Child processes
+    # inherit this env at spawn time; N single-threaded workers then scale across
+    # cores instead of each grabbing every core and thrashing. Restore afterwards
+    # so we don't throttle anything the caller runs later (e.g. GPU training).
+    _saved_env = {v: os.environ.get(v) for v in _THREAD_ENV_VARS}
+    for v in _THREAD_ENV_VARS:
+        os.environ[v] = "1"
+
     result_queue = ctx.Queue()
 
-    if device == "cpu":
-        # CPU mode: each worker loads its own model — true parallelism
-        workers = []
-        for i in range(num_workers):
-            if games_per[i] == 0:
-                continue
-            seed = random.randint(0, 2**31 - 1)
-            w = ctx.Process(
-                target=_game_worker_local,
-                args=(i, games_per[i], config, result_queue, seed),
+    try:
+        if device == "cpu":
+            # CPU mode: each worker loads its own model — true parallelism
+            workers = []
+            for i in range(num_workers):
+                if games_per[i] == 0:
+                    continue
+                seed = random.randint(0, 2**31 - 1)
+                w = ctx.Process(
+                    target=_game_worker_local,
+                    args=(i, games_per[i], config, result_queue, seed),
+                    daemon=True,
+                )
+                w.start()
+                workers.append(w)
+            server = None
+        else:
+            # GPU mode: single inference server batches requests from workers
+            request_queue = ctx.Queue()
+            response_queues = {i: ctx.Queue() for i in range(num_workers)}
+
+            server = ctx.Process(
+                target=_inference_server,
+                args=(request_queue, response_queues, config.checkpoint, device,
+                      config.batch_size, num_workers),
                 daemon=True,
             )
-            w.start()
-            workers.append(w)
-        server = None
-    else:
-        # GPU mode: single inference server batches requests from workers
-        request_queue = ctx.Queue()
-        response_queues = {i: ctx.Queue() for i in range(num_workers)}
+            server.start()
 
-        server = ctx.Process(
-            target=_inference_server,
-            args=(request_queue, response_queues, config.checkpoint, device,
-                  config.batch_size, num_workers),
-            daemon=True,
-        )
-        server.start()
-
-        workers = []
-        for i in range(num_workers):
-            if games_per[i] == 0:
-                request_queue.put(_SHUTDOWN)
-                continue
-            seed = random.randint(0, 2**31 - 1)
-            w = ctx.Process(
-                target=_game_worker,
-                args=(i, games_per[i], config, request_queue,
-                      response_queues[i], result_queue, seed),
-                daemon=True,
-            )
-            w.start()
-            workers.append(w)
+            workers = []
+            for i in range(num_workers):
+                if games_per[i] == 0:
+                    request_queue.put(_SHUTDOWN)
+                    continue
+                seed = random.randint(0, 2**31 - 1)
+                w = ctx.Process(
+                    target=_game_worker,
+                    args=(i, games_per[i], config, request_queue,
+                          response_queues[i], result_queue, seed, concurrency),
+                    daemon=True,
+                )
+                w.start()
+                workers.append(w)
+    finally:
+        for v, val in _saved_env.items():
+            if val is None:
+                os.environ.pop(v, None)
+            else:
+                os.environ[v] = val
 
     # Collect results
     writer = _ShardWriter(save_dir)
