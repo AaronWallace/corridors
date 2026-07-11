@@ -81,24 +81,51 @@ def save_training_data(
     return path
 
 
-def load_training_data(
-    name: str,
-    max_iterations: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load self-play data. If max_iterations > 0, only load the most recent N."""
+def _shard_files(name: str, max_iterations: int = 0):
+    """The shard files that would be loaded for `name` (most recent N if capped)."""
     d = AZ_DATA_ROOT / name
     files = sorted(f for f in d.glob("*.npz") if not f.name.startswith("."))
     if not files:
         raise FileNotFoundError(f"no training data in {d}")
     if max_iterations > 0:
         files = files[-max_iterations:]
+    return files
+
+
+def load_training_data(
+    name: str,
+    max_iterations: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load self-play data. If max_iterations > 0, only load the most recent N."""
     ss, ps, os_ = [], [], []
-    for f in files:
+    for f in _shard_files(name, max_iterations):
         with np.load(f) as z:
             ss.append(z["states"])
             ps.append(z["policies"])
             os_.append(z["outcomes"])
     return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
+
+
+def dataset_provenance(name: str, max_iterations: int = 0) -> dict:
+    """Fingerprint the dataset that would be loaded, for stamping into a checkpoint.
+
+    The hash is over each shard's (name, size, mtime) — cheap (no file reads) and
+    changes if any shard is added, removed, or regenerated. Lets you later answer
+    "was this dataset baked into this checkpoint?" by comparing hashes."""
+    import hashlib
+    files = _shard_files(name, max_iterations)
+    manifest = []
+    h = hashlib.sha256()
+    for f in files:
+        st = f.stat()
+        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+        manifest.append(f.name)
+    return {
+        "data_run": name,
+        "data_shards": len(files),
+        "data_shard_names": manifest,
+        "data_sha": h.hexdigest()[:16],
+    }
 
 
 def train_az(
@@ -109,8 +136,12 @@ def train_az(
     resume_from: str = "",
     on_epoch: Optional[Callable[[AZEpochInfo], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
+    data_meta: Optional[dict] = None,
 ) -> dict:
-    """Train the AZNet. Returns summary dict."""
+    """Train the AZNet. Returns summary dict.
+
+    data_meta: optional dataset-provenance dict (see dataset_provenance) stamped
+    into the checkpoint's meta so you can later tell which data trained it."""
     device = resolve_device(config.device)
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
@@ -220,6 +251,7 @@ def train_az(
                 "batch_size": config.batch_size,
                 "lr": config.lr,
                 "device": device,
+                **(data_meta or {}),
             })
 
         if on_epoch:

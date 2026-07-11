@@ -145,7 +145,8 @@ def list_checkpoints() -> list:
             "epoch": meta.get("epoch"),
             "val_mse": meta.get("val_mse"),
             "val_sign_acc": meta.get("val_sign_acc"),
-            "dataset": meta.get("dataset"),
+            "dataset": meta.get("data_run") or meta.get("dataset"),
+            "data_sha": meta.get("data_sha"),
             "elo": meta.get("elo"),
         })
     return out

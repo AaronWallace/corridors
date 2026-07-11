@@ -376,7 +376,8 @@ def _is_az_checkpoint(name: str) -> bool:
 
 def _train() -> None:
     console = _console()
-    from .az_train import AZ_DATA_ROOT, AZTrainConfig, load_training_data, train_az
+    from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
+                           load_training_data, train_az)
 
     if not AZ_DATA_ROOT.exists():
         console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
@@ -444,7 +445,8 @@ def _train() -> None:
 
     try:
         res = train_az(states, policies, outcomes, config,
-                       resume_from=resume, on_epoch=on_epoch)
+                       resume_from=resume, on_epoch=on_epoch,
+                       data_meta=dataset_provenance(run_name))
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]training interrupted — best checkpoint saved.[/dim]")
         return
@@ -482,7 +484,8 @@ def _seed_loop_checkpoint(src: str, dst: str) -> bool:
 def _full_loop() -> None:
     console = _console()
     from .az_selfplay import SelfPlayConfig, SelfPlayPool
-    from .az_train import AZ_DATA_ROOT, AZTrainConfig, load_training_data, train_az
+    from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
+                           load_training_data, train_az)
 
     console.print("\n[bold]AlphaZero training loop[/bold]")
     console.print("[dim]Alternates: self-play → train → self-play → train → ...[/dim]")
@@ -610,7 +613,10 @@ def _full_loop() -> None:
                 )
 
             res = train_az(all_s, all_p, all_o, train_config,
-                           resume_from=resume, on_epoch=on_epoch)
+                           resume_from=resume, on_epoch=on_epoch,
+                           data_meta=dataset_provenance(
+                               run_name,
+                               max_iterations=max_data_iters if max_data_iters > 0 else 0))
             console.print(
                 f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
                 f"({res['elapsed']:.0f}s on {res['device']})[/dim]"
