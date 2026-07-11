@@ -166,6 +166,9 @@ def _tournament() -> None:
     from . import model as model_mod
     from .tournament import run_tournament
 
+    from .tournament import auto_tournament_workers
+    from .az_selfplay import resolve_device
+
     ckpts = [c["name"] for c in model_mod.list_checkpoints()]
     if not ckpts:
         console.print("[yellow]no checkpoints yet — train a model first.[/yellow]")
@@ -176,8 +179,10 @@ def _tournament() -> None:
         games_per_pair += 1
     depth = _prompt_int("Classical depth", 2, 1, 8)
     ctime = _prompt_float("Classical time limit (s)", 0.5, 0.0, 60.0)
+    device = resolve_device("auto")
+    console.print(f"[dim]device: {device} (nets run inference here)[/dim]")
     ncpu = os.cpu_count() or 2
-    workers = _prompt_int(f"Workers [1-{ncpu}]", max(1, ncpu - 1), 1, ncpu)
+    workers = _prompt_int(f"Workers [1-{ncpu}]", auto_tournament_workers(device), 1, ncpu)
 
     n_pairs = (len(ckpts) + 1) * len(ckpts) // 2
     console.print(f"[dim]{n_pairs} pairs × {games_per_pair} games = "
@@ -192,7 +197,7 @@ def _tournament() -> None:
         data = run_tournament(
             ckpts, games_per_pair=games_per_pair,
             classical_depth=depth, classical_time=ctime,
-            workers=workers, on_progress=on_progress,
+            workers=workers, device="auto", on_progress=on_progress,
         )
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]tournament interrupted — no ratings written.[/dim]")
