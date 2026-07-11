@@ -95,8 +95,9 @@ def _get_mover(spec: AgentSpec, seed: int, device: str):
 
 
 def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
-                   device: str = "cpu") -> float:
-    """Play one game; 'a' moves first as P1. Returns score for a: 1 / 0.5 / 0."""
+                   device: str = "cpu", max_plies: int = MAX_PLIES) -> float:
+    """Play one game; 'a' moves first as P1. Returns score for a: 1 / 0.5 / 0.
+    A game reaching `max_plies` half-moves (or a no-progress draw) scores 0.5."""
     seed = hash((a.name, b.name, game_idx)) & 0x7FFFFFFF
     rng = random.Random(seed)
     p1_col = rng.randint(0, NCOLS - 1)
@@ -110,7 +111,7 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
         w = state.winner(board)
         if w is not None:
             return 1.0 if w == 1 else 0.0
-        if plies >= MAX_PLIES or _draw_by_no_progress(states_seen, board):
+        if plies >= max_plies or _draw_by_no_progress(states_seen, board):
             return 0.5
         mv = movers[state.turn](state, board)
         state = apply_move(state, mv)
@@ -119,12 +120,12 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
 
 
 def _pair_game_task(a: AgentSpec, b: AgentSpec, game_idx: int,
-                    swap: bool, device: str) -> Tuple[str, str, float]:
+                    swap: bool, device: str, max_plies: int) -> Tuple[str, str, float]:
     """Worker task. When swap, b plays P1; score is still reported for (a, b)."""
     if swap:
-        score_b = play_pair_game(b, a, game_idx, device)
+        score_b = play_pair_game(b, a, game_idx, device, max_plies)
         return (a.name, b.name, 1.0 - score_b)
-    return (a.name, b.name, play_pair_game(a, b, game_idx, device))
+    return (a.name, b.name, play_pair_game(a, b, game_idx, device, max_plies))
 
 
 def compute_elo(results: List[Tuple[str, str, float]],
@@ -183,6 +184,7 @@ def run_tournament(
     classical_time: float = 0.5,
     workers: int = 0,
     device: str = "auto",
+    max_plies: int = MAX_PLIES,
     on_progress: Optional[Callable[[int, int, Tuple[str, str, float]], None]] = None,
 ) -> dict:
     """Round-robin over checkpoints + classical anchor. Returns elo.json payload.
@@ -224,7 +226,7 @@ def run_tournament(
     try:
         with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
                                  initializer=_worker_init) as pool:
-            futures = [pool.submit(_pair_game_task, a, b, g, swap, dev)
+            futures = [pool.submit(_pair_game_task, a, b, g, swap, dev, max_plies)
                        for a, b, g, swap in tasks]
             for fut in as_completed(futures):
                 res = fut.result()

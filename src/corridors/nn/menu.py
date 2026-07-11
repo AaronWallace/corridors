@@ -222,6 +222,7 @@ def _tournament() -> None:
         games_per_pair += 1
     depth = _prompt_int("Classical depth", 2, 1, 8)
     ctime = _prompt_float("Classical time limit (s)", 0.5, 0.0, 60.0)
+    max_plies = _prompt_int("Max plies per game (draw if reached)", 120, 20, 2000)
 
     # Device: CPU is usually fastest for tournaments (tiny net, 1 forward/move,
     # CPU-bound game logic + classical solver) and can use one worker per core.
@@ -249,7 +250,8 @@ def _tournament() -> None:
         data = run_tournament(
             ckpts, games_per_pair=games_per_pair,
             classical_depth=depth, classical_time=ctime,
-            workers=workers, device=device, on_progress=on_progress,
+            workers=workers, device=device, max_plies=max_plies,
+            on_progress=on_progress,
         )
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]tournament interrupted — no ratings written.[/dim]")
