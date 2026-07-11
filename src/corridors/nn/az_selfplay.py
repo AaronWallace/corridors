@@ -496,6 +496,65 @@ def auto_workers(mode: str = "gpu") -> int:
     return max(2, min(ncpu - 2, 32))
 
 
+def _auto_concurrency(batch_size: int, num_workers: int) -> int:
+    """Games-in-flight per worker so that workers*concurrency ~= batch_size."""
+    return min(16, max(1, -(-batch_size // max(num_workers, 1))))
+
+
+def detect_hardware() -> dict:
+    """Probe the CPU/GPU and recommend self-play + training defaults tuned to it.
+
+    Returns a dict with: device, gpu_name, vram_gb, ncpu, workers,
+    inference_batch, concurrency, games_per_iter, train_batch. The self-play
+    knobs are sized so the GPU inference batches actually fill (games in flight =
+    workers*concurrency), which is the main throughput lever. Falls back to safe
+    CPU values if torch or a GPU is unavailable.
+    """
+    ncpu = os.cpu_count() or 4
+    device, gpu_name, vram_gb = "cpu", "", 0.0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            device = "cuda"
+            props = torch.cuda.get_device_properties(0)
+            gpu_name = props.name
+            vram_gb = props.total_memory / (1024 ** 3)
+    except Exception:
+        pass
+
+    mode = "gpu" if device == "cuda" else "cpu"
+    workers = auto_workers(mode)
+
+    if mode == "cpu":
+        return {
+            "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
+            "ncpu": ncpu, "workers": workers,
+            "inference_batch": 64, "concurrency": 1,
+            "games_per_iter": max(64, workers * 4), "train_batch": 256,
+        }
+
+    # GPU: the net is small, so batch size is about keeping the card busy, not a
+    # hard memory limit — scale it (and the training batch) by VRAM tier.
+    if vram_gb >= 20:
+        inference_batch, train_batch = 512, 1024
+    elif vram_gb >= 12:
+        inference_batch, train_batch = 256, 512
+    elif vram_gb >= 8:
+        inference_batch, train_batch = 192, 256
+    else:
+        inference_batch, train_batch = 128, 128
+
+    concurrency = _auto_concurrency(inference_batch, workers)
+    in_flight = workers * concurrency
+    games_per_iter = int(min(1024, max(64, in_flight * 2)))
+    return {
+        "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
+        "ncpu": ncpu, "workers": workers,
+        "inference_batch": inference_batch, "concurrency": concurrency,
+        "games_per_iter": games_per_iter, "train_batch": train_batch,
+    }
+
+
 def run_selfplay(
     config: SelfPlayConfig,
     on_game: Optional[Callable[[int, int, Optional[int], int, int], None]] = None,

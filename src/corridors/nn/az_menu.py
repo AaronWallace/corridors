@@ -69,25 +69,39 @@ def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
 # Shared self-play runner with a single self-refreshing status line
 # ---------------------------------------------------------------------------
 
-def _prompt_selfplay_params(num_games: int):
-    """Resolve the device and prompt for self-play parallelism, with mode-aware
-    defaults. GPU mode additionally prompts for inference batch size and
-    per-worker concurrency (the levers that actually feed the GPU). Returns
-    (device, workers, batch_size, concurrency)."""
-    from .az_selfplay import auto_workers, resolve_device
+def _detect_and_show_hw() -> dict:
+    """Probe the CPU/GPU and print the detected hardware plus the tuned defaults."""
+    from .az_selfplay import detect_hardware
     console = _console()
-    device = resolve_device("auto")
-    console.print(f"[dim]device: {device}[/dim]")
-    ncpu = os.cpu_count() or 4
-    mode = "cpu" if device == "cpu" else "gpu"
+    hw = detect_hardware()
+    if hw["device"] == "cuda":
+        console.print(f"\n[dim]detected:[/dim] [white]{hw['gpu_name']}[/white] "
+                      f"[dim]({hw['vram_gb']:.0f} GB VRAM) · {hw['ncpu']} CPUs[/dim]")
+        console.print(f"[dim]tuned defaults: workers {hw['workers']} · inference batch "
+                      f"{hw['inference_batch']} · games/iter {hw['games_per_iter']} · "
+                      f"train batch {hw['train_batch']}[/dim]")
+    else:
+        console.print(f"\n[dim]detected: CPU only ({hw['ncpu']} cores), no CUDA GPU[/dim]")
+        console.print(f"[dim]tuned defaults: workers {hw['workers']} · "
+                      f"games/iter {hw['games_per_iter']} · train batch {hw['train_batch']}[/dim]")
+    return hw
+
+
+def _prompt_selfplay_params(num_games: int, hw: dict):
+    """Prompt for self-play parallelism using hardware-tuned defaults from `hw`.
+    GPU mode additionally prompts for inference batch size and per-worker
+    concurrency (the levers that feed the GPU). Returns
+    (device, workers, batch_size, concurrency)."""
+    device = hw["device"]
+    ncpu = hw["ncpu"]
     hi = min(ncpu, num_games) if num_games > 0 else ncpu
-    default_workers = min(auto_workers(mode), hi)
+    default_workers = min(hw["workers"], hi)
     workers = _prompt_int(f"Workers [1-{hi}]", default_workers, 1, hi)
 
     batch_size = 64
     concurrency = 0
     if device != "cpu":
-        batch_size = _prompt_int("Inference batch size", 256, 1, 8192)
+        batch_size = _prompt_int("Inference batch size", hw["inference_batch"], 1, 8192)
         concurrency = _prompt_int("Concurrent games per worker (0=auto)", 0, 0, 256)
     return device, workers, batch_size, concurrency
 
@@ -251,10 +265,11 @@ def _selfplay() -> None:
 
 
     console.print("\n[bold]AlphaZero self-play[/bold]")
-    num_games = _prompt_int("Number of games", 50, 1, 100_000)
+    hw = _detect_and_show_hw()
+    num_games = _prompt_int("Number of games", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    _device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games)
+    _device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games, hw)
 
     # Check for existing checkpoint
     ckpts = []
@@ -417,16 +432,17 @@ def _full_loop() -> None:
     from .az_train import AZ_DATA_ROOT, AZTrainConfig, load_training_data, train_az
 
     console.print("\n[bold]AlphaZero training loop[/bold]")
-    console.print("[dim]Alternates: self-play → train → self-play → train → ...[/dim]\n")
+    console.print("[dim]Alternates: self-play → train → self-play → train → ...[/dim]")
 
+    hw = _detect_and_show_hw()
     iterations = _prompt_int("Number of iterations", 5, 1, 1000)
-    games_per_iter = _prompt_int("Games per iteration", 50, 1, 100_000)
+    games_per_iter = _prompt_int("Games per iteration", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
     epochs_per_iter = _prompt_int("Training epochs per iteration", 10, 1, 1000)
-    train_batch_size = _prompt_int("Training batch size", 256, 8, 65536)
+    train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
-    device, workers, sp_batch_size, concurrency = _prompt_selfplay_params(games_per_iter)
+    device, workers, sp_batch_size, concurrency = _prompt_selfplay_params(games_per_iter, hw)
     max_data_iters = _prompt_int("Replay buffer (keep last N iterations, 0=all)", 0, 0, 1000)
 
     run_name = Prompt.ask("[dim]Run name[/dim]", default="az_loop").strip() or "az_loop"
