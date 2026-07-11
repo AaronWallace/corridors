@@ -106,7 +106,8 @@ def _prompt_selfplay_params(num_games: int, hw: dict):
     return device, workers, batch_size, concurrency
 
 
-def _selfplay_live(*, effective_workers: int, num_games: int, sims: int, run_fn):
+def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
+                   max_plies: int, run_fn):
     """Drive `run_fn(on_game, on_status, on_heartbeat)` behind one self-refreshing
     status line (no per-game or per-heartbeat spam). `run_fn` returns the
     (states, policies, outcomes) arrays. Returns ((states, policies, outcomes),
@@ -155,14 +156,23 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int, run_fn)
         # from heartbeats instead of a frozen "starting workers" line.
         if stats["t0"] is None:
             plies = sum(stats["hb"].values())
+            n = len(stats["hb"])
+            avg = plies / n if n else 0.0
             elapsed = time.monotonic() - (stats["play_t0"] or t0)
+            # Games mostly run to the ply cap early in training, so estimate when
+            # the average game reaches it. First completions arrive a bit sooner.
+            if avg > 0 and max_plies > avg:
+                eta = f"~{_hdur(elapsed * (max_plies / avg - 1))} to first games"
+            else:
+                eta = "estimating…"
             return Text.assemble(
                 ("  playing  ", "cyan"),
                 (f"{len(stats['online'])}/{stats['workers']} workers", "bold white"),
                 sep, (f"~{_hcount(plies)} plies", "white"),
                 sep, (f"~{_hcount(plies * sims)} sims", "white"),
+                sep, (f"avg {avg:.0f}/{max_plies} ply", "white"),
                 sep, (_hdur(elapsed), "dim"),
-                sep, ("first games finishing soon", "dim"),
+                sep, (eta, "green"),
             )
         # Phase 3 — games are completing; full stats with throughput and ETA.
         done, total = stats["done"], stats["total"]
@@ -238,7 +248,8 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
             on_heartbeat=on_heartbeat, save_dir=save_dir)
 
     (s, p, o), stats = _selfplay_live(
-        effective_workers=effective, num_games=num_games, sims=sims, run_fn=run_fn)
+        effective_workers=effective, num_games=num_games, sims=sims,
+        max_plies=config.max_plies, run_fn=run_fn)
     return s, p, o, stats
 
 
@@ -253,7 +264,7 @@ def _run_pool_round_live(pool, *, num_games: int, checkpoint: str, sims: int,
 
     (s, p, o), stats = _selfplay_live(
         effective_workers=pool.num_workers, num_games=num_games, sims=sims,
-        run_fn=run_fn)
+        max_plies=pool.config.max_plies, run_fn=run_fn)
     return s, p, o, stats
 
 

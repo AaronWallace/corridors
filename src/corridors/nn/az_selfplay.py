@@ -548,7 +548,10 @@ def detect_hardware() -> dict:
 
     concurrency = _auto_concurrency(inference_batch, workers)
     in_flight = workers * concurrency
-    games_per_iter = int(min(1024, max(64, in_flight * 2)))
+    # Self-play is CPU-bound, so iteration time scales with total games. Match the
+    # in-flight count (all concurrency slots busy) without a multiplier that would
+    # just make each iteration longer for no GPU benefit.
+    games_per_iter = int(min(512, max(128, in_flight)))
     return {
         "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
         "ncpu": ncpu, "workers": workers,
