@@ -109,6 +109,7 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
         "done": 0, "total": num_games, "positions": 0,
         "wins": {1: 0, 2: 0}, "draws": 0, "plies_sum": 0,
         "workers": effective_workers, "online": set(), "t0": None,
+        "hb": {}, "play_t0": None,  # heartbeat plies + when play started
     }
 
     def _hcount(n: float) -> str:
@@ -129,13 +130,29 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
         return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
     def _render() -> Text:
-        # Startup phase: workers are still spawning; show the ramp on one line.
-        if stats["t0"] is None:
+        sep = ("  ·  ", STYLE_GRID)
+        # Phase 1 — workers still spawning (no game has reported a heartbeat yet).
+        if not stats["online"]:
             return Text.assemble(
                 ("  starting workers  ", "cyan"),
                 (f"{len(stats['online'])}/{stats['workers']}", "bold white"),
-                ("  ·  ", STYLE_GRID), (_hdur(time.monotonic() - t0), "dim"),
+                sep, (_hdur(time.monotonic() - t0), "dim"),
             )
+        # Phase 2 — playing, but no game has finished yet. With many games in
+        # flight they all complete near the end, so show live ply/sim progress
+        # from heartbeats instead of a frozen "starting workers" line.
+        if stats["t0"] is None:
+            plies = sum(stats["hb"].values())
+            elapsed = time.monotonic() - (stats["play_t0"] or t0)
+            return Text.assemble(
+                ("  playing  ", "cyan"),
+                (f"{len(stats['online'])}/{stats['workers']} games", "bold white"),
+                sep, (f"~{_hcount(plies)} plies", "white"),
+                sep, (f"~{_hcount(plies * sims)} sims", "white"),
+                sep, (_hdur(elapsed), "dim"),
+                sep, ("first games finishing soon", "dim"),
+            )
+        # Phase 3 — games are completing; full stats with throughput and ETA.
         done, total = stats["done"], stats["total"]
         elapsed = time.monotonic() - stats["t0"]
         gps = done / elapsed if elapsed > 0 else 0.0
@@ -145,7 +162,6 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
         eta = _hdur(remaining / gps) if gps > 0 and remaining > 0 else "—"
         avg_ply = stats["plies_sum"] / done if done else 0.0
         wins = stats["wins"][1] + stats["wins"][2]
-        sep = ("  ·  ", STYLE_GRID)
         return Text.assemble(
             ("  ", ""),
             (f"{done}/{total} games", "bold white"),
@@ -178,7 +194,10 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
             stats["wins"][winner] = stats["wins"].get(winner, 0) + 1
 
     def on_heartbeat(wid, game_num, ply):
+        if stats["play_t0"] is None:
+            stats["play_t0"] = time.monotonic()
         stats["online"].add(wid)
+        stats["hb"][wid] = ply
 
     with Live(_StatusView(), console=console, refresh_per_second=4,
               transient=False):
