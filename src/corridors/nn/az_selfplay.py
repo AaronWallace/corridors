@@ -58,6 +58,20 @@ def _pin_torch_threads(n: int = 1) -> None:
         pass
 
 
+def _raise_fd_limit() -> None:
+    """Raise the soft open-file limit toward the hard limit (POSIX only). Each
+    worker gets its own command queue (a pipe + semaphores) and a fork pipe, so
+    hundreds of workers blow past the default 1024-fd soft limit."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = hard if hard != resource.RLIM_INFINITY else 1_048_576
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        pass
+
+
 class _ShardWriter:
     """Accumulates game data and flushes shards to disk periodically."""
 
@@ -580,6 +594,7 @@ def run_selfplay(
       outcomes: (N,) float32  — from side-to-move perspective
     """
     import sys
+    _raise_fd_limit()  # per-worker queues + fork pipes can exceed the 1024 default
     device = resolve_device(config.device)
     mode = "cpu" if device == "cpu" else "gpu"
     # CUDA cannot be re-initialized in a forked child (the parent already touched
@@ -1012,6 +1027,7 @@ class SelfPlayPool:
 
     def __init__(self, config: SelfPlayConfig, on_status: Optional[Callable[[str], None]] = None) -> None:
         import sys
+        _raise_fd_limit()  # one command queue + fork pipe per worker adds up fast
         self.config = config
         self.device = resolve_device(config.device)
         self.mode = "cpu" if self.device == "cpu" else "gpu"
