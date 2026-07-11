@@ -546,11 +546,12 @@ def detect_hardware() -> dict:
     CPU values if torch or a GPU is unavailable.
     """
     ncpu = os.cpu_count() or 4
-    device, gpu_name, vram_gb = "cpu", "", 0.0
+    device, gpu_name, vram_gb, gpu_count = "cpu", "", 0.0, 0
     try:
         import torch
         if torch.cuda.is_available():
             device = "cuda"
+            gpu_count = torch.cuda.device_count()
             props = torch.cuda.get_device_properties(0)
             gpu_name = props.name
             vram_gb = props.total_memory / (1024 ** 3)
@@ -563,7 +564,7 @@ def detect_hardware() -> dict:
     if mode == "cpu":
         return {
             "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
-            "ncpu": ncpu, "workers": workers,
+            "gpu_count": gpu_count, "ncpu": ncpu, "workers": workers,
             "inference_batch": 64, "concurrency": 1,
             "games_per_iter": max(64, workers * 4), "train_batch": 256,
         }
@@ -587,7 +588,7 @@ def detect_hardware() -> dict:
     games_per_iter = int(min(512, max(128, in_flight)))
     return {
         "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
-        "ncpu": ncpu, "workers": workers,
+        "gpu_count": gpu_count, "ncpu": ncpu, "workers": workers,
         "inference_batch": inference_batch, "concurrency": concurrency,
         "games_per_iter": games_per_iter, "train_batch": train_batch,
     }

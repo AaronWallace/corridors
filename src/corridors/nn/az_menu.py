@@ -75,8 +75,14 @@ def _detect_and_show_hw() -> dict:
     console = _console()
     hw = detect_hardware()
     if hw["device"] == "cuda":
-        console.print(f"\n[dim]detected:[/dim] [white]{hw['gpu_name']}[/white] "
-                      f"[dim]({hw['vram_gb']:.0f} GB VRAM) · {hw['ncpu']} CPUs[/dim]")
+        gpu_n = hw.get("gpu_count", 1)
+        gpu_tag = f"{gpu_n}× {hw['gpu_name']}" if gpu_n > 1 else hw['gpu_name']
+        console.print(f"\n[dim]detected:[/dim] [white]{gpu_tag}[/white] "
+                      f"[dim]({hw['vram_gb']:.0f} GB VRAM each) · {hw['ncpu']} CPUs[/dim]")
+        if gpu_n > 1:
+            console.print(f"[yellow]note:[/yellow] [dim]only cuda:0 is used. To use the "
+                          f"other {gpu_n - 1}, run separate jobs pinned with "
+                          f"CUDA_VISIBLE_DEVICES=<n> (see below).[/dim]")
         console.print(f"[dim]tuned defaults: workers {hw['workers']} · inference batch "
                       f"{hw['inference_batch']} · games/iter {hw['games_per_iter']} · "
                       f"train batch {hw['train_batch']}[/dim]")
