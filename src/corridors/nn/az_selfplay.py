@@ -279,6 +279,92 @@ def _game_worker(
     result_queue.put(("done", worker_id))
 
 
+def _game_worker_local(
+    worker_id: int,
+    num_games: int,
+    config: SelfPlayConfig,
+    result_queue: mp.Queue,
+    seed: int,
+) -> None:
+    """Self-contained worker: loads model locally, no inference server needed.
+    Each process does its own inference on CPU — ideal for CPU-only clusters."""
+    import torch
+    from .az_net import AZNet, load_checkpoint as load_az
+    from .mcts import run_mcts
+
+    rng = random.Random(seed)
+    np.random.seed(seed & 0x7FFFFFFF)
+
+    if config.checkpoint:
+        model = load_az(config.checkpoint, device="cpu")
+    else:
+        model = AZNet().to("cpu")
+        model.eval()
+
+    @torch.no_grad()
+    def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
+        tensor = encode_state(state, board)
+        x = torch.from_numpy(tensor).unsqueeze(0)
+        p, v = model(x)
+        return p[0].numpy(), float(v[0])
+
+    for game_num in range(num_games):
+        p1_col = rng.randint(0, NCOLS - 1)
+        p2_col = rng.randint(0, NCOLS - 1)
+        board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+
+        record = GameRecord()
+        ply = 0
+        while True:
+            w = state.winner(board)
+            if w is not None:
+                record.winner = w
+                break
+            if ply >= config.max_plies:
+                record.winner = None
+                break
+
+            temp = config.temp_high if ply < config.temperature_moves else config.temp_low
+            pi, root_val, move = run_mcts(
+                state, board,
+                evaluate_fn=evaluate_fn,
+                num_simulations=config.simulations,
+                temperature=temp,
+                add_noise=True,
+            )
+            if move is None:
+                record.winner = 2 if state.turn == 1 else 1
+                break
+
+            record.states.append(encode_state(state, board))
+            record.policies.append(pi)
+            record.turns.append(state.turn)
+            state = apply_move(state, move)
+            ply += 1
+
+        outcomes = []
+        for t in record.turns:
+            if record.winner is None:
+                outcomes.append(0.0)
+            elif record.winner == t:
+                outcomes.append(1.0)
+            else:
+                outcomes.append(-1.0)
+
+        if record.states:
+            result_queue.put((
+                worker_id,
+                game_num,
+                np.stack(record.states),
+                np.stack(record.policies),
+                np.array(outcomes, dtype=np.float32),
+                record.winner,
+                ply,
+            ))
+
+    result_queue.put(("done", worker_id))
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -317,41 +403,58 @@ def run_selfplay(
     num_workers = config.workers if config.workers > 0 else auto_workers()
 
     if on_status:
-        on_status(f"device={device}, workers={num_workers}, sims={config.simulations}, "
-                  f"games={config.num_games}")
+        mode = "local-inference" if device == "cpu" else "gpu-server"
+        on_status(f"device={device}, workers={num_workers}, mode={mode}, "
+                  f"sims={config.simulations}, games={config.num_games}")
 
     # Distribute games
     base, extra = divmod(config.num_games, num_workers)
     games_per = [base + (1 if i < extra else 0) for i in range(num_workers)]
 
-    request_queue = ctx.Queue()
-    response_queues = {i: ctx.Queue() for i in range(num_workers)}
     result_queue = ctx.Queue()
 
-    # Start inference server
-    server = ctx.Process(
-        target=_inference_server,
-        args=(request_queue, response_queues, config.checkpoint, device,
-              config.batch_size, num_workers),
-        daemon=True,
-    )
-    server.start()
+    if device == "cpu":
+        # CPU mode: each worker loads its own model — true parallelism
+        workers = []
+        for i in range(num_workers):
+            if games_per[i] == 0:
+                continue
+            seed = random.randint(0, 2**31 - 1)
+            w = ctx.Process(
+                target=_game_worker_local,
+                args=(i, games_per[i], config, result_queue, seed),
+                daemon=True,
+            )
+            w.start()
+            workers.append(w)
+        server = None
+    else:
+        # GPU mode: single inference server batches requests from workers
+        request_queue = ctx.Queue()
+        response_queues = {i: ctx.Queue() for i in range(num_workers)}
 
-    # Start workers
-    workers = []
-    for i in range(num_workers):
-        if games_per[i] == 0:
-            request_queue.put(_SHUTDOWN)
-            continue
-        seed = random.randint(0, 2**31 - 1)
-        w = ctx.Process(
-            target=_game_worker,
-            args=(i, games_per[i], config, request_queue,
-                  response_queues[i], result_queue, seed),
+        server = ctx.Process(
+            target=_inference_server,
+            args=(request_queue, response_queues, config.checkpoint, device,
+                  config.batch_size, num_workers),
             daemon=True,
         )
-        w.start()
-        workers.append(w)
+        server.start()
+
+        workers = []
+        for i in range(num_workers):
+            if games_per[i] == 0:
+                request_queue.put(_SHUTDOWN)
+                continue
+            seed = random.randint(0, 2**31 - 1)
+            w = ctx.Process(
+                target=_game_worker,
+                args=(i, games_per[i], config, request_queue,
+                      response_queues[i], result_queue, seed),
+                daemon=True,
+            )
+            w.start()
+            workers.append(w)
 
     # Collect results
     writer = _ShardWriter(save_dir)
@@ -376,7 +479,8 @@ def run_selfplay(
         writer.flush()
 
     # Wait for processes
-    server.join(timeout=10)
+    if server is not None:
+        server.join(timeout=10)
     for w in workers:
         w.join(timeout=10)
 
