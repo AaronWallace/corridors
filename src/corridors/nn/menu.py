@@ -179,8 +179,17 @@ def _tournament() -> None:
         games_per_pair += 1
     depth = _prompt_int("Classical depth", 2, 1, 8)
     ctime = _prompt_float("Classical time limit (s)", 0.5, 0.0, 60.0)
-    device = resolve_device("auto")
-    console.print(f"[dim]device: {device} (nets run inference here)[/dim]")
+
+    # Device: CPU is usually fastest for tournaments (tiny net, 1 forward/move,
+    # CPU-bound game logic + classical solver) and can use one worker per core.
+    # GPU caps workers to bound CUDA contexts/VRAM, so it parallelizes far less.
+    if resolve_device("auto") == "cpu":
+        device = "cpu"
+    else:
+        console.print("[dim]CPU is usually faster here (tiny net; CPU-bound game "
+                      "logic). GPU caps workers to fit CUDA contexts in VRAM.[/dim]")
+        device = Prompt.ask("[dim]Inference device[/dim]",
+                            choices=["cpu", "cuda"], default="cpu")
     ncpu = os.cpu_count() or 2
     workers = _prompt_int(f"Workers [1-{ncpu}]", auto_tournament_workers(device), 1, ncpu)
 
@@ -197,7 +206,7 @@ def _tournament() -> None:
         data = run_tournament(
             ckpts, games_per_pair=games_per_pair,
             classical_depth=depth, classical_time=ctime,
-            workers=workers, device="auto", on_progress=on_progress,
+            workers=workers, device=device, on_progress=on_progress,
         )
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]tournament interrupted — no ratings written.[/dim]")
