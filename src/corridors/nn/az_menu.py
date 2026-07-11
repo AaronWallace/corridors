@@ -181,11 +181,13 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
                 eta = f"~{_hdur(elapsed * (max_plies / avg - 1))} to first games"
             else:
                 eta = "estimating…"
+            plies_ps = plies / elapsed if elapsed > 0 else 0.0
             return Text.assemble(
                 ("  playing  ", "cyan"),
                 (f"{len(stats['online'])}/{stats['workers']} workers", "bold white"),
                 sep, (f"~{_hcount(plies)} plies", "white"),
-                sep, (f"~{_hcount(plies * sims)} sims", "white"),
+                sep, (f"{_hcount(plies_ps)} plies/s", "cyan"),
+                sep, (f"{_hcount(plies_ps * sims)} sims/s", "cyan"),
                 sep, (f"avg {avg:.0f}/{max_plies} ply", "white"),
                 sep, (_hdur(elapsed), "dim"),
                 sep, (eta, "green"),
@@ -200,14 +202,22 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
         eta = _hdur(remaining / gps) if gps > 0 and remaining > 0 else "—"
         avg_ply = stats["plies_sum"] / done if done else 0.0
         wins = stats["wins"][1] + stats["wins"][2]
+        # Rates over time-since-play-started. plies (live, incl. in-flight) vs pos
+        # (committed to disk) are distinct: the gap is work in games not yet done.
+        elapsed_play = time.monotonic() - (stats["play_t0"] or t0)
+        total_plies = sum(stats["hb"].values())
+        plies_ps = total_plies / elapsed_play if elapsed_play > 0 else 0.0
+        pos_ps = pos / elapsed_play if elapsed_play > 0 else 0.0
         return Text.assemble(
             ("  ", ""),
             (f"{done}/{total} games", "bold white"),
             (f" {done / total * 100:.0f}%" if total else "", "dim"),
             sep, (f"{in_flight} in flight", "white"),
             sep, (f"{_hcount(pos)} pos", "white"),
-            sep, (f"{_hcount(pos * sims)} sims", "white"),
             sep, (f"{gps:.1f} g/s", "cyan"),
+            sep, (f"{_hcount(plies_ps)} plies/s", "cyan"),
+            sep, (f"{_hcount(plies_ps * sims)} sims/s", "cyan"),
+            sep, (f"{_hcount(pos_ps)} pos/s", "cyan"),
             sep, (f"W{wins} D{stats['draws']}", "dim"),
             sep, (f"avg {avg_ply:.0f} ply", "dim"),
             sep, (f"ETA {eta}", "green"),
