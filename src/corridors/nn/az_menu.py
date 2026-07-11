@@ -439,6 +439,20 @@ def _train() -> None:
 # 3. Full loop: self-play → train → repeat
 # ---------------------------------------------------------------------------
 
+def _seed_loop_checkpoint(src: str, dst: str) -> bool:
+    """Copy an existing checkpoint (weights + meta) to the loop's best-checkpoint
+    name so the loop bootstraps from it. Returns True on success."""
+    import shutil
+    src_w = CHECKPOINT_ROOT / f"{src}.safetensors"
+    if not src_w.exists():
+        return False
+    shutil.copy2(src_w, CHECKPOINT_ROOT / f"{dst}.safetensors")
+    src_m = CHECKPOINT_ROOT / f"{src}.meta.json"
+    if src_m.exists():
+        shutil.copy2(src_m, CHECKPOINT_ROOT / f"{dst}.meta.json")
+    return True
+
+
 def _full_loop() -> None:
     console = _console()
     from .az_selfplay import SelfPlayConfig, SelfPlayPool
@@ -460,6 +474,29 @@ def _full_loop() -> None:
 
     run_name = Prompt.ask("[dim]Run name[/dim]", default="az_loop").strip() or "az_loop"
     ckpt_name = f"{run_name}_best"
+    ckpt_path = CHECKPOINT_ROOT / f"{ckpt_name}.safetensors"
+
+    # Optionally seed the loop from an existing checkpoint (e.g. az_latest). The
+    # loop otherwise bootstraps from {run_name}_best if it exists, else random init.
+    seed_choices = [f.stem for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors"))
+                    if _is_az_checkpoint(f.stem) and f.stem != ckpt_name]
+    if seed_choices:
+        console.print(f"[dim]AZ checkpoints: {', '.join(seed_choices)}[/dim]")
+        default_hint = f"continue {ckpt_name}" if ckpt_path.exists() else "random init"
+        seed_from = Prompt.ask(
+            f"[dim]Seed from checkpoint (name / Enter = {default_hint})[/dim]",
+            default="").strip()
+        if seed_from and seed_from not in seed_choices:
+            console.print(f"[yellow]'{seed_from}' is not an AZ checkpoint — using "
+                          f"{default_hint}[/yellow]")
+        elif seed_from:
+            overwrite = (not ckpt_path.exists()) or Confirm.ask(
+                f"[yellow]{ckpt_name} exists — overwrite it with {seed_from}?[/yellow]",
+                default=True)
+            if overwrite and _seed_loop_checkpoint(seed_from, ckpt_name):
+                console.print(f"[dim]seeded {ckpt_name} from {seed_from}[/dim]")
+            else:
+                console.print(f"[dim]keeping existing {ckpt_name}[/dim]")
 
     sp_extra = f" · inference batch {sp_batch_size}" if device != "cpu" else ""
     console.print(f"\n[dim]device: {device} · workers: {min(workers, games_per_iter)}"
