@@ -69,6 +69,29 @@ def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
 # Shared self-play runner with a single self-refreshing status line
 # ---------------------------------------------------------------------------
 
+def _prompt_selfplay_params(num_games: int):
+    """Resolve the device and prompt for self-play parallelism, with mode-aware
+    defaults. GPU mode additionally prompts for inference batch size and
+    per-worker concurrency (the levers that actually feed the GPU). Returns
+    (device, workers, batch_size, concurrency)."""
+    from .az_selfplay import auto_workers, resolve_device
+    console = _console()
+    device = resolve_device("auto")
+    console.print(f"[dim]device: {device}[/dim]")
+    ncpu = os.cpu_count() or 4
+    mode = "cpu" if device == "cpu" else "gpu"
+    hi = min(ncpu, num_games) if num_games > 0 else ncpu
+    default_workers = min(auto_workers(mode), hi)
+    workers = _prompt_int(f"Workers [1-{hi}]", default_workers, 1, hi)
+
+    batch_size = 64
+    concurrency = 0
+    if device != "cpu":
+        batch_size = _prompt_int("Inference batch size", 256, 1, 8192)
+        concurrency = _prompt_int("Concurrent games per worker (0=auto)", 0, 0, 256)
+    return device, workers, batch_size, concurrency
+
+
 def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
                        save_dir: str):
     """Run self-play behind one self-refreshing status line (no per-game or
@@ -79,10 +102,13 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
     from rich.live import Live
 
     t0 = time.monotonic()
+    # run_selfplay clamps workers to the game count; mirror that so the status
+    # line's "X/Y workers" and "in flight" reflect what actually spawns.
+    effective_workers = min(workers, num_games) if num_games > 0 else workers
     stats = {
         "done": 0, "total": num_games, "positions": 0,
         "wins": {1: 0, 2: 0}, "draws": 0, "plies_sum": 0,
-        "workers": workers, "online": set(), "t0": None,
+        "workers": effective_workers, "online": set(), "t0": None,
     }
 
     def _hcount(n: float) -> str:
@@ -175,16 +201,14 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
 
 def _selfplay() -> None:
     console = _console()
-    from .az_selfplay import SelfPlayConfig, auto_workers, resolve_device
+    from .az_selfplay import SelfPlayConfig
 
 
     console.print("\n[bold]AlphaZero self-play[/bold]")
     num_games = _prompt_int("Number of games", 50, 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    ncpu = os.cpu_count() or 4
-    default_workers = max(2, ncpu - 2)
-    workers = _prompt_int(f"Workers [1-{ncpu}]", default_workers, 1, ncpu)
+    _device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games)
 
     # Check for existing checkpoint
     ckpts = []
@@ -208,6 +232,8 @@ def _selfplay() -> None:
         simulations=sims,
         max_plies=max_plies,
         workers=workers,
+        batch_size=batch_size,
+        concurrent_games=concurrency,
         checkpoint=checkpoint,
         device="auto",
     )
@@ -341,8 +367,8 @@ def _train() -> None:
 
 def _full_loop() -> None:
     console = _console()
-    from .az_selfplay import SelfPlayConfig, auto_workers, resolve_device
-    from .az_train import AZ_DATA_ROOT, AZTrainConfig, load_training_data, train_az, save_training_data
+    from .az_selfplay import SelfPlayConfig
+    from .az_train import AZ_DATA_ROOT, AZTrainConfig, load_training_data, train_az
 
     console.print("\n[bold]AlphaZero training loop[/bold]")
     console.print("[dim]Alternates: self-play → train → self-play → train → ...[/dim]\n")
@@ -352,17 +378,17 @@ def _full_loop() -> None:
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
     epochs_per_iter = _prompt_int("Training epochs per iteration", 10, 1, 1000)
-    batch_size = _prompt_int("Batch size", 256, 8, 65536)
+    train_batch_size = _prompt_int("Training batch size", 256, 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
-    ncpu = os.cpu_count() or 4
-    workers = _prompt_int(f"Workers [1-{ncpu}]", max(2, ncpu - 2), 1, ncpu)
+    device, workers, sp_batch_size, concurrency = _prompt_selfplay_params(games_per_iter)
     max_data_iters = _prompt_int("Replay buffer (keep last N iterations, 0=all)", 0, 0, 1000)
 
     run_name = Prompt.ask("[dim]Run name[/dim]", default="az_loop").strip() or "az_loop"
     ckpt_name = f"{run_name}_best"
 
-    device = resolve_device("auto")
-    console.print(f"\n[dim]device: {device}, workers: {workers}[/dim]")
+    sp_extra = f" · inference batch {sp_batch_size}" if device != "cpu" else ""
+    console.print(f"\n[dim]device: {device} · workers: {min(workers, games_per_iter)}"
+                  f"{sp_extra}[/dim]")
 
     loop_t0 = time.monotonic()
     cumulative_games = 0
@@ -384,7 +410,8 @@ def _full_loop() -> None:
 
             sp_config = SelfPlayConfig(
                 num_games=games_per_iter, simulations=sims, max_plies=max_plies,
-                workers=workers, checkpoint=checkpoint, device="auto",
+                workers=workers, batch_size=sp_batch_size,
+                concurrent_games=concurrency, checkpoint=checkpoint, device="auto",
             )
 
             t0 = time.monotonic()
@@ -419,11 +446,11 @@ def _full_loop() -> None:
                 run_name, max_iterations=max_data_iters if max_data_iters > 0 else 0)
             console.print(
                 f"\n  [bold]Training[/bold] [dim]· {epochs_per_iter} epochs "
-                f"· batch {batch_size} · replay buffer: {len(all_s):,} positions[/dim]"
+                f"· batch {train_batch_size} · replay buffer: {len(all_s):,} positions[/dim]"
             )
 
             train_config = AZTrainConfig(
-                epochs=epochs_per_iter, batch_size=batch_size, lr=lr,
+                epochs=epochs_per_iter, batch_size=train_batch_size, lr=lr,
                 checkpoint_name=ckpt_name,
             )
             resume = ckpt_name if (

@@ -490,8 +490,10 @@ def auto_workers(mode: str = "gpu") -> int:
         # Each worker is pinned to a single thread, so one worker per core is
         # optimal; leave one core for the collecting coordinator.
         return max(2, ncpu - 1)
-    # GPU mode: leave headroom for the inference server and the coordinator.
-    return max(2, ncpu - 2)
+    # GPU mode: workers only drive MCTS to feed a single inference server, and
+    # per-worker concurrency keeps the GPU fed. A modest count avoids the queue
+    # contention and spawn overhead of hundreds of processes on many-core hosts.
+    return max(2, min(ncpu - 2, 32))
 
 
 def run_selfplay(
