@@ -137,6 +137,9 @@ def _inference_server(
 ) -> None:
     """Batched inference process. Reads (worker_id, tensor) from request_queue,
     runs forward pass, sends (policy, value) back via per-worker response queues."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     import torch
     from .az_net import AZNet, load_checkpoint as load_az
 
@@ -194,6 +197,9 @@ def _game_worker(
     seed: int,
 ) -> None:
     """Plays games using MCTS, sending leaf evaluations to the inference server."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     rng = random.Random(seed)
     np.random.seed(seed & 0x7FFFFFFF)
     req_counter = 0
@@ -295,6 +301,9 @@ def _game_worker_local(
 ) -> None:
     """Self-contained worker: loads model locally, no inference server needed.
     Each process does its own inference on CPU — ideal for CPU-only clusters."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     import torch
     from .az_net import AZNet, load_checkpoint as load_az
     from .mcts import run_mcts
@@ -414,9 +423,11 @@ def run_selfplay(
       policies: (N, 227) float32
       outcomes: (N,) float32  — from side-to-move perspective
     """
-    ctx = mp.get_context("spawn")
+    import sys
+    ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
     device = resolve_device(config.device)
     num_workers = config.workers if config.workers > 0 else auto_workers()
+    num_workers = min(num_workers, config.num_games)
 
     if on_status:
         mode = "local-inference" if device == "cpu" else "gpu-server"
@@ -496,14 +507,18 @@ def run_selfplay(
 
             if on_game:
                 on_game(done_count, config.num_games, winner, ply, writer.total_positions)
+    except KeyboardInterrupt:
+        pass
     finally:
         writer.flush()
-
-    # Wait for processes
-    if server is not None:
-        server.join(timeout=10)
-    for w in workers:
-        w.join(timeout=10)
+        for w in workers:
+            w.terminate()
+        if server is not None:
+            server.terminate()
+        for w in workers:
+            w.join(timeout=5)
+        if server is not None:
+            server.join(timeout=5)
 
     return writer.get_all()
 
