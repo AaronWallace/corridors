@@ -108,69 +108,112 @@ def _selfplay() -> None:
         device="auto",
     )
 
-    t0 = time.monotonic()
-    sp_wins = [0]
-    sp_draws = [0]
-    sp_plies = []
+    from .az_train import AZ_DATA_ROOT
+    from rich.live import Live
 
-    def on_game(done, total, winner, ply, positions):
-        sp_plies.append(ply)
-        if winner is None:
-            sp_draws[0] += 1
-        else:
-            sp_wins[0] += 1
-        tag = f"P{winner}" if winner else "draw"
-        elapsed = time.monotonic() - t0
-        gps = done / elapsed if elapsed > 0 else 0
-        avg_ply = sum(sp_plies) / len(sp_plies)
-        console.print(
-            f"  [dim]game[/dim] {done:>5}/{total}  "
-            f"{tag:<5} "
-            f"[dim]ply[/dim] {ply:>3}  "
-            f"[dim]W[/dim] {sp_wins[0]} [dim]D[/dim] {sp_draws[0]}  "
-            f"[dim]avg ply[/dim] {avg_ply:.0f}  "
-            f"[dim]pos[/dim] {positions:>8,}  "
-            f"[dim]{gps:.1f} g/s[/dim]"
+    save_dir = str(AZ_DATA_ROOT / run_name)
+    t0 = time.monotonic()
+
+    # Live status is driven by mutating this dict from the callbacks; a single
+    # self-refreshing line renders it (see _StatusView below) instead of printing
+    # a line per game / per heartbeat.
+    stats = {
+        "done": 0, "total": num_games, "positions": 0,
+        "wins": 0, "draws": 0, "plies_sum": 0,
+        "workers": workers, "online": set(), "t0": None,
+    }
+
+    def _hcount(n: float) -> str:
+        if n < 1000:
+            return f"{int(n):,}"
+        if n < 1_000_000:
+            return f"{n / 1e3:.1f}K"
+        if n < 1_000_000_000:
+            return f"{n / 1e6:.2f}M"
+        return f"{n / 1e9:.2f}B"
+
+    def _hdur(secs: float) -> str:
+        s = int(secs)
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m{s % 60:02d}s"
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+    def _render() -> Text:
+        # Startup phase: workers are still spawning; show the ramp on one line.
+        if stats["t0"] is None:
+            return Text.assemble(
+                ("  starting workers  ", "cyan"),
+                (f"{len(stats['online'])}/{stats['workers']}", "bold white"),
+                ("  ·  ", STYLE_GRID), (_hdur(time.monotonic() - t0), "dim"),
+            )
+        done, total = stats["done"], stats["total"]
+        elapsed = time.monotonic() - stats["t0"]
+        gps = done / elapsed if elapsed > 0 else 0.0
+        pos = stats["positions"]
+        remaining = total - done
+        in_flight = max(0, min(stats["workers"], remaining))
+        eta = _hdur(remaining / gps) if gps > 0 and remaining > 0 else "—"
+        avg_ply = stats["plies_sum"] / done if done else 0.0
+        sep = ("  ·  ", STYLE_GRID)
+        return Text.assemble(
+            ("  ", ""),
+            (f"{done}/{total} games", "bold white"),
+            (f" {done / total * 100:.0f}%" if total else "", "dim"),
+            sep, (f"{in_flight} in flight", "white"),
+            sep, (f"{_hcount(pos)} pos", "white"),
+            sep, (f"{_hcount(pos * sims)} sims", "white"),
+            sep, (f"{gps:.1f} g/s", "cyan"),
+            sep, (f"W{stats['wins']} D{stats['draws']}", "dim"),
+            sep, (f"avg {avg_ply:.0f} ply", "dim"),
+            sep, (f"ETA {eta}", "green"),
         )
+
+    class _StatusView:
+        def __rich__(self) -> Text:
+            return _render()
 
     def on_status(msg):
         console.print(f"[dim]{msg}[/dim]")
 
-    worker_progress = {}
+    def on_game(done, total, winner, ply, positions):
+        if stats["t0"] is None:
+            stats["t0"] = time.monotonic()  # first completion = end of warmup
+        stats["done"] = done
+        stats["positions"] = positions
+        stats["plies_sum"] += ply
+        if winner is None:
+            stats["draws"] += 1
+        else:
+            stats["wins"] += 1
 
     def on_heartbeat(wid, game_num, ply):
-        worker_progress[wid] = (game_num, ply)
-        active = len(worker_progress)
-        parts = [f"w{w}:g{g}p{p}" for w, (g, p) in sorted(worker_progress.items())]
-        if len(parts) > 8:
-            parts = parts[:8] + [f"...+{len(parts)-8}"]
-        console.print(f"  [dim]♥ {active} workers active  {' '.join(parts)}[/dim]")
-
-    from .az_train import AZ_DATA_ROOT
-    save_dir = str(AZ_DATA_ROOT / run_name)
+        stats["online"].add(wid)
 
     try:
-        if workers <= 1:
-            from .az_selfplay import run_selfplay_single
-            states, policies, outcomes = run_selfplay_single(
-                config, on_game=on_game, on_status=on_status, save_dir=save_dir)
-        else:
-            from .az_selfplay import run_selfplay
-            states, policies, outcomes = run_selfplay(
-                config, on_game=on_game, on_status=on_status,
-                on_heartbeat=on_heartbeat, save_dir=save_dir)
+        with Live(_StatusView(), console=console, refresh_per_second=4,
+                  transient=False):
+            if workers <= 1:
+                from .az_selfplay import run_selfplay_single
+                states, policies, outcomes = run_selfplay_single(
+                    config, on_game=on_game, on_status=on_status, save_dir=save_dir)
+            else:
+                from .az_selfplay import run_selfplay
+                states, policies, outcomes = run_selfplay(
+                    config, on_game=on_game, on_status=on_status,
+                    on_heartbeat=on_heartbeat, save_dir=save_dir)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]interrupted — completed games were saved.[/dim]")
         return
 
-    elapsed = time.monotonic() - t0
-    total_pos = sum(sp_plies)  # each game contributes ~ply positions
+    elapsed = time.monotonic() - (stats["t0"] or t0)
     console.print(Panel(
         Text.assemble(
-            ("games ", "dim"), (f"{len(sp_plies)}", "white"),
-            ("   positions ", "dim"), (f"~{total_pos:,}", "white"),
-            ("   wins ", "dim"), (f"{sp_wins[0]}", "white"),
-            ("   draws ", "dim"), (f"{sp_draws[0]}", "white"),
+            ("games ", "dim"), (f"{stats['done']}", "white"),
+            ("   positions ", "dim"), (f"{stats['positions']:,}", "white"),
+            ("   wins ", "dim"), (f"{stats['wins']}", "white"),
+            ("   draws ", "dim"), (f"{stats['draws']}", "white"),
             ("   ", "dim"), (f"{elapsed:.0f}s", "white"),
             ("   saved to ", "dim"), (run_name, STYLE_HINT),
         ),
@@ -202,8 +245,8 @@ def _train() -> None:
 
     for i, r in enumerate(runs, 1):
         d = AZ_DATA_ROOT / r
-        files = list(d.glob("iter_*.npz"))
-        console.print(f"  [dim]{i}.[/dim] {r} [dim]({len(files)} iteration(s))[/dim]")
+        files = [f for f in d.glob("*.npz") if not f.name.startswith(".")]
+        console.print(f"  [dim]{i}.[/dim] {r} [dim]({len(files)} data file(s))[/dim]")
 
     raw = Prompt.ask("[dim]Run name or #[/dim]", default=runs[-1]).strip()
     if raw.isdigit() and 1 <= int(raw) <= len(runs):
