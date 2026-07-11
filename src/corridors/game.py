@@ -151,7 +151,25 @@ def _dist_table_from(goal: Pos, blocked_mask: int) -> Dict[Pos, int]:
 
 
 def has_path(start: Pos, goal: Pos, blocked_mask: int) -> bool:
-    return start in _dist_table_from(goal, blocked_mask)
+    if start == goal:
+        return True
+    seen = {start}
+    frontier = [start]
+    while frontier:
+        nxt = []
+        for cell in frontier:
+            for nb in _ADJ[cell]:
+                if nb in seen:
+                    continue
+                bit = _EDGE_BIT.get(_edge_key(cell, nb))
+                if bit is not None and (blocked_mask >> bit) & 1:
+                    continue
+                if nb == goal:
+                    return True
+                seen.add(nb)
+                nxt.append(nb)
+        frontier = nxt
+    return False
 
 
 def shortest_dist(start: Pos, goal: Pos, blocked_mask: int) -> Optional[int]:
