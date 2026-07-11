@@ -492,10 +492,11 @@ def auto_workers(mode: str = "gpu") -> int:
         return max(2, ncpu - 1)
     # GPU mode: workers drive MCTS (CPU-bound; ~1 core each due to the GIL) to
     # feed a single inference server. Self-play is usually CPU-bound, so scale
-    # with cores, but cap it — past a point the single request queue and spawn
-    # overhead dominate. On huge-core hosts, raise Workers manually if the GPU
-    # stays underutilized.
-    return max(2, min(ncpu - 2, 64))
+    # with cores, but cap it — past ~a couple hundred, the single request queue
+    # (one server draining all workers) becomes the bottleneck, not cores. On
+    # huge-core hosts, raise Workers manually and watch whether iterations speed
+    # up; if they plateau, the single server is saturated.
+    return max(2, min(ncpu - 2, 128))
 
 
 def _auto_concurrency(batch_size: int, num_workers: int) -> int:
