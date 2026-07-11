@@ -92,19 +92,17 @@ def _prompt_selfplay_params(num_games: int):
     return device, workers, batch_size, concurrency
 
 
-def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
-                       save_dir: str):
-    """Run self-play behind one self-refreshing status line (no per-game or
-    per-heartbeat spam). Returns (states, policies, outcomes, stats); stats holds
-    done/positions/plies_sum plus wins={1,2} and draws for the caller's summary.
-    Raises KeyboardInterrupt/EOFError to the caller (completed games are saved)."""
+def _selfplay_live(*, effective_workers: int, num_games: int, sims: int, run_fn):
+    """Drive `run_fn(on_game, on_status, on_heartbeat)` behind one self-refreshing
+    status line (no per-game or per-heartbeat spam). `run_fn` returns the
+    (states, policies, outcomes) arrays. Returns ((states, policies, outcomes),
+    stats); stats holds done/positions/plies_sum plus wins={1,2} and draws for the
+    caller's summary. Propagates KeyboardInterrupt/EOFError (completed games are
+    saved by the runner)."""
     console = _console()
     from rich.live import Live
 
     t0 = time.monotonic()
-    # run_selfplay clamps workers to the game count; mirror that so the status
-    # line's "X/Y workers" and "in flight" reflect what actually spawns.
-    effective_workers = min(workers, num_games) if num_games > 0 else workers
     stats = {
         "done": 0, "total": num_games, "positions": 0,
         "wins": {1: 0, 2: 0}, "draws": 0, "plies_sum": 0,
@@ -201,17 +199,46 @@ def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
 
     with Live(_StatusView(), console=console, refresh_per_second=4,
               transient=False):
+        states, policies, outcomes = run_fn(on_game, on_status, on_heartbeat)
+
+    return (states, policies, outcomes), stats
+
+
+def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
+                       save_dir: str):
+    """One-shot self-play (spawns fresh) with the live status line.
+    Returns (states, policies, outcomes, stats)."""
+    # run_selfplay clamps workers to the game count; mirror that for the display.
+    effective = min(workers, num_games) if num_games > 0 else workers
+
+    def run_fn(on_game, on_status, on_heartbeat):
         if workers <= 1:
             from .az_selfplay import run_selfplay_single
-            states, policies, outcomes = run_selfplay_single(
+            return run_selfplay_single(
                 config, on_game=on_game, on_status=on_status, save_dir=save_dir)
-        else:
-            from .az_selfplay import run_selfplay
-            states, policies, outcomes = run_selfplay(
-                config, on_game=on_game, on_status=on_status,
-                on_heartbeat=on_heartbeat, save_dir=save_dir)
+        from .az_selfplay import run_selfplay
+        return run_selfplay(
+            config, on_game=on_game, on_status=on_status,
+            on_heartbeat=on_heartbeat, save_dir=save_dir)
 
-    return states, policies, outcomes, stats
+    (s, p, o), stats = _selfplay_live(
+        effective_workers=effective, num_games=num_games, sims=sims, run_fn=run_fn)
+    return s, p, o, stats
+
+
+def _run_pool_round_live(pool, *, num_games: int, checkpoint: str, sims: int,
+                         save_dir: str, base_game: int):
+    """One round on a persistent SelfPlayPool with the live status line.
+    Returns (states, policies, outcomes, stats)."""
+    def run_fn(on_game, on_status, on_heartbeat):
+        return pool.run(num_games, checkpoint, save_dir=save_dir,
+                        on_game=on_game, on_heartbeat=on_heartbeat,
+                        base_game=base_game)
+
+    (s, p, o), stats = _selfplay_live(
+        effective_workers=pool.num_workers, num_games=num_games, sims=sims,
+        run_fn=run_fn)
+    return s, p, o, stats
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +413,7 @@ def _train() -> None:
 
 def _full_loop() -> None:
     console = _console()
-    from .az_selfplay import SelfPlayConfig
+    from .az_selfplay import SelfPlayConfig, SelfPlayPool
     from .az_train import AZ_DATA_ROOT, AZTrainConfig, load_training_data, train_az
 
     console.print("\n[bold]AlphaZero training loop[/bold]")
@@ -407,7 +434,17 @@ def _full_loop() -> None:
 
     sp_extra = f" · inference batch {sp_batch_size}" if device != "cpu" else ""
     console.print(f"\n[dim]device: {device} · workers: {min(workers, games_per_iter)}"
-                  f"{sp_extra}[/dim]")
+                  f"{sp_extra} · persistent pool[/dim]")
+
+    # One persistent pool for the whole loop — spawn/CUDA-init cost is paid once,
+    # not per iteration. The model checkpoint is reloaded at the start of each
+    # round; other self-play params are fixed for the pool's lifetime.
+    sp_config = SelfPlayConfig(
+        num_games=games_per_iter, simulations=sims, max_plies=max_plies,
+        workers=workers, batch_size=sp_batch_size,
+        concurrent_games=concurrency, device="auto",
+    )
+    pool = SelfPlayPool(sp_config)
 
     loop_t0 = time.monotonic()
     cumulative_games = 0
@@ -420,26 +457,20 @@ def _full_loop() -> None:
             console.print(f"\n[bold]═══ Iteration {it}/{iterations} ═══[/bold]")
 
             # --- Self-play ---
-        
             checkpoint = ckpt_name if (
                 CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
             using = checkpoint or "random init"
             console.print(f"\n  [bold]Self-play[/bold] [dim]· {games_per_iter} games "
                           f"· {sims} sims · {max_plies} max plies · net: {using}[/dim]")
 
-            sp_config = SelfPlayConfig(
-                num_games=games_per_iter, simulations=sims, max_plies=max_plies,
-                workers=workers, batch_size=sp_batch_size,
-                concurrent_games=concurrency, checkpoint=checkpoint, device="auto",
-            )
-
             t0 = time.monotonic()
-            # Self-play streams data to shards on disk; when save_dir is set,
-            # run_selfplay returns empty arrays (everything was flushed), so rely
-            # on stats for counts and load from disk (below) for training.
-            _, _, _, stats = _run_selfplay_live(
-                sp_config, workers=workers, num_games=games_per_iter,
-                sims=sims, save_dir=str(AZ_DATA_ROOT / run_name))
+            # Self-play streams data to shards on disk; the round returns empty
+            # arrays (everything was flushed), so rely on stats for counts and
+            # load from disk (below) for training.
+            _, _, _, stats = _run_pool_round_live(
+                pool, num_games=games_per_iter, checkpoint=checkpoint, sims=sims,
+                save_dir=str(AZ_DATA_ROOT / run_name),
+                base_game=(it - 1) * games_per_iter)
 
             sp_time = time.monotonic() - t0
             positions = stats["positions"]
@@ -508,6 +539,8 @@ def _full_loop() -> None:
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]loop interrupted — last best checkpoint is saved.[/dim]")
         return
+    finally:
+        pool.close()
 
     loop_elapsed = time.monotonic() - loop_t0
     console.print(Panel(

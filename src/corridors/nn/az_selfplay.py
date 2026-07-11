@@ -724,3 +724,381 @@ def run_selfplay_single(
         writer.flush()
 
     return writer.get_all()
+
+
+# ---------------------------------------------------------------------------
+# Persistent pool — reuse server + workers across many rounds (iterations)
+#
+# The one-shot run_selfplay above spawns everything on every call, which costs
+# process-spawn + CUDA init on each iteration of a training loop. SelfPlayPool
+# spawns once and plays repeated rounds; between rounds the GPU server hot-swaps
+# the model checkpoint (CPU workers reload their own local model on change).
+# ---------------------------------------------------------------------------
+
+# Control message tags sent through the (otherwise eval-request) request_queue.
+_CMD_TAG = "__cmd__"
+
+
+def _inference_server_persistent(
+    request_queue: mp.Queue,
+    response_queues: Dict[int, mp.Queue],
+    ack_queue: mp.Queue,
+    device: str,
+    batch_size: int,
+) -> None:
+    """Long-lived batched inference server. Services eval requests and, between
+    rounds, handles control messages: ("__cmd__","reload",ckpt) reloads the model
+    and acks; ("__cmd__","stop",_) exits. Blocks (no busy-spin) while idle."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    import torch
+    from .az_net import AZNet, load_checkpoint as load_az
+
+    model = None
+    pending: List[Tuple[int, int, np.ndarray]] = []
+
+    def _flush_batch():
+        if not pending or model is None:
+            pending.clear()
+            return
+        batch_np = np.stack([t for _, _, t in pending])
+        with torch.no_grad():
+            x = torch.from_numpy(batch_np).to(device)
+            policy_logits, values = model(x)
+            policy_np = policy_logits.cpu().numpy()
+            values_np = values.cpu().numpy()
+        for i, (wid, rid, _) in enumerate(pending):
+            response_queues[wid].put((rid, policy_np[i], float(values_np[i])))
+        pending.clear()
+
+    while True:
+        # Use a short timeout only when a partial batch is waiting to be flushed;
+        # otherwise block so an idle server (e.g. during training) doesn't spin.
+        if pending:
+            try:
+                item = request_queue.get(timeout=_BATCH_TIMEOUT)
+            except Exception:
+                _flush_batch()
+                continue
+        else:
+            item = request_queue.get()
+
+        if item[0] == _CMD_TAG:
+            _flush_batch()
+            _, sub, arg = item
+            if sub == "reload":
+                if arg:
+                    model = load_az(arg, device=device)
+                else:
+                    model = AZNet().to(device)
+                    model.eval()
+                ack_queue.put("ready")
+                continue
+            if sub == "stop":
+                break
+            continue
+
+        pending.append(item)
+        if len(pending) >= batch_size:
+            _flush_batch()
+
+
+def _game_worker_persistent(
+    worker_id: int,
+    config: SelfPlayConfig,
+    request_queue: mp.Queue,
+    response_queue: mp.Queue,
+    result_queue: mp.Queue,
+    cmd_queue: mp.Queue,
+) -> None:
+    """Long-lived GPU-mode worker. Waits for ("play", n, seed, concurrency, base)
+    commands, plays that many games (threaded for concurrency, feeding the shared
+    inference server), signals ("round_done", wid), then waits for the next round.
+    ("stop",) exits."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import itertools
+    import threading
+
+    req_ids = itertools.count()
+    slots: Dict[int, list] = {}
+    slots_lock = threading.Lock()
+    stop_reader = threading.Event()
+
+    def _reader() -> None:
+        while not stop_reader.is_set():
+            try:
+                rid, policy, value = response_queue.get(timeout=0.2)
+            except Exception:
+                continue
+            with slots_lock:
+                slot = slots.get(rid)
+            if slot is not None:
+                slot[1] = (policy, value)
+                slot[0].set()
+
+    def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
+        tensor = encode_state(state, board)
+        rid = next(req_ids)
+        ev = threading.Event()
+        slot = [ev, None]
+        with slots_lock:
+            slots[rid] = slot
+        request_queue.put((worker_id, rid, tensor))
+        ev.wait()
+        with slots_lock:
+            del slots[rid]
+        return slot[1]
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    try:
+        while True:
+            cmd = cmd_queue.get()
+            if cmd[0] == "stop":
+                break
+            _, num_games, seed, concurrency, base_game = cmd
+            np.random.seed(seed & 0x7FFFFFFF)
+            concurrency = max(1, min(concurrency, num_games))
+            buckets: List[List[int]] = [[] for _ in range(concurrency)]
+            for g in range(num_games):
+                buckets[g % concurrency].append(base_game + g)
+
+            def _run_range(thread_idx: int, game_nums: List[int]) -> None:
+                rng = random.Random(seed + 1 + thread_idx)
+                for game_num in game_nums:
+                    _play_one_game(game_num, worker_id, config, evaluate_fn,
+                                   rng, result_queue)
+
+            threads = [
+                threading.Thread(target=_run_range, args=(i, buckets[i]), daemon=True)
+                for i in range(concurrency) if buckets[i]
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            result_queue.put(("round_done", worker_id))
+    finally:
+        stop_reader.set()
+        reader.join(timeout=1)
+
+
+def _game_worker_local_persistent(
+    worker_id: int,
+    config: SelfPlayConfig,
+    result_queue: mp.Queue,
+    cmd_queue: mp.Queue,
+) -> None:
+    """Long-lived CPU-mode worker: loads its own model and reloads it when the
+    checkpoint changes between rounds. Command: ("play", n, seed, ckpt, base)."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    import torch
+    _pin_torch_threads(1)
+    from .az_net import AZNet, load_checkpoint as load_az
+
+    model = None
+    current_ckpt = None
+
+    while True:
+        cmd = cmd_queue.get()
+        if cmd[0] == "stop":
+            break
+        _, num_games, seed, checkpoint, base_game = cmd
+
+        if model is None or checkpoint != current_ckpt:
+            if checkpoint:
+                model = load_az(checkpoint, device="cpu")
+            else:
+                model = AZNet().to("cpu")
+                model.eval()
+            current_ckpt = checkpoint
+
+        @torch.no_grad()
+        def evaluate_fn(state: State, board, _model=model) -> Tuple[np.ndarray, float]:
+            tensor = encode_state(state, board)
+            x = torch.from_numpy(tensor).unsqueeze(0)
+            p, v = _model(x)
+            return p[0].numpy(), float(v[0])
+
+        np.random.seed(seed & 0x7FFFFFFF)
+        rng = random.Random(seed)
+        for i in range(num_games):
+            _play_one_game(base_game + i, worker_id, config, evaluate_fn,
+                           rng, result_queue)
+        result_queue.put(("round_done", worker_id))
+
+
+class SelfPlayPool:
+    """Persistent self-play worker pool. Spawn once, play many rounds.
+
+        pool = SelfPlayPool(config)
+        states, policies, outcomes = pool.run(num_games, checkpoint, save_dir, ...)
+        ...                                    # repeat for each iteration
+        pool.close()
+
+    Use as a context manager to close automatically. The GPU inference server (or
+    each CPU worker's local model) reloads `checkpoint` at the start of each run.
+    """
+
+    def __init__(self, config: SelfPlayConfig, on_status: Optional[Callable[[str], None]] = None) -> None:
+        import sys
+        self.config = config
+        self.device = resolve_device(config.device)
+        self.mode = "cpu" if self.device == "cpu" else "gpu"
+        nw = config.workers if config.workers > 0 else auto_workers(self.mode)
+        self.num_workers = max(1, min(nw, config.num_games))
+        self.concurrency = config.concurrent_games
+        if self.concurrency <= 0:
+            self.concurrency = min(16, max(1, -(-config.batch_size // max(self.num_workers, 1))))
+
+        if self.device == "cpu" and sys.platform != "win32":
+            ctx = mp.get_context("fork")
+        else:
+            ctx = mp.get_context("spawn")
+        self.ctx = ctx
+
+        self.result_queue = ctx.Queue()
+        self.cmd_queues = [ctx.Queue() for _ in range(self.num_workers)]
+        self.workers: List[mp.Process] = []
+        self.server: Optional[mp.Process] = None
+        self.request_queue = None
+        self.response_queues = None
+        self.ack_queue = None
+        self._closed = False
+
+        # Pin native math threads to 1 in every child (inherited at spawn/fork).
+        saved_env = {v: os.environ.get(v) for v in _THREAD_ENV_VARS}
+        for v in _THREAD_ENV_VARS:
+            os.environ[v] = "1"
+        try:
+            if self.mode == "cpu":
+                for i in range(self.num_workers):
+                    w = ctx.Process(
+                        target=_game_worker_local_persistent,
+                        args=(i, config, self.result_queue, self.cmd_queues[i]),
+                        daemon=True,
+                    )
+                    w.start()
+                    self.workers.append(w)
+            else:
+                self.request_queue = ctx.Queue()
+                self.response_queues = {i: ctx.Queue() for i in range(self.num_workers)}
+                self.ack_queue = ctx.Queue()
+                self.server = ctx.Process(
+                    target=_inference_server_persistent,
+                    args=(self.request_queue, self.response_queues, self.ack_queue,
+                          self.device, config.batch_size),
+                    daemon=True,
+                )
+                self.server.start()
+                for i in range(self.num_workers):
+                    w = ctx.Process(
+                        target=_game_worker_persistent,
+                        args=(i, config, self.request_queue, self.response_queues[i],
+                              self.result_queue, self.cmd_queues[i]),
+                        daemon=True,
+                    )
+                    w.start()
+                    self.workers.append(w)
+        finally:
+            for v, val in saved_env.items():
+                if val is None:
+                    os.environ.pop(v, None)
+                else:
+                    os.environ[v] = val
+
+        if on_status:
+            on_status(f"pool: device={self.device}, workers={self.num_workers}, "
+                      f"mode={self.mode}, concurrency={self.concurrency} (persistent)")
+
+    def run(
+        self,
+        num_games: int,
+        checkpoint: str,
+        save_dir: Optional[str] = None,
+        on_game: Optional[Callable] = None,
+        on_heartbeat: Optional[Callable] = None,
+        base_game: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Play one round of `num_games` games using `checkpoint`. Returns any
+        unflushed (states, policies, outcomes)."""
+        if self._closed:
+            raise RuntimeError("pool is closed")
+
+        # Load the model for this round before any worker starts playing.
+        if self.mode == "gpu":
+            self.request_queue.put((_CMD_TAG, "reload", checkpoint))
+            self.ack_queue.get()
+
+        base, extra = divmod(num_games, self.num_workers)
+        games_per = [base + (1 if i < extra else 0) for i in range(self.num_workers)]
+        active = 0
+        gbase = base_game
+        for i in range(self.num_workers):
+            if games_per[i] == 0:
+                continue
+            seed = random.randint(0, 2**31 - 1)
+            if self.mode == "cpu":
+                self.cmd_queues[i].put(("play", games_per[i], seed, checkpoint, gbase))
+            else:
+                self.cmd_queues[i].put(("play", games_per[i], seed, self.concurrency, gbase))
+            gbase += games_per[i]
+            active += 1
+
+        writer = _ShardWriter(save_dir)
+        done_workers = 0
+        done_count = 0
+        try:
+            while done_workers < active:
+                item = self.result_queue.get()
+                if item[0] == "round_done":
+                    done_workers += 1
+                    continue
+                if item[0] == "heartbeat":
+                    if on_heartbeat:
+                        _, wid, game_num, ply = item
+                        on_heartbeat(wid, game_num, ply)
+                    continue
+                wid, game_num, states, policies, outcomes, winner, ply = item
+                writer.add_game(states, policies, outcomes)
+                done_count += 1
+                if on_game:
+                    on_game(done_count, num_games, winner, ply, writer.total_positions)
+        finally:
+            writer.flush()
+        return writer.get_all()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for q in self.cmd_queues:
+            try:
+                q.put(("stop",))
+            except Exception:
+                pass
+        if self.mode == "gpu" and self.request_queue is not None:
+            try:
+                self.request_queue.put((_CMD_TAG, "stop", ""))
+            except Exception:
+                pass
+        for w in self.workers:
+            w.join(timeout=5)
+        if self.server is not None:
+            self.server.join(timeout=5)
+        for w in self.workers:
+            if w.is_alive():
+                w.terminate()
+        if self.server is not None and self.server.is_alive():
+            self.server.terminate()
+
+    def __enter__(self) -> "SelfPlayPool":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
