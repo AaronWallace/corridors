@@ -158,7 +158,7 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int, run_fn)
             elapsed = time.monotonic() - (stats["play_t0"] or t0)
             return Text.assemble(
                 ("  playing  ", "cyan"),
-                (f"{len(stats['online'])}/{stats['workers']} games", "bold white"),
+                (f"{len(stats['online'])}/{stats['workers']} workers", "bold white"),
                 sep, (f"~{_hcount(plies)} plies", "white"),
                 sep, (f"~{_hcount(plies * sims)} sims", "white"),
                 sep, (_hdur(elapsed), "dim"),
@@ -209,7 +209,9 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int, run_fn)
         if stats["play_t0"] is None:
             stats["play_t0"] = time.monotonic()
         stats["online"].add(wid)
-        stats["hb"][wid] = ply
+        # Key by (worker, game) — each worker runs many concurrent games, so
+        # keying by worker alone would only track one game's plies per worker.
+        stats["hb"][(wid, game_num)] = ply
 
     with Live(_StatusView(), console=console, refresh_per_second=4,
               transient=False):
