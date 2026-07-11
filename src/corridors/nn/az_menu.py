@@ -136,6 +136,16 @@ def _selfplay() -> None:
     def on_status(msg):
         console.print(f"[dim]{msg}[/dim]")
 
+    worker_progress = {}
+
+    def on_heartbeat(wid, game_num, ply):
+        worker_progress[wid] = (game_num, ply)
+        active = len(worker_progress)
+        parts = [f"w{w}:g{g}p{p}" for w, (g, p) in sorted(worker_progress.items())]
+        if len(parts) > 8:
+            parts = parts[:8] + [f"...+{len(parts)-8}"]
+        console.print(f"  [dim]♥ {active} workers active  {' '.join(parts)}[/dim]")
+
     from .az_train import AZ_DATA_ROOT
     save_dir = str(AZ_DATA_ROOT / run_name)
 
@@ -147,7 +157,8 @@ def _selfplay() -> None:
         else:
             from .az_selfplay import run_selfplay
             states, policies, outcomes = run_selfplay(
-                config, on_game=on_game, on_status=on_status, save_dir=save_dir)
+                config, on_game=on_game, on_status=on_status,
+                on_heartbeat=on_heartbeat, save_dir=save_dir)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]interrupted — completed games were saved.[/dim]")
         return
@@ -340,6 +351,15 @@ def _full_loop() -> None:
                         f"{gps:.1f} g/s[/dim]"
                     )
 
+            worker_progress = {}
+
+            def on_heartbeat(wid, game_num, ply, _wp=worker_progress):
+                _wp[wid] = (game_num, ply)
+                parts = [f"w{w}:g{g}p{p}" for w, (g, p) in sorted(_wp.items())]
+                if len(parts) > 8:
+                    parts = parts[:8] + [f"...+{len(parts)-8}"]
+                console.print(f"    [dim]♥ {len(_wp)} workers  {' '.join(parts)}[/dim]")
+
             sp_save_dir = str(AZ_DATA_ROOT / run_name)
             if workers <= 1:
                 from .az_selfplay import run_selfplay_single
@@ -348,7 +368,8 @@ def _full_loop() -> None:
             else:
                 from .az_selfplay import run_selfplay
                 states, policies, outcomes = run_selfplay(
-                    sp_config, on_game=on_game, save_dir=sp_save_dir)
+                    sp_config, on_game=on_game, on_heartbeat=on_heartbeat,
+                    save_dir=sp_save_dir)
 
             sp_time = time.monotonic() - t0
             decisive = sp_wins.get(1, 0) + sp_wins.get(2, 0)

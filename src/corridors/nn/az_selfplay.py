@@ -215,6 +215,7 @@ def _game_worker(
         return policy, value
 
     from .mcts import run_mcts
+    import time as _time
 
     for game_num in range(num_games):
         p1_col = rng.randint(0, NCOLS - 1)
@@ -223,6 +224,7 @@ def _game_worker(
 
         record = GameRecord()
         ply = 0
+        last_heartbeat = _time.monotonic()
         while True:
             w = state.winner(board)
             if w is not None:
@@ -252,6 +254,11 @@ def _game_worker(
 
             state = apply_move(state, move)
             ply += 1
+
+            now = _time.monotonic()
+            if now - last_heartbeat >= 5.0:
+                result_queue.put(("heartbeat", worker_id, game_num, ply))
+                last_heartbeat = now
 
         # Back-fill outcomes
         outcomes = []
@@ -308,6 +315,8 @@ def _game_worker_local(
         p, v = model(x)
         return p[0].numpy(), float(v[0])
 
+    import time as _time
+
     for game_num in range(num_games):
         p1_col = rng.randint(0, NCOLS - 1)
         p2_col = rng.randint(0, NCOLS - 1)
@@ -315,6 +324,7 @@ def _game_worker_local(
 
         record = GameRecord()
         ply = 0
+        last_heartbeat = _time.monotonic()
         while True:
             w = state.winner(board)
             if w is not None:
@@ -341,6 +351,11 @@ def _game_worker_local(
             record.turns.append(state.turn)
             state = apply_move(state, move)
             ply += 1
+
+            now = _time.monotonic()
+            if now - last_heartbeat >= 5.0:
+                result_queue.put(("heartbeat", worker_id, game_num, ply))
+                last_heartbeat = now
 
         outcomes = []
         for t in record.turns:
@@ -385,6 +400,7 @@ def run_selfplay(
     config: SelfPlayConfig,
     on_game: Optional[Callable[[int, int, Optional[int], int, int], None]] = None,
     on_status: Optional[Callable[[str], None]] = None,
+    on_heartbeat: Optional[Callable[[int, int, int], None]] = None,
     save_dir: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run self-play games. Returns (states, policies, outcomes) arrays.
@@ -467,6 +483,11 @@ def run_selfplay(
             item = result_queue.get()
             if item[0] == "done":
                 workers_done += 1
+                continue
+            if item[0] == "heartbeat":
+                if on_heartbeat:
+                    _, wid, game_num, ply = item
+                    on_heartbeat(wid, game_num, ply)
                 continue
 
             wid, game_num, states, policies, outcomes, winner, ply = item
