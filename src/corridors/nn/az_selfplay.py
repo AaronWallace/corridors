@@ -513,9 +513,15 @@ def run_selfplay(
       outcomes: (N,) float32  — from side-to-move perspective
     """
     import sys
-    ctx = mp.get_context("fork" if sys.platform != "win32" else "spawn")
     device = resolve_device(config.device)
     mode = "cpu" if device == "cpu" else "gpu"
+    # CUDA cannot be re-initialized in a forked child (the parent already touched
+    # CUDA via resolve_device), so GPU mode must use spawn. CPU mode uses fork on
+    # POSIX for fast, import-free worker startup.
+    if device == "cpu" and sys.platform != "win32":
+        ctx = mp.get_context("fork")
+    else:
+        ctx = mp.get_context("spawn")
     num_workers = config.workers if config.workers > 0 else auto_workers(mode)
     num_workers = min(num_workers, config.num_games)
 
