@@ -66,6 +66,110 @@ def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Shared self-play runner with a single self-refreshing status line
+# ---------------------------------------------------------------------------
+
+def _run_selfplay_live(config, *, workers: int, num_games: int, sims: int,
+                       save_dir: str):
+    """Run self-play behind one self-refreshing status line (no per-game or
+    per-heartbeat spam). Returns (states, policies, outcomes, stats); stats holds
+    done/positions/plies_sum plus wins={1,2} and draws for the caller's summary.
+    Raises KeyboardInterrupt/EOFError to the caller (completed games are saved)."""
+    console = _console()
+    from rich.live import Live
+
+    t0 = time.monotonic()
+    stats = {
+        "done": 0, "total": num_games, "positions": 0,
+        "wins": {1: 0, 2: 0}, "draws": 0, "plies_sum": 0,
+        "workers": workers, "online": set(), "t0": None,
+    }
+
+    def _hcount(n: float) -> str:
+        if n < 1000:
+            return f"{int(n):,}"
+        if n < 1_000_000:
+            return f"{n / 1e3:.1f}K"
+        if n < 1_000_000_000:
+            return f"{n / 1e6:.2f}M"
+        return f"{n / 1e9:.2f}B"
+
+    def _hdur(secs: float) -> str:
+        s = int(secs)
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m{s % 60:02d}s"
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+    def _render() -> Text:
+        # Startup phase: workers are still spawning; show the ramp on one line.
+        if stats["t0"] is None:
+            return Text.assemble(
+                ("  starting workers  ", "cyan"),
+                (f"{len(stats['online'])}/{stats['workers']}", "bold white"),
+                ("  ·  ", STYLE_GRID), (_hdur(time.monotonic() - t0), "dim"),
+            )
+        done, total = stats["done"], stats["total"]
+        elapsed = time.monotonic() - stats["t0"]
+        gps = done / elapsed if elapsed > 0 else 0.0
+        pos = stats["positions"]
+        remaining = total - done
+        in_flight = max(0, min(stats["workers"], remaining))
+        eta = _hdur(remaining / gps) if gps > 0 and remaining > 0 else "—"
+        avg_ply = stats["plies_sum"] / done if done else 0.0
+        wins = stats["wins"][1] + stats["wins"][2]
+        sep = ("  ·  ", STYLE_GRID)
+        return Text.assemble(
+            ("  ", ""),
+            (f"{done}/{total} games", "bold white"),
+            (f" {done / total * 100:.0f}%" if total else "", "dim"),
+            sep, (f"{in_flight} in flight", "white"),
+            sep, (f"{_hcount(pos)} pos", "white"),
+            sep, (f"{_hcount(pos * sims)} sims", "white"),
+            sep, (f"{gps:.1f} g/s", "cyan"),
+            sep, (f"W{wins} D{stats['draws']}", "dim"),
+            sep, (f"avg {avg_ply:.0f} ply", "dim"),
+            sep, (f"ETA {eta}", "green"),
+        )
+
+    class _StatusView:
+        def __rich__(self) -> Text:
+            return _render()
+
+    def on_status(msg):
+        console.print(f"[dim]{msg}[/dim]")
+
+    def on_game(done, total, winner, ply, positions):
+        if stats["t0"] is None:
+            stats["t0"] = time.monotonic()  # first completion = end of warmup
+        stats["done"] = done
+        stats["positions"] = positions
+        stats["plies_sum"] += ply
+        if winner is None:
+            stats["draws"] += 1
+        else:
+            stats["wins"][winner] = stats["wins"].get(winner, 0) + 1
+
+    def on_heartbeat(wid, game_num, ply):
+        stats["online"].add(wid)
+
+    with Live(_StatusView(), console=console, refresh_per_second=4,
+              transient=False):
+        if workers <= 1:
+            from .az_selfplay import run_selfplay_single
+            states, policies, outcomes = run_selfplay_single(
+                config, on_game=on_game, on_status=on_status, save_dir=save_dir)
+        else:
+            from .az_selfplay import run_selfplay
+            states, policies, outcomes = run_selfplay(
+                config, on_game=on_game, on_status=on_status,
+                on_heartbeat=on_heartbeat, save_dir=save_dir)
+
+    return states, policies, outcomes, stats
+
+
+# ---------------------------------------------------------------------------
 # 1. Self-play
 # ---------------------------------------------------------------------------
 
@@ -109,110 +213,24 @@ def _selfplay() -> None:
     )
 
     from .az_train import AZ_DATA_ROOT
-    from rich.live import Live
-
     save_dir = str(AZ_DATA_ROOT / run_name)
     t0 = time.monotonic()
 
-    # Live status is driven by mutating this dict from the callbacks; a single
-    # self-refreshing line renders it (see _StatusView below) instead of printing
-    # a line per game / per heartbeat.
-    stats = {
-        "done": 0, "total": num_games, "positions": 0,
-        "wins": 0, "draws": 0, "plies_sum": 0,
-        "workers": workers, "online": set(), "t0": None,
-    }
-
-    def _hcount(n: float) -> str:
-        if n < 1000:
-            return f"{int(n):,}"
-        if n < 1_000_000:
-            return f"{n / 1e3:.1f}K"
-        if n < 1_000_000_000:
-            return f"{n / 1e6:.2f}M"
-        return f"{n / 1e9:.2f}B"
-
-    def _hdur(secs: float) -> str:
-        s = int(secs)
-        if s < 60:
-            return f"{s}s"
-        if s < 3600:
-            return f"{s // 60}m{s % 60:02d}s"
-        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
-
-    def _render() -> Text:
-        # Startup phase: workers are still spawning; show the ramp on one line.
-        if stats["t0"] is None:
-            return Text.assemble(
-                ("  starting workers  ", "cyan"),
-                (f"{len(stats['online'])}/{stats['workers']}", "bold white"),
-                ("  ·  ", STYLE_GRID), (_hdur(time.monotonic() - t0), "dim"),
-            )
-        done, total = stats["done"], stats["total"]
-        elapsed = time.monotonic() - stats["t0"]
-        gps = done / elapsed if elapsed > 0 else 0.0
-        pos = stats["positions"]
-        remaining = total - done
-        in_flight = max(0, min(stats["workers"], remaining))
-        eta = _hdur(remaining / gps) if gps > 0 and remaining > 0 else "—"
-        avg_ply = stats["plies_sum"] / done if done else 0.0
-        sep = ("  ·  ", STYLE_GRID)
-        return Text.assemble(
-            ("  ", ""),
-            (f"{done}/{total} games", "bold white"),
-            (f" {done / total * 100:.0f}%" if total else "", "dim"),
-            sep, (f"{in_flight} in flight", "white"),
-            sep, (f"{_hcount(pos)} pos", "white"),
-            sep, (f"{_hcount(pos * sims)} sims", "white"),
-            sep, (f"{gps:.1f} g/s", "cyan"),
-            sep, (f"W{stats['wins']} D{stats['draws']}", "dim"),
-            sep, (f"avg {avg_ply:.0f} ply", "dim"),
-            sep, (f"ETA {eta}", "green"),
-        )
-
-    class _StatusView:
-        def __rich__(self) -> Text:
-            return _render()
-
-    def on_status(msg):
-        console.print(f"[dim]{msg}[/dim]")
-
-    def on_game(done, total, winner, ply, positions):
-        if stats["t0"] is None:
-            stats["t0"] = time.monotonic()  # first completion = end of warmup
-        stats["done"] = done
-        stats["positions"] = positions
-        stats["plies_sum"] += ply
-        if winner is None:
-            stats["draws"] += 1
-        else:
-            stats["wins"] += 1
-
-    def on_heartbeat(wid, game_num, ply):
-        stats["online"].add(wid)
-
     try:
-        with Live(_StatusView(), console=console, refresh_per_second=4,
-                  transient=False):
-            if workers <= 1:
-                from .az_selfplay import run_selfplay_single
-                states, policies, outcomes = run_selfplay_single(
-                    config, on_game=on_game, on_status=on_status, save_dir=save_dir)
-            else:
-                from .az_selfplay import run_selfplay
-                states, policies, outcomes = run_selfplay(
-                    config, on_game=on_game, on_status=on_status,
-                    on_heartbeat=on_heartbeat, save_dir=save_dir)
+        states, policies, outcomes, stats = _run_selfplay_live(
+            config, workers=workers, num_games=num_games, sims=sims,
+            save_dir=save_dir)
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]interrupted — completed games were saved.[/dim]")
         return
 
-    elapsed = time.monotonic() - (stats["t0"] or t0)
+    elapsed = time.monotonic() - t0
+    wins = stats["wins"][1] + stats["wins"][2]
     console.print(Panel(
         Text.assemble(
             ("games ", "dim"), (f"{stats['done']}", "white"),
             ("   positions ", "dim"), (f"{stats['positions']:,}", "white"),
-            ("   wins ", "dim"), (f"{stats['wins']}", "white"),
+            ("   wins ", "dim"), (f"{wins}", "white"),
             ("   draws ", "dim"), (f"{stats['draws']}", "white"),
             ("   ", "dim"), (f"{elapsed:.0f}s", "white"),
             ("   saved to ", "dim"), (run_name, STYLE_HINT),
@@ -370,65 +388,29 @@ def _full_loop() -> None:
             )
 
             t0 = time.monotonic()
-            sp_wins = {1: 0, 2: 0}
-            sp_draws = [0]
-            sp_plies = []
-
-            def on_game(done, total, winner, ply, positions, _t0=t0,
-                        _wins=sp_wins, _draws=sp_draws, _plies=sp_plies):
-                _plies.append(ply)
-                if winner is None:
-                    _draws[0] += 1
-                else:
-                    _wins[winner] = _wins.get(winner, 0) + 1
-                if done % max(1, total // 10) == 0 or done == total:
-                    elapsed = time.monotonic() - _t0
-                    gps = done / elapsed if elapsed > 0 else 0
-                    avg_ply = sum(_plies) / len(_plies) if _plies else 0
-                    w = _wins.get(1, 0) + _wins.get(2, 0)
-                    console.print(
-                        f"    [dim]{done:>5}/{total}  "
-                        f"W {w} D {_draws[0]}  "
-                        f"avg ply {avg_ply:.0f}  "
-                        f"{positions:>8,} pos  "
-                        f"{gps:.1f} g/s[/dim]"
-                    )
-
-            worker_progress = {}
-
-            def on_heartbeat(wid, game_num, ply, _wp=worker_progress):
-                _wp[wid] = (game_num, ply)
-                parts = [f"w{w}:g{g}p{p}" for w, (g, p) in sorted(_wp.items())]
-                if len(parts) > 8:
-                    parts = parts[:8] + [f"...+{len(parts)-8}"]
-                console.print(f"    [dim]♥ {len(_wp)} workers  {' '.join(parts)}[/dim]")
-
-            sp_save_dir = str(AZ_DATA_ROOT / run_name)
-            if workers <= 1:
-                from .az_selfplay import run_selfplay_single
-                states, policies, outcomes = run_selfplay_single(
-                    sp_config, on_game=on_game, save_dir=sp_save_dir)
-            else:
-                from .az_selfplay import run_selfplay
-                states, policies, outcomes = run_selfplay(
-                    sp_config, on_game=on_game, on_heartbeat=on_heartbeat,
-                    save_dir=sp_save_dir)
+            # Self-play streams data to shards on disk; when save_dir is set,
+            # run_selfplay returns empty arrays (everything was flushed), so rely
+            # on stats for counts and load from disk (below) for training.
+            _, _, _, stats = _run_selfplay_live(
+                sp_config, workers=workers, num_games=games_per_iter,
+                sims=sims, save_dir=str(AZ_DATA_ROOT / run_name))
 
             sp_time = time.monotonic() - t0
-            decisive = sp_wins.get(1, 0) + sp_wins.get(2, 0)
-            avg_ply = sum(sp_plies) / len(sp_plies) if sp_plies else 0
+            positions = stats["positions"]
+            decisive = stats["wins"][1] + stats["wins"][2]
+            avg_ply = stats["plies_sum"] / stats["done"] if stats["done"] else 0
             console.print(
-                f"  [dim]→ {len(states):,} positions in {sp_time:.0f}s  "
-                f"({decisive} decisive, {sp_draws[0]} draws, avg {avg_ply:.0f} ply)[/dim]"
+                f"  [dim]→ {positions:,} positions in {sp_time:.0f}s  "
+                f"({decisive} decisive, {stats['draws']} draws, avg {avg_ply:.0f} ply)[/dim]"
             )
 
             cumulative_games += games_per_iter
-            cumulative_positions += len(states)
-            cumulative_wins[1] += sp_wins.get(1, 0)
-            cumulative_wins[2] += sp_wins.get(2, 0)
-            cumulative_draws += sp_draws[0]
+            cumulative_positions += positions
+            cumulative_wins[1] += stats["wins"][1]
+            cumulative_wins[2] += stats["wins"][2]
+            cumulative_draws += stats["draws"]
 
-            if len(states) == 0:
+            if positions == 0:
                 console.print("[yellow]no data generated, stopping.[/yellow]")
                 break
 
