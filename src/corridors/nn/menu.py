@@ -161,6 +161,49 @@ def _train_model() -> None:
 # 3. Tournament
 # ---------------------------------------------------------------------------
 
+def _print_head_to_head(console, results, ratings) -> None:
+    """Crosstable of each model's W-L-D vs every other model (row's perspective).
+    Rows/columns are ordered by Elo; columns are numbered to keep it compact."""
+    from collections import defaultdict
+    if not results:
+        return
+    rec = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))  # rec[a][b] = [W,L,D]
+    names = set()
+    for a, b, score in results:
+        names.add(a); names.add(b)
+        if score == 1.0:
+            rec[a][b][0] += 1; rec[b][a][1] += 1      # a wins, b loses
+        elif score == 0.0:
+            rec[a][b][1] += 1; rec[b][a][0] += 1      # a loses, b wins
+        else:
+            rec[a][b][2] += 1; rec[b][a][2] += 1      # draw
+
+    order = sorted(names, key=lambda n: (-ratings.get(n, 0.0), n))
+    idx = {n: i + 1 for i, n in enumerate(order)}
+
+    t = Table(box=box.SIMPLE, header_style="dim",
+              title="Head-to-head (W-L-D, row vs column)", title_style="bold")
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("model")
+    for n in order:
+        t.add_column(str(idx[n]), justify="center")
+    for r in order:
+        cells = []
+        for c in order:
+            if r == c:
+                cells.append("[dim]·[/dim]")
+                continue
+            w, l, d = rec[r][c]
+            if w + l + d == 0:
+                cells.append("[dim]-[/dim]")
+            else:
+                colour = "green" if w > l else ("red" if l > w else "yellow")
+                cells.append(f"[{colour}]{w}-{l}-{d}[/{colour}]")
+        style = "bold white" if r == "classical" else STYLE_HINT
+        t.add_row(str(idx[r]), Text(r, style=style), *cells)
+    console.print(t)
+
+
 def _tournament() -> None:
     console = _console()
     from . import model as model_mod
@@ -221,6 +264,9 @@ def _tournament() -> None:
         style = "bold white" if name == "classical" else STYLE_HINT
         t.add_row(str(i), Text(name, style=style), f"{elo:+.0f}")
     console.print(t)
+
+    _print_head_to_head(console, data.get("last_run", {}).get("results", []),
+                        data["ratings"])
 
 
 # ---------------------------------------------------------------------------
