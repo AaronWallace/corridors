@@ -50,8 +50,46 @@ echo "Installing dependencies..."
 # Install PyTorch with CUDA if nvidia-smi is available
 if command -v nvidia-smi &>/dev/null; then
     echo "NVIDIA GPU detected — installing PyTorch with CUDA..."
-    "$PYTHON" -m pip install torch --index-url https://download.pytorch.org/whl/cu126 -q
-    "$PYTHON" -c 'import torch; print(f"  PyTorch CUDA: {torch.cuda.is_available()}")'
+
+    # Pick a wheel channel that ships kernels for the installed GPU. Newer GPUs
+    # (e.g. Blackwell / RTX 50-series, sm_120) need CUDA 12.8+ builds; a cu126
+    # wheel installs cleanly and even reports cuda.is_available()==True, but has
+    # no kernels for sm_120 and dies at the first CUDA op. Choose by the driver's
+    # max CUDA version (override with TORCH_CUDA_CHANNEL=cu129 etc).
+    CH="${TORCH_CUDA_CHANNEL:-}"
+    CUDA_VER=$(nvidia-smi 2>/dev/null | grep -oiE 'CUDA Version:[[:space:]]*[0-9]+\.[0-9]+' \
+        | grep -oE '[0-9]+\.[0-9]+' | head -1) || true
+    if [ -z "$CH" ]; then
+        cuda_int=$(awk -v v="${CUDA_VER:-0}" 'BEGIN{n=split(v,a,"."); print (n>=2)?a[1]*100+a[2]:0}')
+        if   [ "$cuda_int" -ge 1302 ]; then CH=cu132
+        elif [ "$cuda_int" -ge 1300 ]; then CH=cu130
+        elif [ "$cuda_int" -ge 1208 ]; then CH=cu129
+        else CH=cu126
+        fi
+    fi
+    echo "  driver CUDA: ${CUDA_VER:-unknown} — using wheel channel: $CH"
+    "$PYTHON" -m pip install torch --index-url "https://download.pytorch.org/whl/$CH" -q
+
+    # Verify with a real CUDA op (is_available() alone doesn't catch missing
+    # kernels). If it fails, the wrong build is present — force a clean reinstall.
+    _gpu_ok() {
+        "$PYTHON" - <<'PY' >/dev/null 2>&1
+import torch
+assert torch.cuda.is_available()
+(torch.zeros(8, device="cuda") + 1).sum().item()
+PY
+    }
+    if ! _gpu_ok; then
+        echo "  installed build has no kernels for this GPU — forcing reinstall on $CH..."
+        "$PYTHON" -m pip install --force-reinstall --no-cache-dir torch \
+            --index-url "https://download.pytorch.org/whl/$CH" -q
+    fi
+    if _gpu_ok; then
+        "$PYTHON" -c 'import torch; print(f"  PyTorch {torch.__version__} · CUDA ops: OK")'
+    else
+        echo "  WARNING: CUDA ops still failing. Try a different channel, e.g.:"
+        echo "    TORCH_CUDA_CHANNEL=cu130 ./setup.sh"
+    fi
 else
     echo "No NVIDIA GPU detected — skipping PyTorch (install manually if needed)."
 fi
