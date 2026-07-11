@@ -3,7 +3,7 @@ name = "corridors"
 version = "0.1.0"
 description = "Quoridor-family board game with alpha-beta solver, playable in the console."
 requires-python = ">=3.10"
-dependencies = ["rich>=13", "numpy>=1.26", "safetensors>=0.4"]
+dependencies = ["rich>=13", "numpy>=1.26", "safetensors>=0.4", "threadpoolctl>=3"]
 
 [project.optional-dependencies]
 # torch install is platform-specific; on CUDA machines prefer:

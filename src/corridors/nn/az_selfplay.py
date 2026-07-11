@@ -58,6 +58,22 @@ def _pin_torch_threads(n: int = 1) -> None:
         pass
 
 
+_blas_limiter = None  # kept alive for the process lifetime once set
+
+
+def _limit_blas_threads(n: int = 1) -> None:
+    """Force this process's BLAS/OpenMP pools to n threads at runtime. The
+    inherited *_NUM_THREADS env vars usually suffice, but if the BLAS initialized
+    before they were set it ignores them — then hundreds of workers each spin up a
+    full multi-threaded BLAS and thrash. threadpoolctl caps it regardless."""
+    global _blas_limiter
+    try:
+        from threadpoolctl import threadpool_limits
+        _blas_limiter = threadpool_limits(limits=n)
+    except Exception:
+        pass
+
+
 def _raise_fd_limit() -> None:
     """Raise the soft open-file limit toward the hard limit (POSIX only). Each
     worker gets its own command queue (a pipe + semaphores) and a fork pipe, so
@@ -400,6 +416,7 @@ def _game_worker_local(
     torch — ideal for CPU clusters (each process stays lightweight)."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _limit_blas_threads(1)  # one BLAS thread per worker — parallelism is per-process
 
     from .az_infer_np import load_np, random_np
     from .mcts import run_mcts
@@ -964,6 +981,7 @@ def _game_worker_local_persistent(
     ("play", n, seed, ckpt, base)."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    _limit_blas_threads(1)  # one BLAS thread per worker — parallelism is per-process
 
     from .az_infer_np import load_np, random_np
 
