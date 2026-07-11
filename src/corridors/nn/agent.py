@@ -1,8 +1,10 @@
-"""NetworkAgent: plays Corridors using a trained ValueNet (1-ply lookahead).
+"""NetworkAgent: plays Corridors using a trained network.
 
-pick_move: enumerate legal moves; short-circuit immediate wins; batch-encode
-all children; single forward pass; negate (child value is from the opponent's
-perspective); epsilon-band random tie-break for variety.
+Supports both architectures:
+  - ValueNet (value-only): 1-ply lookahead, batch-evaluate all children
+  - AZNet (policy+value): use policy head directly, no search needed
+
+pick_move: short-circuit immediate wins; epsilon-band random tie-break.
 """
 
 from __future__ import annotations
@@ -14,8 +16,17 @@ import numpy as np
 import torch
 
 from ..game import Board, Move, State, apply_move, legal_moves
-from . import model as model_mod
 from .encoding import encode_state
+
+
+def _load_model(checkpoint: str, device: str):
+    """Load checkpoint, auto-detecting architecture from .meta.json."""
+    from . import model as model_mod
+    meta = model_mod.read_meta(checkpoint)
+    if meta.get("arch") == "az":
+        from . import az_net
+        return az_net.load_checkpoint(checkpoint, device=device), "az"
+    return model_mod.load_checkpoint(checkpoint, device=device), "value"
 
 
 class NetworkAgent:
@@ -23,7 +34,7 @@ class NetworkAgent:
                  epsilon_band: float = 0.02, seed: Optional[int] = None) -> None:
         self.name = checkpoint
         self.device = device
-        self.model = model_mod.load_checkpoint(checkpoint, device=device)
+        self.model, self.arch = _load_model(checkpoint, device=device)
         self.epsilon_band = epsilon_band
         self.rng = random.Random(seed)
 
@@ -35,16 +46,41 @@ class NetworkAgent:
         moves = legal_moves(state, board)
         if not moves:
             raise RuntimeError("no legal moves")
-        children: List[State] = []
+
+        # Short-circuit immediate wins
         for mv in moves:
             child = apply_move(state, mv)
             if child.winner(board) is not None:
-                return mv  # immediate win
-            children.append(child)
+                return mv
 
+        if self.arch == "az":
+            return self._pick_az(state, board, moves)
+        return self._pick_value(state, board, moves)
+
+    def _pick_az(self, state: State, board: Board, moves: List[Move]) -> Move:
+        """AZ net: use policy head directly."""
+        from .actions import move_to_index
+        tensor = encode_state(state, board)
+        x = torch.from_numpy(tensor).unsqueeze(0).to(self.device)
+        policy_logits, value = self.model(x)
+        logits = policy_logits[0].cpu().numpy()
+
+        # Mask illegal moves, softmax over legal
+        indices = [move_to_index(m) for m in moves]
+        legal_logits = logits[indices]
+        legal_logits -= legal_logits.max()
+        exp = np.exp(legal_logits)
+        probs = exp / exp.sum()
+
+        best = float(probs.max())
+        band = [m for m, p in zip(moves, probs) if p >= best - self.epsilon_band]
+        return self.rng.choice(band)
+
+    def _pick_value(self, state: State, board: Board, moves: List[Move]) -> Move:
+        """Value-only net: 1-ply lookahead over all children."""
+        children = [apply_move(state, mv) for mv in moves]
         batch = np.stack([encode_state(c, board) for c in children])
         x = torch.from_numpy(batch).to(self.device)
-        # Child values are from the opponent's (side-to-move of child) view; negate.
         values = (-self.model(x)).cpu().numpy()
 
         best = float(values.max())
