@@ -25,9 +25,9 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from . import az_net
+from .az_selfplay import AZ_DATA_ROOT  # single source of truth (torch-free module)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-AZ_DATA_ROOT = _PROJECT_ROOT / "nn_data" / "alphazero"
 
 
 @dataclass

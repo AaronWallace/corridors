@@ -18,6 +18,7 @@ import os
 import random
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,6 +31,11 @@ from .encoding import NROWS, NUM_PLANES, encode_state
 _SHUTDOWN = None
 _BATCH_TIMEOUT = 0.005  # 5ms — wait this long to fill a batch
 SHARD_EVERY = 25  # flush to disk every N games
+
+# Where self-play shards are written / training reads them. Defined here (a
+# torch-free module) so CPU self-play never imports az_train (and thus torch).
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+AZ_DATA_ROOT = _PROJECT_ROOT / "nn_data" / "alphazero"
 
 # Env vars that native math libraries (OpenMP/MKL/OpenBLAS) read at import time to
 # size their thread pools. We pin these to 1 in each worker so N single-threaded
@@ -499,10 +505,15 @@ def _game_worker_local(
 # ---------------------------------------------------------------------------
 
 def resolve_device(device: str) -> str:
-    import torch
+    # Only touch torch when we actually have to decide (device="auto"). An explicit
+    # "cpu"/"cuda" resolves without importing torch, so CPU self-play needs no torch.
     if device != "auto":
         return device
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
 
 
 def auto_workers(mode: str = "gpu") -> int:
@@ -735,26 +746,34 @@ def run_selfplay_single(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Single-process self-play (no multiprocessing). Good for debugging or
     when running inside a container with limited resources."""
-    import torch
-    from .az_net import AZNet, load_checkpoint as load_az
     from .mcts import run_mcts
 
     device = resolve_device(config.device)
-    if config.checkpoint:
-        model = load_az(config.checkpoint, device=device)
-    else:
-        model = AZNet().to(device)
-        model.eval()
-
     if on_status:
         on_status(f"single-process mode, device={device}, sims={config.simulations}")
 
-    @torch.no_grad()
-    def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
-        tensor = encode_state(state, board)
-        x = torch.from_numpy(tensor).unsqueeze(0).to(device)
-        p, v = model(x)
-        return p[0].cpu().numpy(), float(v[0])
+    if device == "cpu":
+        # Torch-free NumPy inference — no torch needed for CPU self-play.
+        from .az_infer_np import load_np, random_np
+        net = load_np(config.checkpoint) if config.checkpoint else random_np()
+
+        def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
+            return net.forward(encode_state(state, board))
+    else:
+        import torch
+        from .az_net import AZNet, load_checkpoint as load_az
+        if config.checkpoint:
+            model = load_az(config.checkpoint, device=device)
+        else:
+            model = AZNet().to(device)
+            model.eval()
+
+        @torch.no_grad()
+        def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
+            tensor = encode_state(state, board)
+            x = torch.from_numpy(tensor).unsqueeze(0).to(device)
+            p, v = model(x)
+            return p[0].cpu().numpy(), float(v[0])
 
     writer = _ShardWriter(save_dir)
 

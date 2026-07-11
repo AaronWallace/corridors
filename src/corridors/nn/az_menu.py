@@ -338,7 +338,7 @@ def _selfplay() -> None:
         device=sp_device,
     )
 
-    from .az_train import AZ_DATA_ROOT
+    from .az_selfplay import AZ_DATA_ROOT  # torch-free — standalone self-play needs no torch
     save_dir = str(AZ_DATA_ROOT / run_name)
     t0 = time.monotonic()
 
