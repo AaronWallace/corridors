@@ -396,31 +396,21 @@ def _game_worker_local(
     result_queue: mp.Queue,
     seed: int,
 ) -> None:
-    """Self-contained worker: loads model locally, no inference server needed.
-    Each process does its own inference on CPU — ideal for CPU-only clusters."""
+    """Self-contained worker: runs its own NumPy inference, no server and no
+    torch — ideal for CPU clusters (each process stays lightweight)."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    import torch
-    _pin_torch_threads(1)  # one thread per worker — parallelism comes from processes
-    from .az_net import AZNet, load_checkpoint as load_az
+    from .az_infer_np import load_np, random_np
     from .mcts import run_mcts
 
     rng = random.Random(seed)
     np.random.seed(seed & 0x7FFFFFFF)
 
-    if config.checkpoint:
-        model = load_az(config.checkpoint, device="cpu")
-    else:
-        model = AZNet().to("cpu")
-        model.eval()
+    net = load_np(config.checkpoint) if config.checkpoint else random_np()
 
-    @torch.no_grad()
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
-        tensor = encode_state(state, board)
-        x = torch.from_numpy(tensor).unsqueeze(0)
-        p, v = model(x)
-        return p[0].numpy(), float(v[0])
+        return net.forward(encode_state(state, board))
 
     import time as _time
 
@@ -594,16 +584,13 @@ def run_selfplay(
       outcomes: (N,) float32  — from side-to-move perspective
     """
     import sys
-    _raise_fd_limit()  # per-worker queues + fork pipes can exceed the 1024 default
+    _raise_fd_limit()  # per-worker queues + spawn pipes can exceed the 1024 default
     device = resolve_device(config.device)
     mode = "cpu" if device == "cpu" else "gpu"
-    # CUDA cannot be re-initialized in a forked child (the parent already touched
-    # CUDA via resolve_device), so GPU mode must use spawn. CPU mode uses fork on
-    # POSIX for fast, import-free worker startup.
-    if device == "cpu" and sys.platform != "win32":
-        ctx = mp.get_context("fork")
-    else:
-        ctx = mp.get_context("spawn")
+    # Always spawn: GPU can't re-init CUDA in a fork, and CPU workers re-import
+    # NumPy fresh so its BLAS honors the pinned 1-thread env (a forked child would
+    # inherit the parent's already-initialized multi-threaded BLAS → oversubscribe).
+    ctx = mp.get_context("spawn")
     num_workers = config.workers if config.workers > 0 else auto_workers(mode)
     num_workers = min(num_workers, config.num_games)
 
@@ -972,16 +959,15 @@ def _game_worker_local_persistent(
     result_queue: mp.Queue,
     cmd_queue: mp.Queue,
 ) -> None:
-    """Long-lived CPU-mode worker: loads its own model and reloads it when the
-    checkpoint changes between rounds. Command: ("play", n, seed, ckpt, base)."""
+    """Long-lived CPU-mode worker: runs its own NumPy inference (no torch) and
+    reloads weights when the checkpoint changes between rounds. Command:
+    ("play", n, seed, ckpt, base)."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    import torch
-    _pin_torch_threads(1)
-    from .az_net import AZNet, load_checkpoint as load_az
+    from .az_infer_np import load_np, random_np
 
-    model = None
+    net = None
     current_ckpt = None
 
     while True:
@@ -990,20 +976,12 @@ def _game_worker_local_persistent(
             break
         _, num_games, seed, checkpoint, base_game = cmd
 
-        if model is None or checkpoint != current_ckpt:
-            if checkpoint:
-                model = load_az(checkpoint, device="cpu")
-            else:
-                model = AZNet().to("cpu")
-                model.eval()
+        if net is None or checkpoint != current_ckpt:
+            net = load_np(checkpoint) if checkpoint else random_np()
             current_ckpt = checkpoint
 
-        @torch.no_grad()
-        def evaluate_fn(state: State, board, _model=model) -> Tuple[np.ndarray, float]:
-            tensor = encode_state(state, board)
-            x = torch.from_numpy(tensor).unsqueeze(0)
-            p, v = _model(x)
-            return p[0].numpy(), float(v[0])
+        def evaluate_fn(state: State, board, _net=net) -> Tuple[np.ndarray, float]:
+            return _net.forward(encode_state(state, board))
 
         np.random.seed(seed & 0x7FFFFFFF)
         rng = random.Random(seed)
@@ -1037,10 +1015,9 @@ class SelfPlayPool:
         if self.concurrency <= 0:
             self.concurrency = min(16, max(1, -(-config.batch_size // max(self.num_workers, 1))))
 
-        if self.device == "cpu" and sys.platform != "win32":
-            ctx = mp.get_context("fork")
-        else:
-            ctx = mp.get_context("spawn")
+        # Always spawn: GPU can't re-init CUDA in a fork, and CPU workers must
+        # re-import NumPy fresh so its BLAS honors the pinned 1-thread env.
+        ctx = mp.get_context("spawn")
         self.ctx = ctx
 
         self.result_queue = ctx.Queue()
