@@ -104,33 +104,48 @@ def run_mcts(
     num_simulations: int = 200,
     temperature: float = 1.0,
     add_noise: bool = True,
-) -> Tuple[np.ndarray, float, Move]:
-    """Run MCTS from root_state. Returns (policy_target, root_value, selected_move).
+    reuse_root: Optional["Node"] = None,
+) -> Tuple[np.ndarray, float, Optional[Move], Optional["Node"]]:
+    """Run MCTS from root_state.
+    Returns (policy_target, root_value, selected_move, selected_child).
 
     evaluate_fn(state, board) -> (policy_logits [227], value scalar)
         Called for each leaf node that needs expansion.
 
+    reuse_root: the previously-played move's child node (its subtree carries
+        forward — see tree reuse). If it matches root_state and is already
+        expanded, its accumulated visits/values are kept and we only run enough
+        new simulations to top up to num_simulations. Pass the returned
+        selected_child back in as reuse_root next move.
+
     policy_target: normalized visit counts over the 227-action space (training target).
     root_value: average value at root after all simulations.
-    selected_move: the move selected according to temperature.
+    selected_move: the move selected according to temperature (None if terminal).
+    selected_child: the node under selected_move, for reuse next move (None if terminal).
     """
-    root = Node(root_state, board)
+    # Tree reuse: continue the carried-over subtree when it is this position.
+    if (reuse_root is not None and reuse_root.expanded
+            and not reuse_root.is_terminal and reuse_root.state == root_state):
+        root = reuse_root
+    else:
+        root = Node(root_state, board)
 
     if root.is_terminal:
         pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        return pi, root.terminal_value, None
+        return pi, root.terminal_value, None, None
 
-    # Expand root
-    policy, value = evaluate_fn(root_state, board)
-    root.expand(policy)
-    if root.is_terminal:
-        pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
-        return pi, root.terminal_value, None
+    if not root.expanded:
+        policy, value = evaluate_fn(root_state, board)
+        root.expand(policy)
+        if root.is_terminal:  # no legal moves
+            pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
+            return pi, root.terminal_value, None, None
 
     if add_noise:
         root.add_dirichlet_noise()
 
-    for _ in range(num_simulations):
+    # Top up to num_simulations total visits — reused visits already count.
+    while root.n_total < num_simulations:
         node = root
         path: List[Tuple[Node, int]] = []
 
@@ -174,10 +189,19 @@ def run_mcts(
         counts = root.N.copy()
         if temperature != 1.0:
             counts = counts ** (1.0 / temperature)
-        probs = counts / counts.sum()
-        best = int(np.random.choice(len(root.child_moves), p=probs))
+        s = counts.sum()
+        if s <= 0:
+            best = int(np.argmax(root.N))
+        else:
+            best = int(np.random.choice(len(root.child_moves), p=counts / s))
 
     selected_move = root.child_moves[best]
+
+    # Materialize the chosen child so its subtree can be reused next move.
+    selected_child = root.children[best]
+    if selected_child is None:
+        selected_child = Node(apply_move(root.state, root.child_moves[best]), board)
+        root.children[best] = selected_child
 
     # Normalize pi to sum to 1
     total = pi.sum()
@@ -185,4 +209,4 @@ def run_mcts(
         pi /= total
 
     root_value = float(root.W.sum() / max(root.n_total, 1))
-    return pi, root_value, selected_move
+    return pi, root_value, selected_move, selected_child

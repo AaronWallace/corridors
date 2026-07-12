@@ -31,6 +31,7 @@ from .encoding import NROWS, NUM_PLANES, encode_state
 _SHUTDOWN = None
 _BATCH_TIMEOUT = 0.005  # 5ms — wait this long to fill a batch
 SHARD_EVERY = 25  # flush to disk every N games
+_EVAL_CACHE_MAX = 200_000  # per-game NN-eval cache cap (positions, not usually hit)
 
 # Where self-play shards are written / training reads them. Defined here (a
 # torch-free module) so CPU self-play never imports az_train (and thus torch).
@@ -268,8 +269,24 @@ def _play_one_game(
     p2_col = rng.randint(0, NCOLS - 1)
     board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
 
+    # Per-game NN-eval cache: board (goals) is fixed within a game, so key by
+    # state. Deduplicates transpositions within a search and positions recurring
+    # across moves. Scoped to this game — starts randomize the goals, so the same
+    # position rarely recurs across games, and a cross-process cache would just
+    # reintroduce IPC contention.
+    eval_cache = {}
+
+    def cached_eval(st: State, bd) -> Tuple[np.ndarray, float]:
+        hit = eval_cache.get(st)
+        if hit is None:
+            hit = evaluate_fn(st, bd)
+            if len(eval_cache) < _EVAL_CACHE_MAX:
+                eval_cache[st] = hit
+        return hit
+
     record = GameRecord()
     ply = 0
+    reuse = None  # tree reuse: carry the chosen subtree to the next move
     last_heartbeat = _time.monotonic()
     while True:
         w = state.winner(board)
@@ -281,12 +298,13 @@ def _play_one_game(
             break
 
         temp = config.temp_high if ply < config.temperature_moves else config.temp_low
-        pi, root_val, move = run_mcts(
+        pi, root_val, move, reuse = run_mcts(
             state, board,
-            evaluate_fn=evaluate_fn,
+            evaluate_fn=cached_eval,
             num_simulations=config.simulations,
             temperature=temp,
             add_noise=True,
+            reuse_root=reuse,
         )
         if move is None:
             record.winner = 2 if state.turn == 1 else 1
@@ -425,7 +443,6 @@ def _game_worker_local(
     _limit_blas_threads(1)  # one BLAS thread per worker — parallelism is per-process
 
     from .az_infer_np import load_np, random_np
-    from .mcts import run_mcts
 
     rng = random.Random(seed)
     np.random.seed(seed & 0x7FFFFFFF)
@@ -435,67 +452,9 @@ def _game_worker_local(
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
         return net.forward(encode_state(state, board))
 
-    import time as _time
-
+    # Shares the single game loop (NN-eval cache + tree reuse live there).
     for game_num in range(num_games):
-        p1_col = rng.randint(0, NCOLS - 1)
-        p2_col = rng.randint(0, NCOLS - 1)
-        board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
-
-        record = GameRecord()
-        ply = 0
-        last_heartbeat = _time.monotonic()
-        while True:
-            w = state.winner(board)
-            if w is not None:
-                record.winner = w
-                break
-            if ply >= config.max_plies:
-                record.winner = None
-                break
-
-            temp = config.temp_high if ply < config.temperature_moves else config.temp_low
-            pi, root_val, move = run_mcts(
-                state, board,
-                evaluate_fn=evaluate_fn,
-                num_simulations=config.simulations,
-                temperature=temp,
-                add_noise=True,
-            )
-            if move is None:
-                record.winner = 2 if state.turn == 1 else 1
-                break
-
-            record.states.append(encode_state(state, board))
-            record.policies.append(pi)
-            record.turns.append(state.turn)
-            state = apply_move(state, move)
-            ply += 1
-
-            now = _time.monotonic()
-            if now - last_heartbeat >= 5.0:
-                result_queue.put(("heartbeat", worker_id, game_num, ply))
-                last_heartbeat = now
-
-        outcomes = []
-        for t in record.turns:
-            if record.winner is None:
-                outcomes.append(0.0)
-            elif record.winner == t:
-                outcomes.append(1.0)
-            else:
-                outcomes.append(-1.0)
-
-        if record.states:
-            result_queue.put((
-                worker_id,
-                game_num,
-                np.stack(record.states),
-                np.stack(record.policies),
-                np.array(outcomes, dtype=np.float32),
-                record.winner,
-                ply,
-            ))
+        _play_one_game(game_num, worker_id, config, evaluate_fn, rng, result_queue)
 
     result_queue.put(("done", worker_id))
 
@@ -787,6 +746,17 @@ def run_selfplay_single(
             states, policies, turns = [], [], []
             ply = 0
             winner = None
+            reuse = None
+            eval_cache = {}
+
+            def cached_eval(st, bd, _c=eval_cache):
+                hit = _c.get(st)
+                if hit is None:
+                    hit = evaluate_fn(st, bd)
+                    if len(_c) < _EVAL_CACHE_MAX:
+                        _c[st] = hit
+                return hit
+
             while True:
                 w = state.winner(board)
                 if w is not None:
@@ -796,8 +766,9 @@ def run_selfplay_single(
                     break
 
                 temp = config.temp_high if ply < config.temperature_moves else config.temp_low
-                pi, _, move = run_mcts(state, board, evaluate_fn, config.simulations,
-                                       temp, add_noise=True)
+                pi, _, move, reuse = run_mcts(state, board, cached_eval,
+                                              config.simulations, temp, add_noise=True,
+                                              reuse_root=reuse)
                 if move is None:
                     winner = 2 if state.turn == 1 else 1
                     break
