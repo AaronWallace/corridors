@@ -177,6 +177,7 @@ class SelfPlayConfig:
     device: str = "auto"
     dirichlet_alpha: float = 0.3
     dirichlet_frac: float = 0.25
+    c_puct: float = 1.5
 
 
 @dataclass
@@ -305,6 +306,9 @@ def _play_one_game(
             temperature=temp,
             add_noise=True,
             reuse_root=reuse,
+            c_puct=config.c_puct,
+            dirichlet_alpha=config.dirichlet_alpha,
+            dirichlet_frac=config.dirichlet_frac,
         )
         if move is None:
             record.winner = 2 if state.turn == 1 else 1
@@ -827,7 +831,10 @@ def run_selfplay_single(
                 temp = config.temp_high if ply < config.temperature_moves else config.temp_low
                 pi, _, move, reuse = run_mcts(state, board, cached_eval,
                                               config.simulations, temp, add_noise=True,
-                                              reuse_root=reuse)
+                                              reuse_root=reuse,
+                                              c_puct=config.c_puct,
+                                              dirichlet_alpha=config.dirichlet_alpha,
+                                              dirichlet_frac=config.dirichlet_frac)
                 if move is None:
                     winner = 2 if state.turn == 1 else 1
                     break

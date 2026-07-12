@@ -43,6 +43,7 @@ class AZTrainConfig:
     seed: int = 0
     device: str = "auto"
     checkpoint_name: str = "az_latest"
+    reflection_prob: float = 0.5
 
 
 @dataclass
@@ -193,6 +194,10 @@ def train_az(
     train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True,
                               drop_last=len(train_set) > config.batch_size)
     val_loader = DataLoader(val_set, batch_size=config.batch_size)
+    reflection_permutation = None
+    if config.reflection_prob > 0:
+        from .actions import REFLECT_ACTION_INDEX
+        reflection_permutation = torch.as_tensor(REFLECT_ACTION_INDEX, dtype=torch.long)
 
     if resume_from:
         model = az_net.load_checkpoint(resume_from, device=device)
@@ -217,6 +222,17 @@ def train_az(
         total_loss = total_ploss = total_vloss = 0.0
         batches = 0
         for xb, pb, ob in train_loader:
+            if config.reflection_prob > 0:
+                reflect = torch.rand(len(xb)) < config.reflection_prob
+                if reflect.any():
+                    source_states = xb[reflect]
+                    reflected_states = source_states.flip(-1)
+                    reflected_states[:, 2:4, :, :] = 0
+                    reflected_states[:, 2:4, :, :-1] = source_states[:, 2:4, :, :-1].flip(-1)
+                    xb[reflect] = reflected_states
+                    reflected_policy = torch.empty_like(pb[reflect])
+                    reflected_policy[:, reflection_permutation] = pb[reflect]
+                    pb[reflect] = reflected_policy
             xb = xb.to(device)
             pb = pb.to(device)
             ob = ob.to(device)

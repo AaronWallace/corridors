@@ -46,6 +46,17 @@ def encode_state(state: State, board: Board) -> np.ndarray:
     return t
 
 
+def reflect_encoded(encoded: np.ndarray) -> np.ndarray:
+    """Reflect an encoded state, or batch of states, across the center file."""
+    out = np.flip(encoded, axis=-1).copy()
+    # Wall planes store anchors in columns 0..7, so their reflection is around
+    # that eight-slot grid rather than the nine-cell board grid.
+    out[..., 2:4, :, :] = 0
+    out[..., 2:4, :, :NCOLS - 1] = np.flip(
+        encoded[..., 2:4, :, :NCOLS - 1], axis=-1)
+    return out
+
+
 def normalize_score(score: int) -> float:
     """Squash a classical engine score (side-to-move perspective) into [-1, 1]."""
     return float(np.tanh(score / SCORE_SCALE))

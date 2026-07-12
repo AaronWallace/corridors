@@ -130,6 +130,20 @@ def _prompt_selfplay_params(num_games: int, hw: dict):
     return device, workers, batch_size, concurrency
 
 
+def _prompt_search_params() -> dict:
+    """Optional AlphaZero exploration controls; defaults remain conservative."""
+    if not Confirm.ask("[dim]Adjust advanced MCTS exploration settings?[/dim]", default=False):
+        return {}
+    return {
+        "c_puct": _prompt_float("PUCT exploration constant", 1.5, 0.01, 20.0),
+        "dirichlet_alpha": _prompt_float("Root Dirichlet alpha", 0.3, 0.001, 10.0),
+        "dirichlet_frac": _prompt_float("Root noise fraction", 0.25, 0.0, 1.0),
+        "temperature_moves": _prompt_int("High-temperature opening plies", 20, 0, 1000),
+        "temp_high": _prompt_float("Opening temperature", 1.0, 0.001, 10.0),
+        "temp_low": _prompt_float("Later temperature", 0.1, 0.001, 10.0),
+    }
+
+
 def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
                    max_plies: int, run_fn):
     """Drive `run_fn(on_game, on_status, on_heartbeat)` behind one self-refreshing
@@ -463,6 +477,7 @@ def _selfplay() -> None:
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
     sp_device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games, hw)
+    search_params = _prompt_search_params()
 
     # Check for existing checkpoint
     ckpts = []
@@ -490,6 +505,7 @@ def _selfplay() -> None:
         concurrent_games=concurrency,
         checkpoint=checkpoint,
         device=sp_device,
+        **search_params,
     )
 
     from .az_selfplay import AZ_DATA_ROOT  # torch-free — standalone self-play needs no torch
@@ -661,6 +677,7 @@ def _full_loop() -> None:
     from .az_selfplay import SelfPlayConfig, SelfPlayPool
     from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
                            load_training_data, train_az)
+    from .az_arena import promote_candidate, run_arena
 
     console.print("\n[bold]AlphaZero training loop[/bold]")
     console.print("[dim]Alternates: self-play → train → self-play → train → ...[/dim]")
@@ -674,16 +691,20 @@ def _full_loop() -> None:
     train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
     device, workers, sp_batch_size, concurrency = _prompt_selfplay_params(games_per_iter, hw)
+    search_params = _prompt_search_params()
     max_data_iters = _prompt_int("Replay buffer (keep last N iterations, 0=all)", 0, 0, 1000)
+    arena_games = _prompt_int("Arena games before promotion", 20, 2, 1000)
+    promotion_score = _prompt_float("Candidate promotion score", 0.55, 0.5, 1.0)
 
     run_name = Prompt.ask("[dim]Run name[/dim]", default="az_loop").strip() or "az_loop"
     ckpt_name = f"{run_name}_best"
+    candidate_name = f"{run_name}_candidate"
     ckpt_path = CHECKPOINT_ROOT / f"{ckpt_name}.safetensors"
 
     # Optionally seed the loop from an existing checkpoint (e.g. az_latest). The
     # loop otherwise bootstraps from {run_name}_best if it exists, else random init.
     seed_choices = [f.stem for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors"))
-                    if _is_az_checkpoint(f.stem) and f.stem != ckpt_name]
+                    if _is_az_checkpoint(f.stem) and f.stem not in (ckpt_name, candidate_name)]
     if seed_choices:
         console.print(f"[dim]AZ checkpoints: {', '.join(seed_choices)}[/dim]")
         default_hint = f"continue {ckpt_name}" if ckpt_path.exists() else "random init"
@@ -713,6 +734,7 @@ def _full_loop() -> None:
         num_games=games_per_iter, simulations=sims, max_plies=max_plies,
         workers=workers, batch_size=sp_batch_size,
         concurrent_games=concurrency, device=device,
+        **search_params,
     )
     pool = SelfPlayPool(sp_config)
 
@@ -784,7 +806,7 @@ def _full_loop() -> None:
 
             train_config = AZTrainConfig(
                 epochs=epochs_per_iter, batch_size=train_batch_size, lr=lr,
-                checkpoint_name=ckpt_name,
+                checkpoint_name=candidate_name,
             )
             resume = ckpt_name if (
                 CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
@@ -809,6 +831,35 @@ def _full_loop() -> None:
                 f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
                 f"({res['elapsed']:.0f}s on {res['device']})[/dim]"
             )
+
+            # --- Arena gate ---
+            if not ckpt_path.exists():
+                arena = {"games": 0, "score": 1.0, "bootstrap": True}
+                promote_candidate(candidate_name, ckpt_name, arena)
+                console.print("  [green]→ bootstrap candidate promoted[/green]")
+            else:
+                console.print(
+                    f"\n  [bold]Arena[/bold] [dim]· {arena_games} games · candidate must score "
+                    f"{promotion_score:.0%}[/dim]"
+                )
+
+                def on_arena_game(done, total, result):
+                    symbol = "W" if result == 1.0 else "D" if result == 0.5 else "L"
+                    console.print(f"    [dim]{done:>3}/{total} {symbol}[/dim]")
+
+                arena = run_arena(
+                    ckpt_name, candidate_name, games=arena_games,
+                    max_plies=max_plies, device="cpu", on_game=on_arena_game,
+                )
+                if arena["score"] >= promotion_score:
+                    promote_candidate(candidate_name, ckpt_name, arena)
+                    decision = "[green]promoted[/green]"
+                else:
+                    decision = "[yellow]rejected; incumbent retained[/yellow]"
+                console.print(
+                    f"  [dim]→ candidate W{arena['wins']} D{arena['draws']} "
+                    f"L{arena['losses']} · score {arena['score']:.1%} · [/dim]{decision}"
+                )
 
             # Iteration summary
             loop_elapsed = time.monotonic() - loop_t0

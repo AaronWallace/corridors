@@ -42,6 +42,30 @@ def index_to_move(idx: int) -> Move:
     return ("w", (r, c, o))
 
 
+def reflect_move(move: Move) -> Move:
+    """Reflect an action horizontally across the center file."""
+    kind, arg = move
+    if kind == "m":
+        r, c = arg
+        return ("m", (r, NCOLS - 1 - c))
+    r, c, orient = arg
+    return ("w", (r, NCOLS - 2 - c, orient))
+
+
+# Source action index -> horizontally reflected destination index.
+REFLECT_ACTION_INDEX = tuple(
+    move_to_index(reflect_move(index_to_move(i))) for i in range(NUM_ACTIONS)
+)
+
+
+def reflect_policy(policy):
+    """Reflect one policy vector or a batch of policy vectors."""
+    import numpy as np
+    out = np.empty_like(policy)
+    out[..., REFLECT_ACTION_INDEX] = policy
+    return out
+
+
 # --- legal move mask --------------------------------------------------------
 
 def legal_move_mask(state: State, board: Board) -> Tuple[List[Move], List[int]]:

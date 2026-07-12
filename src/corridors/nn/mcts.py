@@ -82,12 +82,12 @@ class Node:
         noise = np.random.dirichlet([alpha] * len(self.P)).astype(np.float32)
         self.P = (1 - frac) * self.P + frac * noise
 
-    def select_child(self) -> int:
+    def select_child(self, c_puct: float = C_PUCT) -> int:
         """PUCT selection — returns child index."""
         sqrt_total = math.sqrt(self.n_total + 1)
         with np.errstate(divide="ignore", invalid="ignore"):
             q = np.where(self.N > 0, self.W / self.N, 0.0)
-        u = C_PUCT * self.P * sqrt_total / (1 + self.N)
+        u = c_puct * self.P * sqrt_total / (1 + self.N)
         return int(np.argmax(q + u))
 
     def backup(self, child_idx: int, value: float) -> None:
@@ -105,6 +105,9 @@ def run_mcts(
     temperature: float = 1.0,
     add_noise: bool = True,
     reuse_root: Optional["Node"] = None,
+    c_puct: float = C_PUCT,
+    dirichlet_alpha: float = DIRICHLET_ALPHA,
+    dirichlet_frac: float = DIRICHLET_FRAC,
 ) -> Tuple[np.ndarray, float, Optional[Move], Optional["Node"]]:
     """Run MCTS from root_state.
     Returns (policy_target, root_value, selected_move, selected_child).
@@ -142,7 +145,7 @@ def run_mcts(
             return pi, root.terminal_value, None, None
 
     if add_noise:
-        root.add_dirichlet_noise()
+        root.add_dirichlet_noise(dirichlet_alpha, dirichlet_frac)
 
     # Top up to num_simulations total visits — reused visits already count.
     while root.n_total < num_simulations:
@@ -151,7 +154,7 @@ def run_mcts(
 
         # Selection — descend to a leaf
         while node.expanded and not node.is_terminal:
-            ci = node.select_child()
+            ci = node.select_child(c_puct)
             path.append((node, ci))
 
             child = node.children[ci]
