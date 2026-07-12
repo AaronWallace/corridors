@@ -24,6 +24,8 @@ DEFAULTS: Dict[str, Any] = {
     "time_limit": 3.0,      # per-move soft cap in seconds
     "tiebreak_epsilon": 15, # root-move variety for self-play
     "max_plies": 160,       # draw cap per game
+    "p1_agent": "classical",
+    "p2_agent": "classical",
     "use_persistent_tt": True,
     "tt_path": str(_PROJECT_ROOT / "corridors_tt.sqlite3"),
     # AlphaZero benchmark winners keyed by a stable hardware signature. This

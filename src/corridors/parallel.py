@@ -43,6 +43,8 @@ class WorkerConfig:
     report_moves: bool   # False lets high-worker-count runs skip per-move traffic
     record_dataset: Optional[str] = None   # dataset name; records training data when set
     record_shard_index: int = 0            # this worker's shard number
+    p1_agent: str = "classical"
+    p2_agent: str = "classical"
 
 
 NO_PROGRESS_WINDOW = 25
@@ -76,6 +78,13 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
     rec_scores: list = []      # normalized search score (mover's perspective)
     rec_outcomes: list = []    # filled at game end
     games_recorded = 0
+    agents = {}
+    if cfg.p1_agent != "classical" or cfg.p2_agent != "classical":
+        from .nn.agent import NetworkAgent
+        for player, name in ((1, cfg.p1_agent), (2, cfg.p2_agent)):
+            if name != "classical":
+                agents[player] = NetworkAgent(name, device="cpu",
+                                              seed=cfg.seed ^ player)
     if cfg.record_dataset:
         import numpy as np
         from .nn import encoding
@@ -126,15 +135,22 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                     winner = None
                     break
 
-                tl = cfg.time_limit if cfg.time_limit > 0 else None
                 mover = state.turn
-                mv, score, stats, _pv = solver.best_move(
-                    state, board,
-                    max_depth=cfg.depth, time_limit=tl,
-                    tiebreak_epsilon=cfg.tiebreak_epsilon,
-                    tt=tt, verbose=False,
-                    flush_on_exit=False,  # batch TT writes per game, not per move
-                )
+                agent_name = cfg.p1_agent if mover == 1 else cfg.p2_agent
+                if agent_name == "classical":
+                    tl = cfg.time_limit if cfg.time_limit > 0 else None
+                    mv, score, stats, _pv = solver.best_move(
+                        state, board,
+                        max_depth=cfg.depth, time_limit=tl,
+                        tiebreak_epsilon=cfg.tiebreak_epsilon,
+                        tt=tt, verbose=False,
+                        flush_on_exit=False,
+                    )
+                    elapsed, nodes, depth_reached = stats.elapsed, stats.nodes, stats.max_depth
+                else:
+                    think_t0 = time.monotonic()
+                    mv = agents[mover].pick_move(state, board)
+                    elapsed, nodes, depth_reached, score = time.monotonic() - think_t0, 0, 0, 0
                 if cfg.record_dataset:
                     rec_tensors.append(encoding.encode_state(state, board))
                     rec_turns.append(mover)
@@ -142,12 +158,12 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                 state = apply_move(state, mv)
                 states_seen.append(state)
                 plies += 1
-                game_nodes += stats.nodes
-                think_time += stats.elapsed
+                game_nodes += nodes
+                think_time += elapsed
                 if cfg.report_moves:
                     queue.put((
                         "move", cfg.worker_id, game_num, state, board, mv,
-                        mover, score, stats.elapsed, stats.nodes, stats.max_depth,
+                        mover, score, elapsed, nodes, depth_reached,
                     ))
 
             if tt is not None:

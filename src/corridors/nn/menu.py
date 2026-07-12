@@ -66,7 +66,7 @@ def _generate_data() -> None:
     from ..play import _setup, autoplay_headless, autoplay_parallel
     console = _console()
     cfg = settings.load()
-    params = _setup(cfg)
+    params = _setup(cfg, allow_neural=False)
     default_name = ds_mod.default_dataset_name(
         params.num_games, params.depth, params.tiebreak_epsilon
     )

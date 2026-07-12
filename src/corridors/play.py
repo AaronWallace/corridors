@@ -15,6 +15,7 @@ import random
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 for _stream in (sys.stdout, sys.stderr):
@@ -431,6 +432,8 @@ class AutoplayParams:
     max_plies: int
     workers: int
     headless: bool
+    p1_agent: str = "classical"
+    p2_agent: str = "classical"
 
 
 def _auto_workers() -> int:
@@ -479,7 +482,7 @@ def _prompt_col(player: int, endzone_row: int, default: int) -> int:
         return col
 
 
-def _setup(cfg: dict) -> AutoplayParams:
+def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
     console.clear()
     console.print(Panel(
         Text.assemble(
@@ -510,18 +513,41 @@ def _setup(cfg: dict) -> AutoplayParams:
         p1_col = int(cfg["p1_col"])
         p2_col = int(cfg["p2_col"])
 
-    depth = _prompt_int(
-        Text.assemble(("AI ", "dim"), ("depth", "bold"), (" [1-8]", "dim")),
-        default=int(cfg["depth"]), lo=1, hi=8,
-    )
-    time_limit = _prompt_float(
-        Text.assemble(("AI ", "dim"), ("time limit", "bold"), (" (s, 0 = none)", "dim")),
-        default=float(cfg["time_limit"]), lo=0.0, hi=600.0,
-    )
-    tiebreak = _prompt_int(
-        Text.assemble(("Tiebreak ε ", "dim"), ("(0 = deterministic, higher = more variety)", "dim")),
-        default=int(cfg["tiebreak_epsilon"]), lo=0, hi=500,
-    )
+    agent_choices = ["classical"]
+    if allow_neural:
+        checkpoint_root = Path(__file__).resolve().parent.parent.parent / "nn_checkpoints"
+        agent_choices.extend(f.stem for f in sorted(checkpoint_root.glob("*.safetensors")))
+
+    def choose_agent(player: int) -> str:
+        saved = str(cfg.get(f"p{player}_agent", "classical"))
+        default = saved if saved in agent_choices else "classical"
+        if len(agent_choices) == 1:
+            return "classical"
+        console.print(f"[dim]P{player} agents:[/dim] " + ", ".join(agent_choices))
+        return Prompt.ask(f"[dim]Player {player} AI[/dim]",
+                          choices=agent_choices, default=default)
+
+    p1_agent = choose_agent(1)
+    p2_agent = choose_agent(2)
+
+    depth = int(cfg["depth"])
+    time_limit = float(cfg["time_limit"])
+    tiebreak = int(cfg["tiebreak_epsilon"])
+    if "classical" in (p1_agent, p2_agent):
+        depth = _prompt_int(
+            Text.assemble(("Classical AI ", "dim"), ("depth", "bold"), (" [1-8]", "dim")),
+            default=depth, lo=1, hi=8,
+        )
+        time_limit = _prompt_float(
+            Text.assemble(("Classical AI ", "dim"), ("time limit", "bold"),
+                          (" (s, 0 = none)", "dim")),
+            default=time_limit, lo=0.0, hi=600.0,
+        )
+        tiebreak = _prompt_int(
+            Text.assemble(("Classical tiebreak ε ", "dim"),
+                          ("(0 = deterministic, higher = more variety)", "dim")),
+            default=tiebreak, lo=0, hi=500,
+        )
     max_plies = _prompt_int(
         Text.assemble(("Max plies per game ", "dim"), ("(draw threshold)", "dim")),
         default=int(cfg["max_plies"]), lo=20, hi=2000,
@@ -554,12 +580,14 @@ def _setup(cfg: dict) -> AutoplayParams:
         depth=depth, time_limit=time_limit,
         tiebreak_epsilon=tiebreak, max_plies=max_plies,
         workers=workers, display=display,
+        p1_agent=p1_agent, p2_agent=p2_agent,
     )
     return AutoplayParams(
         num_games=num_games, starts=starts, p1_col=p1_col, p2_col=p2_col,
         depth=depth, time_limit=time_limit,
         tiebreak_epsilon=tiebreak, max_plies=max_plies,
         workers=workers, headless=(display == "headless"),
+        p1_agent=p1_agent, p2_agent=p2_agent,
     )
 
 
@@ -589,6 +617,7 @@ def _run_one_game(
     game_num: int,
     tt: Optional[solver.TT],
     live: Live,
+    agents: Dict[int, object],
 ) -> None:
     if params.starts == "random":
         p1_col = random.randint(0, NCOLS - 1)
@@ -633,16 +662,24 @@ def _run_one_game(
             search_state["elapsed"] = info.elapsed
             live.update(_build_view(state, board, moves, session, game_num, search_state, banner))
 
-        tl = params.time_limit if params.time_limit > 0 else None
-        mv, score, stats, _pv = solver.best_move(
-            state, board,
-            max_depth=params.depth, time_limit=tl,
-            tiebreak_epsilon=params.tiebreak_epsilon,
-            tt=tt, on_iteration=on_iter, verbose=False,
-        )
-
         player_stats = session.p1 if state.turn == 1 else session.p2
-        player_stats.record_turn(stats, score)
+        agent = params.p1_agent if state.turn == 1 else params.p2_agent
+        if agent == "classical":
+            tl = params.time_limit if params.time_limit > 0 else None
+            mv, score, stats, _pv = solver.best_move(
+                state, board,
+                max_depth=params.depth, time_limit=tl,
+                tiebreak_epsilon=params.tiebreak_epsilon,
+                tt=tt, on_iteration=on_iter, verbose=False,
+            )
+            player_stats.record_turn(stats, score)
+        else:
+            think_t0 = time.monotonic()
+            mv = agents[state.turn].pick_move(state, board)
+            elapsed = time.monotonic() - think_t0
+            score = 0
+            player_stats.turns += 1
+            player_stats.total_time += elapsed
         state = apply_move(state, mv)
         moves.append(mv)
         states_seen.append(state)
@@ -699,11 +736,18 @@ def _final_summary(session: SessionStats) -> Panel:
 
 def autoplay(params: AutoplayParams, tt: Optional[solver.TT]) -> None:
     session = SessionStats(target_games=params.num_games)
+    agents = {}
+    NetworkAgent = None
+    for player, name in ((1, params.p1_agent), (2, params.p2_agent)):
+        if name != "classical":
+            if NetworkAgent is None:
+                from .nn.agent import NetworkAgent
+            agents[player] = NetworkAgent(name, device="cpu", seed=player)
     console.clear()
     initial = _build_view(None, None, [], session, 1, None, None)
     with Live(initial, console=console, refresh_per_second=10, screen=False, transient=False) as live:
         for i in range(params.num_games):
-            _run_one_game(params, session, i + 1, tt, live)
+            _run_one_game(params, session, i + 1, tt, live, agents)
     console.print(_final_summary(session))
 
 
@@ -789,7 +833,9 @@ def _spawn_workers(params: AutoplayParams, cfg: dict, report_moves: bool,
     ctx = multiprocessing.get_context("spawn")
     q = ctx.Queue()
     counts = parallel.split_games(params.num_games, params.workers)
-    tt_path = str(cfg["tt_path"]) if bool(cfg.get("use_persistent_tt", True)) else None
+    uses_classical = "classical" in (params.p1_agent, params.p2_agent)
+    tt_path = (str(cfg["tt_path"])
+               if uses_classical and bool(cfg.get("use_persistent_tt", True)) else None)
 
     shard_base = 0
     if record_dataset is not None:
@@ -811,6 +857,7 @@ def _spawn_workers(params: AutoplayParams, cfg: dict, report_moves: bool,
             report_moves=report_moves,
             record_dataset=record_dataset,
             record_shard_index=shard_base + wid,
+            p1_agent=params.p1_agent, p2_agent=params.p2_agent,
         )
         p = ctx.Process(target=parallel.run_worker, args=(wcfg, q), daemon=True)
         p.start()
@@ -979,7 +1026,8 @@ def autoplay_headless(params: AutoplayParams, cfg: dict,
 
     print(
         f"corridors autoplay: {params.num_games} games, {len(views)} workers, "
-        f"depth {params.depth}, time {params.time_limit:g}s, "
+        f"P1 {params.p1_agent}, P2 {params.p2_agent}, "
+        f"classical depth {params.depth}, time {params.time_limit:g}s, "
         f"starts {params.starts}, eps {params.tiebreak_epsilon}",
         flush=True,
     )
@@ -1099,7 +1147,8 @@ def _dispatch_autoplay(params: AutoplayParams, cfg: dict) -> None:
         return
 
     tt: Optional[solver.TT] = None
-    if bool(cfg.get("use_persistent_tt", True)):
+    uses_classical = "classical" in (params.p1_agent, params.p2_agent)
+    if uses_classical and bool(cfg.get("use_persistent_tt", True)):
         try:
             tt = solver.TT(sqlite_path=str(cfg["tt_path"]))
         except Exception as e:
