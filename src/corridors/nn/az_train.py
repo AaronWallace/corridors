@@ -166,6 +166,16 @@ def train_az(
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
+    # Weight lineage: the checkpoint this run continued from, plus the propagated
+    # cross-lineage origin (e.g. a loop seeded from az_latest keeps seeded_from
+    # through every iteration). Stamped into the meta on each save.
+    lineage = {}
+    if resume_from:
+        lineage["resumed_from"] = resume_from
+        prev = az_net.read_meta(resume_from)
+        if prev.get("seeded_from"):
+            lineage["seeded_from"] = prev["seeded_from"]
+
     n = len(states)
     idx = np.random.permutation(n)
     n_val = max(1, int(n * config.val_frac))
@@ -271,6 +281,7 @@ def train_az(
                 "batch_size": config.batch_size,
                 "lr": config.lr,
                 "device": device,
+                **lineage,
                 **(data_meta or {}),
             })
 

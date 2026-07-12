@@ -45,6 +45,7 @@ def _edge_key(a: Pos, b: Pos) -> Tuple[Pos, Pos]:
 
 _EDGE_BIT: Dict[Tuple[Pos, Pos], int] = {}
 _ADJ: Dict[Pos, Tuple[Pos, ...]] = {}
+_CELL_NEIGHBORS: Tuple[Tuple[Tuple[int, int], ...], ...] = ()
 
 
 def _init_edges() -> None:
@@ -80,6 +81,28 @@ def _init_edges() -> None:
 
 _init_edges()
 NUM_EDGE_BITS = len(_EDGE_BIT)
+
+
+def _init_cell_neighbors() -> Tuple[Tuple[Tuple[int, int], ...], ...]:
+    """Precompute compact adjacency for bitset reachability searches.
+
+    Each entry is ``(neighbor_cell_bit, blocking_edge_bit)``. End-zone entry
+    edges cannot be blocked and therefore use a zero blocking mask.
+    """
+    out = []
+    for r in range(NROWS):
+        for c in range(NCOLS):
+            cell = (r, c)
+            neighbors = []
+            for nb in _ADJ[cell]:
+                edge_idx = _EDGE_BIT.get(_edge_key(cell, nb))
+                edge_mask = 0 if edge_idx is None else 1 << edge_idx
+                neighbors.append((1 << (nb[0] * NCOLS + nb[1]), edge_mask))
+            out.append(tuple(neighbors))
+    return tuple(out)
+
+
+_CELL_NEIGHBORS = _init_cell_neighbors()
 
 
 def _wall_edges(w: Wall) -> Tuple[Tuple[Pos, Pos], Tuple[Pos, Pos]]:
@@ -151,23 +174,27 @@ def _dist_table_from(goal: Pos, blocked_mask: int) -> Dict[Pos, int]:
 
 
 def has_path(start: Pos, goal: Pos, blocked_mask: int) -> bool:
+    """Return whether start can reach goal using an allocation-light bitset BFS."""
     if start == goal:
         return True
-    seen = {start}
-    frontier = [start]
+    start_bit = 1 << (start[0] * NCOLS + start[1])
+    goal_bit = 1 << (goal[0] * NCOLS + goal[1])
+    seen = start_bit
+    frontier = start_bit
     while frontier:
-        nxt = []
-        for cell in frontier:
-            for nb in _ADJ[cell]:
-                if nb in seen:
+        nxt = 0
+        cells = frontier
+        while cells:
+            cell_bit = cells & -cells
+            cells ^= cell_bit
+            cell_idx = cell_bit.bit_length() - 1
+            for neighbor_bit, edge_mask in _CELL_NEIGHBORS[cell_idx]:
+                if seen & neighbor_bit or edge_mask & blocked_mask:
                     continue
-                bit = _EDGE_BIT.get(_edge_key(cell, nb))
-                if bit is not None and (blocked_mask >> bit) & 1:
-                    continue
-                if nb == goal:
+                if neighbor_bit == goal_bit:
                     return True
-                seen.add(nb)
-                nxt.append(nb)
+                seen |= neighbor_bit
+                nxt |= neighbor_bit
         frontier = nxt
     return False
 
@@ -304,14 +331,15 @@ def legal_wall_moves(state: State, board: Board) -> List[Wall]:
     conflicting = set()
     for w in state.walls:
         conflicting.update(_WALL_CONFLICTS[w])
-    # Cheap self-block skip: when the candidate wall's edges do not touch the mover's
-    # own current shortest path, blocking them cannot lengthen it, so we still need
-    # to check the opponent's path but can trust the mover's path stays valid.
+    # A wall cannot invalidate a path whose edges it does not touch. Keep one
+    # existing path for each player and only run reachability when the candidate
+    # intersects that path. This is an exact shortcut, not a legality heuristic.
     me = state.p1 if state.turn == 1 else state.p2
     my_goal = board.p1_goal if state.turn == 1 else board.p2_goal
     opp = state.p2 if state.turn == 1 else state.p1
     opp_goal = board.p2_goal if state.turn == 1 else board.p1_goal
     my_path_edges = _shortest_path_edges(me, my_goal, m)
+    opp_path_edges = _shortest_path_edges(opp, opp_goal, m)
     out: List[Wall] = []
     for w in ALL_WALLS:
         if w in state.walls or w in conflicting:
@@ -320,8 +348,9 @@ def legal_wall_moves(state: State, board: Board) -> List[Wall]:
         if _wall_touches_shortest_path(w, my_path_edges):
             if not has_path(me, my_goal, m2):
                 continue
-        if not has_path(opp, opp_goal, m2):
-            continue
+        if _wall_touches_shortest_path(w, opp_path_edges):
+            if not has_path(opp, opp_goal, m2):
+                continue
         out.append(w)
     return out
 

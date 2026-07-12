@@ -1,5 +1,7 @@
 """Sanity tests for the game engine and solver."""
 
+import random
+
 import pytest
 
 from corridors import game, solver
@@ -13,7 +15,49 @@ from corridors.game import (
     has_path,
     legal_moves,
     legal_pawn_moves,
+    legal_wall_moves,
 )
+
+
+def _reference_has_path(start, goal, blocked_mask):
+    """Straightforward set-based BFS used to verify the optimized traversal."""
+    seen = {start}
+    frontier = [start]
+    while frontier:
+        cell = frontier.pop()
+        if cell == goal:
+            return True
+        for neighbor in game._ADJ[cell]:
+            if neighbor in seen:
+                continue
+            edge_idx = game._EDGE_BIT.get(game._edge_key(cell, neighbor))
+            if edge_idx is not None and blocked_mask & (1 << edge_idx):
+                continue
+            seen.add(neighbor)
+            frontier.append(neighbor)
+    return False
+
+
+def _reference_legal_walls(state, board):
+    """Exhaustive wall legality without shortest-path witness shortcuts."""
+    walls_left = state.p1_walls_left if state.turn == 1 else state.p2_walls_left
+    if walls_left <= 0:
+        return []
+    blocked = blocked_mask_for(state.walls)
+    conflicting = set()
+    for wall in state.walls:
+        conflicting.update(game._WALL_CONFLICTS[wall])
+    out = []
+    for wall in ALL_WALLS:
+        if wall in state.walls or wall in conflicting:
+            continue
+        candidate_mask = blocked | game._WALL_BITMASK[wall]
+        if not _reference_has_path(state.p1, board.p1_goal, candidate_mask):
+            continue
+        if not _reference_has_path(state.p2, board.p2_goal, candidate_mask):
+            continue
+        out.append(wall)
+    return out
 
 
 def test_start_state_positions():
@@ -162,6 +206,31 @@ def test_legal_move_count_at_start():
     assert len(pawn) == 1
     # 8x8 * 2 = 128 wall slots, all should be legal on empty board.
     assert len(walls) == len(ALL_WALLS)
+
+
+def test_bitset_path_search_matches_reference_bfs():
+    rng = random.Random(731)
+    cells = list(game._ADJ)
+    for _ in range(100):
+        # Connectivity remains well-defined even when this random collection of
+        # walls would not be reachable through legal play.
+        walls = rng.sample(ALL_WALLS, rng.randrange(0, 19))
+        mask = blocked_mask_for(walls)
+        start, goal = rng.sample(cells, 2)
+        assert has_path(start, goal, mask) == _reference_has_path(start, goal, mask)
+
+
+def test_shortest_path_wall_shortcut_matches_exhaustive_legality():
+    rng = random.Random(917)
+    for _ in range(6):
+        board, state = State.start(rng.randrange(9), rng.randrange(9))
+        # Build varied, reachable positions exclusively through legal moves.
+        for _ in range(rng.randrange(4, 11)):
+            moves = legal_moves(state, board)
+            if not moves:
+                break
+            state = apply_move(state, rng.choice(moves))
+        assert legal_wall_moves(state, board) == _reference_legal_walls(state, board)
 
 
 def test_solver_returns_a_legal_move():

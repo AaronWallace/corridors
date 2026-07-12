@@ -486,15 +486,25 @@ def _train() -> None:
 
 def _seed_loop_checkpoint(src: str, dst: str) -> bool:
     """Copy an existing checkpoint (weights + meta) to the loop's best-checkpoint
-    name so the loop bootstraps from it. Returns True on success."""
+    name so the loop bootstraps from it, and stamp seeded_from=src into the copy's
+    meta so the weight lineage survives (train_az propagates it each iteration).
+    Returns True on success."""
+    import json
     import shutil
     src_w = CHECKPOINT_ROOT / f"{src}.safetensors"
     if not src_w.exists():
         return False
     shutil.copy2(src_w, CHECKPOINT_ROOT / f"{dst}.safetensors")
+    dst_m = CHECKPOINT_ROOT / f"{dst}.meta.json"
     src_m = CHECKPOINT_ROOT / f"{src}.meta.json"
+    meta = {}
     if src_m.exists():
-        shutil.copy2(src_m, CHECKPOINT_ROOT / f"{dst}.meta.json")
+        try:
+            meta = json.loads(src_m.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            meta = {}
+    meta["seeded_from"] = src  # root of this weight lineage
+    dst_m.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return True
 
 
