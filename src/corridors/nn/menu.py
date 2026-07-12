@@ -326,20 +326,25 @@ def _manage_checkpoints() -> None:
     t.add_column("#", justify="right", style="dim")
     t.add_column("name")
     t.add_column("Elo", justify="right")
-    t.add_column("val MSE", justify="right")
-    t.add_column("sign acc", justify="right")
     t.add_column("epoch", justify="right")
     t.add_column("dataset", style="dim")
+    t.add_column("lineage", style="dim")
     t.add_column("MB", justify="right")
     for i, c in enumerate(items, 1):
         e = elo.get(c["name"], c.get("elo"))
+        # Weight lineage: seed origin (cross-lineage) beats a self-resume.
+        if c.get("seeded_from"):
+            lineage = f"seed:{c['seeded_from']}"
+        elif c.get("resumed_from") and c["resumed_from"] != c["name"]:
+            lineage = c["resumed_from"]
+        else:
+            lineage = "-"
         t.add_row(
             str(i), c["name"],
             f"{e:+.0f}" if isinstance(e, (int, float)) else "-",
-            f"{c['val_mse']:.4f}" if c.get("val_mse") is not None else "-",
-            f"{c['val_sign_acc']:.3f}" if c.get("val_sign_acc") is not None else "-",
             str(c.get("epoch") or "-"),
             str(c.get("dataset") or "-"),
+            lineage,
             f"{c['size_mb']:.1f}",
         )
     console.print(t)
