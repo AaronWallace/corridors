@@ -383,7 +383,7 @@ def _is_az_checkpoint(name: str) -> bool:
 def _train() -> None:
     console = _console()
     from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
-                           load_training_data, train_az)
+                           load_training_datasets, train_az)
 
     if not AZ_DATA_ROOT.exists():
         console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
@@ -399,23 +399,34 @@ def _train() -> None:
         files = [f for f in d.glob("*.npz") if not f.name.startswith(".")]
         console.print(f"  [dim]{i}.[/dim] {r} [dim]({len(files)} data file(s))[/dim]")
 
-    raw = Prompt.ask("[dim]Run name or #[/dim]", default=runs[-1]).strip()
-    if raw.isdigit() and 1 <= int(raw) <= len(runs):
-        run_name = runs[int(raw) - 1]
-    elif raw in runs:
-        run_name = raw
+    # Select one, several, or all runs — train on the combined data.
+    raw = Prompt.ask("[dim]Runs to train on (#, names, comma-separated, or 'all')[/dim]",
+                     default="all").strip()
+    if raw.lower() == "all":
+        selected = list(runs)
     else:
-        console.print("[red]unknown run[/red]")
+        selected = []
+        for tok in raw.replace(",", " ").split():
+            if tok.isdigit() and 1 <= int(tok) <= len(runs):
+                selected.append(runs[int(tok) - 1])
+            elif tok in runs:
+                selected.append(tok)
+            else:
+                console.print(f"[yellow]skipping unknown run '{tok}'[/yellow]")
+        seen = set()
+        selected = [r for r in selected if not (r in seen or seen.add(r))]
+    if not selected:
+        console.print("[red]no valid runs selected[/red]")
         return
 
-    console.print(f"[dim]loading data from '{run_name}'...[/dim]")
+    console.print(f"[dim]loading {len(selected)} run(s): {', '.join(selected)}...[/dim]")
     try:
-        states, policies, outcomes = load_training_data(run_name)
+        states, policies, outcomes = load_training_datasets(selected)
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
         return
 
-    console.print(f"[dim]{len(states):,} positions loaded[/dim]")
+    console.print(f"[dim]{len(states):,} positions from {len(selected)} run(s)[/dim]")
 
     epochs = _prompt_int("Epochs", 10, 1, 1000)
     batch_size = _prompt_int("Batch size", 256, 8, 65536)
@@ -452,7 +463,7 @@ def _train() -> None:
     try:
         res = train_az(states, policies, outcomes, config,
                        resume_from=resume, on_epoch=on_epoch,
-                       data_meta=dataset_provenance(run_name))
+                       data_meta=dataset_provenance(selected))
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]training interrupted — best checkpoint saved.[/dim]")
         return

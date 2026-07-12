@@ -106,24 +106,44 @@ def load_training_data(
     return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
 
 
-def dataset_provenance(name: str, max_iterations: int = 0) -> dict:
-    """Fingerprint the dataset that would be loaded, for stamping into a checkpoint.
+def load_training_datasets(names) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load and concatenate the shards of one or more runs (names: str or list)."""
+    if isinstance(names, str):
+        names = [names]
+    ss, ps, os_ = [], [], []
+    for name in names:
+        s, p, o = load_training_data(name)
+        ss.append(s); ps.append(p); os_.append(o)
+    if not ss:
+        raise FileNotFoundError("no runs selected")
+    return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
 
-    The hash is over each shard's (name, size, mtime) — cheap (no file reads) and
-    changes if any shard is added, removed, or regenerated. Lets you later answer
-    "was this dataset baked into this checkpoint?" by comparing hashes."""
+
+def dataset_provenance(names, max_iterations: int = 0) -> dict:
+    """Fingerprint the dataset(s) that would be loaded, for stamping into a
+    checkpoint. `names` is a run name or a list of run names.
+
+    The hash is over each shard's (run/name, size, mtime) — cheap (no file reads)
+    and changes if any shard is added, removed, or regenerated. Lets you later
+    answer "was this data baked into this checkpoint?" by comparing hashes."""
     import hashlib
-    files = _shard_files(name, max_iterations)
-    manifest = []
+    if isinstance(names, str):
+        names = [names]
+    all_runs, shard_names, total = [], [], 0
     h = hashlib.sha256()
-    for f in files:
-        st = f.stat()
-        h.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
-        manifest.append(f.name)
+    for name in names:
+        files = _shard_files(name, max_iterations)
+        for f in files:
+            st = f.stat()
+            h.update(f"{name}/{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+            shard_names.append(f"{name}/{f.name}")
+        total += len(files)
+        all_runs.append(name)
     return {
-        "data_run": name,
-        "data_shards": len(files),
-        "data_shard_names": manifest,
+        "data_run": "+".join(all_runs),
+        "data_runs": all_runs,
+        "data_shards": total,
+        "data_shard_names": shard_names,
         "data_sha": h.hexdigest()[:16],
     }
 
