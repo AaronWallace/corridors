@@ -311,6 +311,15 @@ def _benchmark_selfplay() -> None:
         gpu_configurations,
     )
     from .az_selfplay import hardware_tuning_key, save_tuning_profile
+    from rich.progress import (
+        BarColumn,
+        Progress,
+        SpinnerColumn,
+        TaskProgressColumn,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+    )
 
     console = _console()
     console.print("\n[bold]AlphaZero self-play benchmark[/bold]")
@@ -335,24 +344,52 @@ def _benchmark_selfplay() -> None:
     games = _prompt_int("Games per configuration", default_games, 1, 100_000)
 
     results = []
+
+    def run_with_progress(label: str, **kwargs):
+        active_plies = {}
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            TextColumn("{task.completed:.0f}/{task.total:.0f} games"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            refresh_per_second=4,
+        ) as progress:
+            task = progress.add_task(label, total=games)
+
+            def on_game(done, total, winner, ply, positions):
+                progress.update(task, completed=done,
+                                description=f"{label} · {positions:,} positions")
+
+            def on_heartbeat(worker, game, ply):
+                active_plies[(worker, game)] = ply
+                progress.update(
+                    task,
+                    description=(f"{label} · ~{sum(active_plies.values()):,} "
+                                 "active plies"),
+                )
+
+            return benchmark_configuration(
+                **kwargs, on_game=on_game, on_heartbeat=on_heartbeat)
+
     try:
         if device == "cuda":
             for index, (batch, concurrency) in enumerate(configs, 1):
-                console.print(
-                    f"[dim]  [{index}/{len(configs)}] batch {batch}, "
-                    f"concurrency {concurrency}…[/dim]"
-                )
-                results.append(benchmark_configuration(
+                label = f"[{index}/{len(configs)}] batch {batch}, concurrency {concurrency}"
+                results.append(run_with_progress(
+                    label,
                     device=device, games=games, simulations=simulations,
                     max_plies=max_plies, workers=workers,
                     batch_size=batch, concurrency=concurrency,
                 ))
         else:
             for index, worker_count in enumerate(configs, 1):
-                console.print(
-                    f"[dim]  [{index}/{len(configs)}] {worker_count} workers…[/dim]"
-                )
-                results.append(benchmark_configuration(
+                label = f"[{index}/{len(configs)}] {worker_count} workers"
+                results.append(run_with_progress(
+                    label,
                     device=device, games=games, simulations=simulations,
                     max_plies=max_plies, workers=worker_count,
                 ))

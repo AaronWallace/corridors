@@ -8,7 +8,7 @@ worker counts.
 from __future__ import annotations
 
 import argparse
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .az_selfplay import (
     SelfPlayConfig,
@@ -40,6 +40,8 @@ def benchmark_configuration(
     workers: int,
     batch_size: int = 1,
     concurrency: int = 1,
+    on_game: Optional[Callable] = None,
+    on_heartbeat: Optional[Callable] = None,
 ) -> Dict[str, object]:
     config = SelfPlayConfig(
         num_games=games,
@@ -51,7 +53,8 @@ def benchmark_configuration(
         device=device,
     )
     with SelfPlayPool(config) as pool:
-        pool.run(games, checkpoint="", save_dir=None)
+        pool.run(games, checkpoint="", save_dir=None,
+                 on_game=on_game, on_heartbeat=on_heartbeat)
         metrics = dict(pool.last_metrics)
     metrics.update({
         "device": device,
