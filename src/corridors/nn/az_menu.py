@@ -144,6 +144,43 @@ def _prompt_search_params() -> dict:
     }
 
 
+def _setting_token(value: float) -> str:
+    """Compact, path-safe representation of a numeric setting."""
+    return f"{value:g}".replace("-", "m").replace(".", "p")
+
+
+def _auto_dataset_name(*, prefix: str, games: int, simulations: int,
+                       max_plies: int, device: str, workers: int,
+                       batch_size: int, concurrency: int,
+                       search_params: dict, timestamp: Optional[str] = None) -> str:
+    """Build a unique dataset name that records all self-play search settings."""
+    values = {
+        "c_puct": 1.5,
+        "dirichlet_alpha": 0.3,
+        "dirichlet_frac": 0.25,
+        "temperature_moves": 20,
+        "temp_high": 1.0,
+        "temp_low": 0.1,
+        **search_params,
+    }
+    stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
+    parts = [
+        prefix, stamp, f"g{games}", f"s{simulations}", f"p{max_plies}",
+        device, f"w{workers}",
+    ]
+    if device != "cpu":
+        parts.extend((f"b{batch_size}", f"c{concurrency or 'auto'}"))
+    parts.extend((
+        f"cp{_setting_token(values['c_puct'])}",
+        f"da{_setting_token(values['dirichlet_alpha'])}",
+        f"df{_setting_token(values['dirichlet_frac'])}",
+        f"tm{values['temperature_moves']}",
+        f"th{_setting_token(values['temp_high'])}",
+        f"tl{_setting_token(values['temp_low'])}",
+    ))
+    return "_".join(str(part) for part in parts)
+
+
 def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
                    max_plies: int, run_fn):
     """Drive `run_fn(on_game, on_status, on_heartbeat)` behind one self-refreshing
@@ -494,7 +531,12 @@ def _selfplay() -> None:
         elif raw:
             console.print(f"[yellow]'{raw}' not found — using random init[/yellow]")
 
-    run_name = Prompt.ask("[dim]Run name[/dim]", default="az_run").strip() or "az_run"
+    auto_name = _auto_dataset_name(
+        prefix="az", games=num_games, simulations=sims, max_plies=max_plies,
+        device=sp_device, workers=workers, batch_size=batch_size,
+        concurrency=concurrency, search_params=search_params,
+    )
+    run_name = Prompt.ask("[dim]Dataset name[/dim]", default=auto_name).strip() or auto_name
 
     config = SelfPlayConfig(
         num_games=num_games,
@@ -696,7 +738,12 @@ def _full_loop() -> None:
     arena_games = _prompt_int("Arena games before promotion", 20, 2, 1000)
     promotion_score = _prompt_float("Candidate promotion score", 0.55, 0.5, 1.0)
 
-    run_name = Prompt.ask("[dim]Run name[/dim]", default="az_loop").strip() or "az_loop"
+    auto_name = _auto_dataset_name(
+        prefix="azloop", games=games_per_iter, simulations=sims, max_plies=max_plies,
+        device=device, workers=workers, batch_size=sp_batch_size,
+        concurrency=concurrency, search_params=search_params,
+    )
+    run_name = Prompt.ask("[dim]Dataset/run name[/dim]", default=auto_name).strip() or auto_name
     ckpt_name = f"{run_name}_best"
     candidate_name = f"{run_name}_candidate"
     ckpt_path = CHECKPOINT_ROOT / f"{ckpt_name}.safetensors"
