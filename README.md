@@ -20,6 +20,23 @@ On Windows, use the PowerShell launcher instead:
 .\corridors.ps1
 ```
 
+## Web app
+
+Start the local browser interface from the project directory:
+
+```powershell
+.\corridors-web.ps1
+```
+
+On Linux/macOS:
+
+```bash
+./corridors-web.sh
+```
+
+Then open `http://127.0.0.1:8765`. The server discovers and preloads available
+checkpoints from `nn_checkpoints`, and supports human-vs-AI and AI-vs-AI games.
+
 ## Rules
 
 - 11 rows (0..10) x 9 cols (A..I). Rows 1..9 are playable; rows 0 and 10 are end zones.

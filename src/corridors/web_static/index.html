@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Corridors</title>
+  <meta name="description" content="Play Corridors against classical and neural AI agents.">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div><span class="eyebrow">STRATEGY LAB</span><h1>Corridors</h1></div>
+      <button id="newGame" class="ghost">New game</button>
+    </header>
+    <section class="game-layout">
+      <aside id="p2Panel" class="player-card p2"></aside>
+      <section class="board-wrap">
+        <div id="status" class="status">Choose a match to begin</div>
+        <button id="playAgain" class="ghost" hidden>Play again</button>
+        <div id="board" class="board" aria-label="Corridors board"></div>
+        <div class="help"><kbd>R</kbd> rotate wall <span>·</span> <kbd>Esc</kbd> cancel <span>·</span> drag or click a pawn</div>
+      </section>
+      <aside id="p1Panel" class="player-card p1"></aside>
+    </section>
+    <section class="lower">
+      <div class="history-card"><div class="section-title">Recent moves</div><ol id="history"></ol></div>
+      <div class="telemetry-card"><div class="section-title">Move telemetry</div><div id="telemetry">No moves yet</div></div>
+    </section>
+  </main>
+
+  <dialog id="setup" class="setup">
+    <form method="dialog" id="setupForm">
+      <span class="eyebrow">NEW MATCH</span><h2>Choose the players</h2>
+      <div class="segmented"><button type="button" data-mode="human-ai" class="active">Human vs AI</button><button type="button" data-mode="ai-ai">AI vs AI</button></div>
+      <div id="humanOptions" class="field"><label>Human plays</label><select id="humanSide"><option value="1">Player 1 · Amber</option><option value="2">Player 2 · Violet</option></select></div>
+      <div class="agent-grid">
+        <fieldset id="p1Setup"><legend>Player 1</legend></fieldset>
+        <fieldset id="p2Setup"><legend>Player 2</legend></fieldset>
+      </div>
+      <button id="startGame" class="primary" value="default">Start match</button>
+    </form>
+  </dialog>
+  <script src="/app.js"></script>
+</body>
+</html>

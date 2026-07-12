@@ -12,6 +12,7 @@ nn = ["torch>=2.9"]
 
 [project.scripts]
 corridors = "corridors.play:main"
+corridors-web = "corridors.web:main"
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -19,3 +20,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+corridors = ["web_static/*"]
