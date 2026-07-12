@@ -491,8 +491,53 @@ def auto_workers(mode: str = "gpu") -> int:
 
 
 def _auto_concurrency(batch_size: int, num_workers: int) -> int:
-    """Games-in-flight per worker so that workers*concurrency ~= batch_size."""
-    return min(16, max(1, -(-batch_size // max(num_workers, 1))))
+    """Games per worker needed to keep about two inference batches in flight.
+
+    One batch worth can leave the GPU idle while responses travel back and
+    workers perform CPU search. Two batches provide portable overlap across
+    separate CPU and GPU processes while retaining a conservative host cap.
+    """
+    target = 2 * batch_size
+    return min(16, max(1, -(-target // max(num_workers, 1))))
+
+
+def hardware_tuning_key(device: str, ncpu: int, gpu_name: str = "",
+                        vram_gb: float = 0.0, gpu_count: int = 0) -> str:
+    """Stable hardware-class key; intentionally excludes volatile host names."""
+    if device == "cuda":
+        return f"cuda|cpu={ncpu}|gpu={gpu_name}|vram={vram_gb:.1f}|count={gpu_count}"
+    return f"cpu|cpu={ncpu}"
+
+
+def save_tuning_profile(hardware_key: str, values: Dict[str, object]) -> None:
+    """Persist a benchmark winner without disturbing profiles for other hosts."""
+    from .. import settings
+    current = settings.load().get("az_tuning_profiles", {})
+    profiles = dict(current) if isinstance(current, dict) else {}
+    profiles[hardware_key] = dict(values)
+    settings.save(az_tuning_profiles=profiles)
+
+
+def _load_tuning_profile(hardware_key: str) -> dict:
+    from .. import settings
+    profiles = settings.load().get("az_tuning_profiles", {})
+    if not isinstance(profiles, dict):
+        return {}
+    profile = profiles.get(hardware_key, {})
+    return profile if isinstance(profile, dict) else {}
+
+
+def _apply_tuning_profile(result: dict) -> dict:
+    profile = _load_tuning_profile(result["hardware_key"])
+    if not profile:
+        return result
+    allowed = {"workers", "inference_batch", "concurrency", "games_per_iter"}
+    for key in allowed:
+        value = profile.get(key)
+        if isinstance(value, int) and value > 0:
+            result[key] = value
+    result["benchmark_tuned"] = True
+    return result
 
 
 def detect_hardware() -> dict:
@@ -519,14 +564,22 @@ def detect_hardware() -> dict:
 
     mode = "gpu" if device == "cuda" else "cpu"
     workers = auto_workers(mode)
+    cpu_workers = auto_workers("cpu")
+    cpu_profile = _load_tuning_profile(hardware_tuning_key("cpu", ncpu))
+    if isinstance(cpu_profile.get("workers"), int) and cpu_profile["workers"] > 0:
+        cpu_workers = cpu_profile["workers"]
 
     if mode == "cpu":
-        return {
+        result = {
             "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
             "gpu_count": gpu_count, "ncpu": ncpu, "workers": workers,
+            "cpu_workers": cpu_workers,
             "inference_batch": 64, "concurrency": 1,
             "games_per_iter": max(64, workers * 4), "train_batch": 256,
+            "hardware_key": hardware_tuning_key(device, ncpu),
+            "benchmark_tuned": False,
         }
+        return _apply_tuning_profile(result)
 
     # GPU: the net is small, so batch size is about keeping the card busy, not a
     # hard memory limit — scale it (and the training batch) by VRAM tier.
@@ -534,10 +587,12 @@ def detect_hardware() -> dict:
         inference_batch, train_batch = 512, 1024
     elif vram_gb >= 12:
         inference_batch, train_batch = 256, 512
-    elif vram_gb >= 8:
-        inference_batch, train_batch = 192, 256
+    elif vram_gb >= 10:
+        inference_batch, train_batch = 128, 256
     else:
-        inference_batch, train_batch = 128, 128
+        # A conservative batch for GPUs below the higher VRAM tiers. The
+        # benchmark menu can tune this for the host's CPU/GPU balance.
+        inference_batch, train_batch = 64, 128
 
     concurrency = _auto_concurrency(inference_batch, workers)
     in_flight = workers * concurrency
@@ -545,12 +600,16 @@ def detect_hardware() -> dict:
     # in-flight count (all concurrency slots busy) without a multiplier that would
     # just make each iteration longer for no GPU benefit.
     games_per_iter = int(min(512, max(128, in_flight)))
-    return {
+    result = {
         "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
         "gpu_count": gpu_count, "ncpu": ncpu, "workers": workers,
+        "cpu_workers": cpu_workers,
         "inference_batch": inference_batch, "concurrency": concurrency,
         "games_per_iter": games_per_iter, "train_batch": train_batch,
+        "hardware_key": hardware_tuning_key(device, ncpu, gpu_name, vram_gb, gpu_count),
+        "benchmark_tuned": False,
     }
+    return _apply_tuning_profile(result)
 
 
 def run_selfplay(
@@ -586,7 +645,7 @@ def run_selfplay(
     # Aim for the whole batch to be fillable across all workers.
     concurrency = config.concurrent_games
     if concurrency <= 0:
-        concurrency = min(16, max(1, -(-config.batch_size // max(num_workers, 1))))
+        concurrency = _auto_concurrency(config.batch_size, num_workers)
 
     if on_status:
         label = "local-inference" if device == "cpu" else "gpu-server"
@@ -832,20 +891,47 @@ def _inference_server_persistent(
 
     model = None
     pending: List[Tuple[int, int, np.ndarray]] = []
+    pending_since = 0.0
+    metrics = {}
 
-    def _flush_batch():
+    def _reset_metrics() -> None:
+        metrics.clear()
+        metrics.update({
+            "batches": 0, "positions": 0, "full_batches": 0,
+            "timeout_batches": 0, "max_batch": 0,
+            "batch_wait_s": 0.0, "inference_s": 0.0,
+        })
+
+    _reset_metrics()
+
+    def _flush_batch(reason: str = "control"):
+        nonlocal pending_since
         if not pending or model is None:
             pending.clear()
+            pending_since = 0.0
             return
+        now = time.monotonic()
+        count = len(pending)
+        metrics["batches"] += 1
+        metrics["positions"] += count
+        metrics["max_batch"] = max(metrics["max_batch"], count)
+        metrics["batch_wait_s"] += now - pending_since
+        if reason == "full":
+            metrics["full_batches"] += 1
+        elif reason == "timeout":
+            metrics["timeout_batches"] += 1
         batch_np = np.stack([t for _, _, t in pending])
-        with torch.no_grad():
+        infer_t0 = time.monotonic()
+        with torch.inference_mode():
             x = torch.from_numpy(batch_np).to(device)
             policy_logits, values = model(x)
             policy_np = policy_logits.cpu().numpy()
             values_np = values.cpu().numpy()
+        metrics["inference_s"] += time.monotonic() - infer_t0
         for i, (wid, rid, _) in enumerate(pending):
             response_queues[wid].put((rid, policy_np[i], float(values_np[i])))
         pending.clear()
+        pending_since = 0.0
 
     while True:
         # Use a short timeout only when a partial batch is waiting to be flushed;
@@ -854,7 +940,7 @@ def _inference_server_persistent(
             try:
                 item = request_queue.get(timeout=_BATCH_TIMEOUT)
             except Exception:
-                _flush_batch()
+                _flush_batch("timeout")
                 continue
         else:
             item = request_queue.get()
@@ -868,15 +954,26 @@ def _inference_server_persistent(
                 else:
                     model = AZNet().to(device)
                     model.eval()
+                _reset_metrics()
                 ack_queue.put("ready")
+                continue
+            if sub == "stats":
+                result = dict(metrics)
+                result["avg_batch"] = (
+                    result["positions"] / result["batches"]
+                    if result["batches"] else 0.0
+                )
+                ack_queue.put(result)
                 continue
             if sub == "stop":
                 break
             continue
 
+        if not pending:
+            pending_since = time.monotonic()
         pending.append(item)
         if len(pending) >= batch_size:
-            _flush_batch()
+            _flush_batch("full")
 
 
 def _game_worker_persistent(
@@ -900,6 +997,9 @@ def _game_worker_persistent(
     slots: Dict[int, list] = {}
     slots_lock = threading.Lock()
     stop_reader = threading.Event()
+    metric_lock = threading.Lock()
+    eval_requests = 0
+    inference_wait_s = 0.0
 
     def _reader() -> None:
         while not stop_reader.is_set():
@@ -914,14 +1014,20 @@ def _game_worker_persistent(
                 slot[0].set()
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
+        nonlocal eval_requests, inference_wait_s
         tensor = encode_state(state, board)
         rid = next(req_ids)
         ev = threading.Event()
         slot = [ev, None]
         with slots_lock:
             slots[rid] = slot
+        wait_t0 = time.monotonic()
         request_queue.put((worker_id, rid, tensor))
         ev.wait()
+        waited = time.monotonic() - wait_t0
+        with metric_lock:
+            eval_requests += 1
+            inference_wait_s += waited
         with slots_lock:
             del slots[rid]
         return slot[1]
@@ -935,6 +1041,9 @@ def _game_worker_persistent(
             if cmd[0] == "stop":
                 break
             _, num_games, seed, concurrency, base_game = cmd
+            with metric_lock:
+                eval_requests = 0
+                inference_wait_s = 0.0
             np.random.seed(seed & 0x7FFFFFFF)
             concurrency = max(1, min(concurrency, num_games))
             buckets: List[List[int]] = [[] for _ in range(concurrency)]
@@ -955,7 +1064,12 @@ def _game_worker_persistent(
                 t.start()
             for t in threads:
                 t.join()
-            result_queue.put(("round_done", worker_id))
+            with metric_lock:
+                worker_metrics = {
+                    "eval_requests": eval_requests,
+                    "inference_wait_s": inference_wait_s,
+                }
+            result_queue.put(("round_done", worker_id, worker_metrics))
     finally:
         stop_reader.set()
         reader.join(timeout=1)
@@ -1022,7 +1136,7 @@ class SelfPlayPool:
         self.num_workers = max(1, min(nw, config.num_games))
         self.concurrency = config.concurrent_games
         if self.concurrency <= 0:
-            self.concurrency = min(16, max(1, -(-config.batch_size // max(self.num_workers, 1))))
+            self.concurrency = _auto_concurrency(config.batch_size, self.num_workers)
 
         # Always spawn: GPU can't re-init CUDA in a fork, and CPU workers must
         # re-import NumPy fresh so its BLAS honors the pinned 1-thread env.
@@ -1036,6 +1150,7 @@ class SelfPlayPool:
         self.request_queue = None
         self.response_queues = None
         self.ack_queue = None
+        self.last_metrics: Dict[str, object] = {}
         self._closed = False
 
         # Pin native math threads to 1 in every child (inherited at spawn/fork).
@@ -1120,11 +1235,15 @@ class SelfPlayPool:
         writer = _ShardWriter(save_dir)
         done_workers = 0
         done_count = 0
+        worker_metrics = []
+        round_t0 = time.monotonic()
         try:
             while done_workers < active:
                 item = self.result_queue.get()
                 if item[0] == "round_done":
                     done_workers += 1
+                    if len(item) > 2:
+                        worker_metrics.append(item[2])
                     continue
                 if item[0] == "heartbeat":
                     if on_heartbeat:
@@ -1138,6 +1257,22 @@ class SelfPlayPool:
                     on_game(done_count, num_games, winner, ply, writer.total_positions)
         finally:
             writer.flush()
+        elapsed = time.monotonic() - round_t0
+        inference = {}
+        if self.mode == "gpu":
+            self.request_queue.put((_CMD_TAG, "stats", ""))
+            inference = self.ack_queue.get()
+        requests = sum(m["eval_requests"] for m in worker_metrics)
+        wait_s = sum(m["inference_wait_s"] for m in worker_metrics)
+        self.last_metrics = {
+            "elapsed_s": elapsed,
+            "games": done_count,
+            "positions": writer.total_positions,
+            "eval_requests": requests,
+            "worker_inference_wait_s": wait_s,
+            "avg_request_wait_ms": 1000.0 * wait_s / requests if requests else 0.0,
+            "inference": inference,
+        }
         return writer.get_all()
 
     def close(self) -> None:

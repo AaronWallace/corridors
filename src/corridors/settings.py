@@ -26,6 +26,9 @@ DEFAULTS: Dict[str, Any] = {
     "max_plies": 160,       # draw cap per game
     "use_persistent_tt": True,
     "tt_path": str(_PROJECT_ROOT / "corridors_tt.sqlite3"),
+    # AlphaZero benchmark winners keyed by a stable hardware signature. This
+    # lets one checkout remember separate CPU-pod and GPU-host recommendations.
+    "az_tuning_profiles": {},
 }
 
 
