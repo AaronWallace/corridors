@@ -91,7 +91,15 @@ PY
         echo "    TORCH_CUDA_CHANNEL=cu130 ./setup.sh"
     fi
 else
-    echo "No NVIDIA GPU detected — skipping PyTorch (install manually if needed)."
+    echo "No NVIDIA GPU detected — installing CPU PyTorch..."
+    # Training and tournaments need torch even on CPU-only hosts (self-play
+    # self is torch-free). Install the smaller CPU-only wheel.
+    "$PYTHON" -m pip install torch --index-url https://download.pytorch.org/whl/cpu -q
+    if "$PYTHON" -c 'import torch' 2>/dev/null; then
+        "$PYTHON" -c 'import torch; print(f"  PyTorch {torch.__version__} (CPU): OK")'
+    else
+        echo "  WARNING: torch install failed — training/tournaments will not run."
+    fi
 fi
 
 # Verify
@@ -100,6 +108,11 @@ echo "=== Verifying ==="
 "$PYTHON" -c "from corridors.game import State; print('  game engine: OK')"
 "$PYTHON" -c "from corridors.solver import best_move; print('  solver:      OK')"
 "$PYTHON" -c "from corridors.nn.encoding import encode_state; print('  nn encoding: OK')"
+if "$PYTHON" -c 'import torch' 2>/dev/null; then
+    echo "  torch:       OK (training + tournaments enabled)"
+else
+    echo "  torch:       MISSING — CPU self-play works, but training/tournaments need it"
+fi
 echo ""
 echo "Setup complete. Run with:"
 echo "  ./corridors.sh"
