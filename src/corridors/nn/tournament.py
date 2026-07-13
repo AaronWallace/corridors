@@ -29,7 +29,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .. import solver
 from ..game import NCOLS, State, WALLS_PER_PLAYER, apply_move
 from ..parallel import _draw_by_no_progress
-from .az_selfplay import _THREAD_ENV_VARS, auto_workers, resolve_device
+from .az_selfplay import (_THREAD_ENV_VARS, _limit_blas_threads, auto_workers,
+                          resolve_device)
 
 CLASSICAL = "classical"
 ELO_PATH = Path(__file__).resolve().parent.parent.parent.parent / "nn_checkpoints" / "elo.json"
@@ -38,9 +39,13 @@ K_FACTOR = 20.0
 ELO_PASSES = 400
 MAX_PLIES = 120
 
-# Per-worker cache of constructed agents, keyed by (checkpoint, device). Avoids
-# reloading a net from disk on every game; reseeded per game for reproducibility.
-_AGENT_CACHE: Dict[Tuple[str, str], object] = {}
+# Per-worker LRU cache of constructed agents, keyed by (checkpoint, device).
+# Avoids reloading a net from disk every game while bounding how many models a
+# worker holds at once (a many-checkpoint tournament otherwise loads them all).
+from collections import OrderedDict
+
+_AGENT_CACHE: "OrderedDict[Tuple[str, str], object]" = OrderedDict()
+_AGENT_CACHE_MAX = 6  # models kept loaded per worker; evicted ones are freed
 
 
 def _worker_init() -> None:
@@ -50,6 +55,7 @@ def _worker_init() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     for v in _THREAD_ENV_VARS:
         os.environ.setdefault(v, "1")
+    _limit_blas_threads(1)  # bulletproof BLAS cap (env alone can miss after import)
     try:
         import torch
         torch.set_num_threads(1)
@@ -89,8 +95,15 @@ def _get_mover(spec: AgentSpec, seed: int, device: str):
         agent = NetworkAgent(spec.name, device=device,
                              epsilon_band=spec.epsilon_band, seed=seed)
         _AGENT_CACHE[key] = agent
+        # LRU: keep only the few most-recently-used models loaded; drop the rest
+        # so a many-checkpoint tournament doesn't hold every model in every worker.
+        while len(_AGENT_CACHE) > _AGENT_CACHE_MAX:
+            _AGENT_CACHE.popitem(last=False)  # evict oldest -> its model is freed
     else:
+        _AGENT_CACHE.move_to_end(key)  # mark most-recently-used
         agent.reseed(seed)
+    # The caller holds this agent for the duration of the game via the closure,
+    # so eviction from the cache never frees a model that's currently in play.
     return lambda state, board: agent.pick_move(state, board)
 
 
