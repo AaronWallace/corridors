@@ -130,11 +130,14 @@ def _prompt_selfplay_params(num_games: int, hw: dict):
 
     batch_size = 64
     concurrency = 0
+    inference_servers = 1
     if device != "cpu":
         batch_size = _prompt_int("Inference batch size", hw["inference_batch"], 1, 8192)
         concurrency = _prompt_int("Concurrent games per worker (0=auto)",
                                   hw.get("concurrency", 0), 0, 256)
-    return device, workers, batch_size, concurrency
+        inference_servers = _prompt_int("Inference servers (parallel, share the GPU)",
+                                        hw.get("inference_servers", 1), 1, 64)
+    return device, workers, batch_size, concurrency, inference_servers
 
 
 def _prompt_search_params() -> dict:
@@ -540,7 +543,8 @@ def _selfplay() -> None:
     num_games = _prompt_int("Number of games", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    sp_device, workers, batch_size, concurrency = _prompt_selfplay_params(num_games, hw)
+    sp_device, workers, batch_size, concurrency, inference_servers = \
+        _prompt_selfplay_params(num_games, hw)
     search_params = _prompt_search_params()
 
     # Check for existing checkpoint
@@ -567,6 +571,7 @@ def _selfplay() -> None:
         workers=workers,
         batch_size=batch_size,
         concurrent_games=concurrency,
+        inference_servers=inference_servers,
         checkpoint=checkpoint,
         device=sp_device,
         **search_params,
@@ -787,7 +792,8 @@ def _full_loop() -> None:
     epochs_per_iter = _prompt_int("Training epochs per iteration", 10, 1, 1000)
     train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
-    device, workers, sp_batch_size, concurrency = _prompt_selfplay_params(games_per_iter, hw)
+    device, workers, sp_batch_size, concurrency, inference_servers = \
+        _prompt_selfplay_params(games_per_iter, hw)
     search_params = _prompt_search_params()
     max_data_iters = _prompt_int("Replay buffer (keep last N iterations, 0=all)", 0, 0, 1000)
     arena_games = _prompt_int("Arena games before promotion", 20, 2, 1000)
@@ -832,7 +838,8 @@ def _full_loop() -> None:
     sp_config = SelfPlayConfig(
         num_games=games_per_iter, simulations=sims, max_plies=max_plies,
         workers=workers, batch_size=sp_batch_size,
-        concurrent_games=concurrency, device=device,
+        concurrent_games=concurrency, inference_servers=inference_servers,
+        device=device,
         **search_params,
     )
     save_run_config(
@@ -884,11 +891,16 @@ def _full_loop() -> None:
                 full = inference.get("full_batches", 0)
                 fill_pct = 100.0 * full / batches if batches else 0.0
                 elapsed = max(pipeline.get("elapsed_s", 0), 1e-9)
+                n_srv = inference.get("num_servers", 1)
+                # inference_s is summed over parallel servers; divide by their count
+                # for a 0-100% per-server GPU-busy figure.
+                gpu_pct = 100 * inference.get("inference_s", 0) / (elapsed * n_srv)
+                srv_tag = f" · {n_srv} servers" if n_srv > 1 else ""
                 console.print(
                     f"  [dim]  inference: avg batch {inference.get('avg_batch', 0):.1f} "
                     f"({fill_pct:.0f}% full) · request wait "
                     f"{pipeline.get('avg_request_wait_ms', 0):.1f} ms · "
-                    f"GPU inference {100 * inference.get('inference_s', 0) / elapsed:.0f}%[/dim]"
+                    f"GPU inference {gpu_pct:.0f}%{srv_tag}[/dim]"
                 )
 
             cumulative_games += games_per_iter

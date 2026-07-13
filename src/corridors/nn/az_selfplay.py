@@ -183,6 +183,7 @@ class SelfPlayConfig:
     workers: int = 0           # 0 = auto-detect
     concurrent_games: int = 0  # GPU mode: games in flight per worker (0 = auto)
     batch_size: int = 64       # max batch for GPU inference
+    inference_servers: int = 1  # GPU mode: parallel inference servers (workers sharded across)
     temperature_moves: int = 20  # use temp=1 for first N moves, then temp→0.1
     temp_high: float = 1.0
     temp_low: float = 0.1
@@ -699,12 +700,18 @@ def detect_hardware() -> dict:
     # in-flight count (all concurrency slots busy) without a multiplier that would
     # just make each iteration longer for no GPU benefit.
     games_per_iter = int(min(512, max(128, in_flight)))
+    # One inference server is single-core-bound; run a few in parallel (the GPU
+    # has headroom) so worker requests don't queue behind one. Scale with VRAM as
+    # a rough proxy for GPU power, capped so we don't starve workers of cores.
+    inference_servers = 4 if vram_gb >= 20 else 3 if vram_gb >= 12 else 2 if vram_gb >= 8 else 1
+    inference_servers = min(inference_servers, max(1, ncpu // 4))
     result = {
         "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
         "gpu_count": gpu_count, "ncpu": ncpu, "avail_gb": avail_gb,
         "mem_capped": mem_capped, "workers": workers,
         "cpu_workers": cpu_workers,
         "inference_batch": inference_batch, "concurrency": concurrency,
+        "inference_servers": inference_servers,
         "games_per_iter": games_per_iter, "train_batch": train_batch,
         "hardware_key": hardware_tuning_key(device, ncpu, gpu_name, vram_gb, gpu_count),
         "benchmark_tuned": False,
@@ -1246,11 +1253,18 @@ class SelfPlayPool:
         ctx = mp.get_context("spawn")
         self.ctx = ctx
 
+        # Multiple inference servers share the one GPU; workers shard across them
+        # round-robin. One server is single-CPU-core-bound on queue processing, so
+        # N servers ~= N x the request-draining throughput (the GPU is the spare
+        # resource). No point having more servers than workers.
+        self.num_servers = max(1, config.inference_servers)
+        self.num_servers = min(self.num_servers, self.num_workers)
+
         self.result_queue = ctx.Queue()
         self.cmd_queues = [ctx.Queue() for _ in range(self.num_workers)]
         self.workers: List[mp.Process] = []
-        self.server: Optional[mp.Process] = None
-        self.request_queue = None
+        self.servers: List[mp.Process] = []
+        self.request_queues: List[mp.Queue] = []
         self.response_queues = None
         self.ack_queue = None
         self.last_metrics: Dict[str, object] = {}
@@ -1271,21 +1285,24 @@ class SelfPlayPool:
                     w.start()
                     self.workers.append(w)
             else:
-                self.request_queue = ctx.Queue()
+                self.request_queues = [ctx.Queue() for _ in range(self.num_servers)]
                 self.response_queues = {i: ctx.Queue() for i in range(self.num_workers)}
                 self.ack_queue = ctx.Queue()
-                self.server = ctx.Process(
-                    target=_inference_server_persistent,
-                    args=(self.request_queue, self.response_queues, self.ack_queue,
-                          self.device, config.batch_size),
-                    daemon=True,
-                )
-                self.server.start()
+                for s in range(self.num_servers):
+                    srv = ctx.Process(
+                        target=_inference_server_persistent,
+                        args=(self.request_queues[s], self.response_queues,
+                              self.ack_queue, self.device, config.batch_size),
+                        daemon=True,
+                    )
+                    srv.start()
+                    self.servers.append(srv)
                 for i in range(self.num_workers):
                     w = ctx.Process(
                         target=_game_worker_persistent,
-                        args=(i, config, self.request_queue, self.response_queues[i],
-                              self.result_queue, self.cmd_queues[i]),
+                        args=(i, config, self.request_queues[i % self.num_servers],
+                              self.response_queues[i], self.result_queue,
+                              self.cmd_queues[i]),
                         daemon=True,
                     )
                     w.start()
@@ -1298,8 +1315,9 @@ class SelfPlayPool:
                     os.environ[v] = val
 
         if on_status:
+            srv_tag = f", servers={self.num_servers}" if self.mode == "gpu" else ""
             on_status(f"pool: device={self.device}, workers={self.num_workers}, "
-                      f"mode={self.mode}, concurrency={self.concurrency} (persistent)")
+                      f"mode={self.mode}, concurrency={self.concurrency}{srv_tag} (persistent)")
 
     def run(
         self,
@@ -1315,10 +1333,12 @@ class SelfPlayPool:
         if self._closed:
             raise RuntimeError("pool is closed")
 
-        # Load the model for this round before any worker starts playing.
+        # Load the model into every inference server before any worker plays.
         if self.mode == "gpu":
-            self.request_queue.put((_CMD_TAG, "reload", checkpoint))
-            self.ack_queue.get()
+            for rq in self.request_queues:
+                rq.put((_CMD_TAG, "reload", checkpoint))
+            for _ in self.request_queues:
+                self.ack_queue.get()
 
         base, extra = divmod(num_games, self.num_workers)
         games_per = [base + (1 if i < extra else 0) for i in range(self.num_workers)]
@@ -1363,8 +1383,19 @@ class SelfPlayPool:
         elapsed = time.monotonic() - round_t0
         inference = {}
         if self.mode == "gpu":
-            self.request_queue.put((_CMD_TAG, "stats", ""))
-            inference = self.ack_queue.get()
+            for rq in self.request_queues:
+                rq.put((_CMD_TAG, "stats", ""))
+            per_server = [self.ack_queue.get() for _ in self.request_queues]
+            # Aggregate across servers. inference_s is wall-time per server; they
+            # run in parallel, so per-server-average GPU busy = sum / num_servers.
+            agg = {"batches": 0, "positions": 0, "full_batches": 0,
+                   "timeout_batches": 0, "inference_s": 0.0}
+            for m in per_server:
+                for k in agg:
+                    agg[k] += m.get(k, 0)
+            agg["avg_batch"] = agg["positions"] / agg["batches"] if agg["batches"] else 0.0
+            agg["num_servers"] = self.num_servers
+            inference = agg
         requests = sum(m["eval_requests"] for m in worker_metrics)
         wait_s = sum(m["inference_wait_s"] for m in worker_metrics)
         self.last_metrics = {
@@ -1387,20 +1418,18 @@ class SelfPlayPool:
                 q.put(("stop",))
             except Exception:
                 pass
-        if self.mode == "gpu" and self.request_queue is not None:
+        for rq in self.request_queues:
             try:
-                self.request_queue.put((_CMD_TAG, "stop", ""))
+                rq.put((_CMD_TAG, "stop", ""))
             except Exception:
                 pass
         for w in self.workers:
             w.join(timeout=5)
-        if self.server is not None:
-            self.server.join(timeout=5)
-        for w in self.workers:
-            if w.is_alive():
-                w.terminate()
-        if self.server is not None and self.server.is_alive():
-            self.server.terminate()
+        for srv in self.servers:
+            srv.join(timeout=5)
+        for proc in (*self.workers, *self.servers):
+            if proc.is_alive():
+                proc.terminate()
 
     def __enter__(self) -> "SelfPlayPool":
         return self
