@@ -27,5 +27,6 @@
   "data_sha": "b605ec7815b8fb73",
   "arch": "az",
   "channels": 128,
-  "blocks": 10
+  "blocks": 10,
+  "elo": -621.3
 }

@@ -12,6 +12,6 @@
   "arch": "az",
   "channels": 128,
   "blocks": 10,
-  "elo": -220.1,
+  "elo": -619.5,
   "seeded_from": "azloop_20260712-183611_g140_s25_p150_cuda_w14_b64_cauto_cp1p5_da0p3_df0p25_tm20_th1_tl0p1_best"
 }

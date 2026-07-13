@@ -332,7 +332,7 @@ def _manage_datasets() -> None:
 def _manage_checkpoints() -> None:
     console = _console()
     from . import model as model_mod
-    from .tournament import load_elo
+    from .tournament import load_elo, rename_elo_checkpoint
 
     items = model_mod.list_checkpoints()
     if not items:
@@ -366,9 +366,23 @@ def _manage_checkpoints() -> None:
         )
     console.print(t)
     raw = Prompt.ask(
-        "[dim]Delete checkpoint # (comma-separated; Enter to go back)[/dim]",
+        "[dim]Delete # (comma-separated), r # to rename, or Enter to go back[/dim]",
         default="",
     ).strip()
+    if raw.lower().startswith("r "):
+        selected = _numbered_selections(items, raw[2:])
+        if len(selected) != 1:
+            console.print("[yellow]choose one checkpoint number to rename[/yellow]")
+            return
+        old_name = selected[0]["name"]
+        new_name = Prompt.ask("[dim]New checkpoint name[/dim]").strip()
+        try:
+            if model_mod.rename_checkpoint(old_name, new_name):
+                rename_elo_checkpoint(old_name, new_name)
+                console.print(f"[dim]renamed {old_name} to {new_name}[/dim]")
+        except (ValueError, FileExistsError) as exc:
+            console.print(f"[red]{exc}[/red]")
+        return
     for item in _numbered_selections(items, raw):
         name = item["name"]
         if model_mod.delete_checkpoint(name):

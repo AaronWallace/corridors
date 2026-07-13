@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
+from .checkpoints import checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths
 from .encoding import NUM_PLANES
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -136,7 +137,8 @@ def list_checkpoints() -> list:
     if not CHECKPOINT_ROOT.exists():
         return []
     out = []
-    for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors")):
+    ratings = load_elo_ratings(CHECKPOINT_ROOT)
+    for f in ranked_checkpoint_paths(CHECKPOINT_ROOT):
         name = f.stem
         meta = read_meta(name)
         out.append({
@@ -149,7 +151,7 @@ def list_checkpoints() -> list:
             "data_sha": meta.get("data_sha"),
             "seeded_from": meta.get("seeded_from"),
             "resumed_from": meta.get("resumed_from"),
-            "elo": meta.get("elo"),
+            "elo": checkpoint_elo(f, ratings),
         })
     return out
 
@@ -162,4 +164,42 @@ def delete_checkpoint(name: str) -> bool:
     mp = meta_path(name)
     if mp.exists():
         mp.unlink()
+    return True
+
+
+def rename_checkpoint(name: str, new_name: str) -> bool:
+    """Rename checkpoint weights and metadata without overwriting anything."""
+    new_name = new_name.strip()
+    if new_name.endswith(".safetensors"):
+        new_name = new_name[:-len(".safetensors")]
+    if (not new_name or Path(new_name).name != new_name
+            or new_name in {".", ".."}):
+        raise ValueError("checkpoint name must be a plain file name")
+
+    source = checkpoint_path(name)
+    target = checkpoint_path(new_name)
+    source_meta = meta_path(name)
+    target_meta = meta_path(new_name)
+    if not source.exists():
+        return False
+    if target.exists() or target_meta.exists():
+        raise FileExistsError(f"checkpoint '{new_name}' already exists")
+
+    source.replace(target)
+    try:
+        if source_meta.exists():
+            source_meta.replace(target_meta)
+    except Exception:
+        target.replace(source)
+        raise
+
+    meta = read_meta(new_name)
+    updates = {}
+    for key in ("name", "checkpoint"):
+        if meta.get(key) == name:
+            updates[key] = new_name
+    if meta.get("resumed_from") == name:
+        updates["resumed_from"] = new_name
+    if updates:
+        update_meta(new_name, updates)
     return True

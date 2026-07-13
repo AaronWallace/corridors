@@ -17,6 +17,8 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
+from .checkpoints import ranked_checkpoint_paths
+
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
 
@@ -507,7 +509,7 @@ def _selfplay() -> None:
     # Check for existing checkpoint
     ckpts = []
     if CHECKPOINT_ROOT.exists():
-        ckpts = [f.stem for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors"))
+        ckpts = [f.stem for f in ranked_checkpoint_paths(CHECKPOINT_ROOT)
                  if _is_az_checkpoint(f.stem) and not f.stem.endswith("_candidate")]
     checkpoint = ""
     if ckpts:
@@ -766,7 +768,7 @@ def _full_loop() -> None:
 
     # Optionally seed the loop from an existing checkpoint (e.g. az_latest). The
     # loop otherwise bootstraps from {run_name}_best if it exists, else random init.
-    seed_choices = [f.stem for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors"))
+    seed_choices = [f.stem for f in ranked_checkpoint_paths(CHECKPOINT_ROOT)
                     if (_is_az_checkpoint(f.stem)
                         and not f.stem.endswith("_candidate")
                         and f.stem not in (ckpt_name, candidate_name))]

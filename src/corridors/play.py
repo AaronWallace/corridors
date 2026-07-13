@@ -515,8 +515,9 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
 
     agent_choices = ["classical"]
     if allow_neural:
+        from .nn.checkpoints import ranked_checkpoint_paths
         checkpoint_root = Path(__file__).resolve().parent.parent.parent / "nn_checkpoints"
-        agent_choices.extend(f.stem for f in sorted(checkpoint_root.glob("*.safetensors")))
+        agent_choices.extend(f.stem for f in ranked_checkpoint_paths(checkpoint_root))
 
     def choose_agent(player: int) -> str:
         saved = str(cfg.get(f"p{player}_agent", "classical"))

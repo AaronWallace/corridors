@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from . import solver
 from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, legal_moves
+from .nn.checkpoints import checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths
 
 STATIC_ROOT = Path(__file__).with_name("web_static")
 CHECKPOINT_ROOT = Path(__file__).resolve().parent.parent.parent / "nn_checkpoints"
@@ -22,7 +23,8 @@ CHECKPOINT_ROOT = Path(__file__).resolve().parent.parent.parent / "nn_checkpoint
 
 def _model_catalog() -> list[dict]:
     catalog = []
-    for weights in sorted(CHECKPOINT_ROOT.glob("*.safetensors")):
+    ratings = load_elo_ratings(CHECKPOINT_ROOT)
+    for weights in ranked_checkpoint_paths(CHECKPOINT_ROOT):
         meta = {}
         meta_file = weights.with_suffix(".meta.json")
         if meta_file.exists():
@@ -33,7 +35,7 @@ def _model_catalog() -> list[dict]:
         catalog.append({
             "name": weights.stem,
             "architecture": meta.get("arch", "value"),
-            "elo": meta.get("elo"),
+            "elo": checkpoint_elo(weights, ratings),
             "validationLoss": meta.get("val_loss"),
             "positions": meta.get("positions"),
             "dataset": meta.get("data_run") or meta.get("dataset"),
@@ -75,7 +77,7 @@ class SolverRegistry:
     def _preload_models(self) -> None:
         if not CHECKPOINT_ROOT.exists():
             return
-        for path in sorted(CHECKPOINT_ROOT.glob("*.safetensors")):
+        for path in ranked_checkpoint_paths(CHECKPOINT_ROOT):
             try:
                 from .nn.agent import NetworkAgent
                 self.models[path.stem] = NetworkAgent(path.stem, device="cpu", seed=0)
@@ -197,7 +199,8 @@ class Handler(BaseHTTPRequestHandler):
             models = _model_catalog()
             return self._json(200, {"checkpoints": [m["name"] for m in models],
                                     "models": models,
-                                    "loaded": sorted(REGISTRY.models),
+                                    "loaded": [m["name"] for m in models
+                                               if m["name"] in REGISTRY.models],
                                     "loadErrors": REGISTRY.preload_errors})
         if path.startswith("/api/games/"):
             game_id = path.split("/")[3]

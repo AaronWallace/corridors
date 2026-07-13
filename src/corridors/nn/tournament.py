@@ -168,6 +168,38 @@ def save_elo(data: dict) -> None:
     tmp.replace(ELO_PATH)
 
 
+def rename_elo_checkpoint(old_name: str, new_name: str) -> bool:
+    """Rename a checkpoint throughout saved tournament history."""
+    data = load_elo()
+    changed = False
+
+    ratings = data.get("ratings", {})
+    if old_name in ratings:
+        ratings[new_name] = ratings.pop(old_name)
+        changed = True
+
+    def rename_results(results) -> None:
+        nonlocal changed
+        for result in results or []:
+            for index in (0, 1):
+                if len(result) > index and result[index] == old_name:
+                    result[index] = new_name
+                    changed = True
+
+    rename_results(data.get("games"))
+    last_run = data.get("last_run", {})
+    rename_results(last_run.get("results"))
+    checkpoints = last_run.get("checkpoints", [])
+    for index, checkpoint in enumerate(checkpoints):
+        if checkpoint == old_name:
+            checkpoints[index] = new_name
+            changed = True
+
+    if changed:
+        save_elo(data)
+    return changed
+
+
 def auto_tournament_workers(device: str) -> int:
     """Default worker count. CPU: one per core (workers are single-threaded).
     GPU: capped, since each worker holds its own CUDA context + model copies."""
