@@ -12,5 +12,5 @@
   "device": "cuda",
   "channels": 64,
   "blocks": 6,
-  "elo": -681.6
+  "elo": -680.3
 }
