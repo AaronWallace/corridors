@@ -26,3 +26,15 @@ def test_agent_spec_rejects_missing_checkpoint():
         assert "checkpoint not found" in str(exc)
     else:
         raise AssertionError("missing checkpoint accepted")
+
+
+def test_agent_spec_accepts_curated_checkpoint(tmp_path, monkeypatch):
+    best = tmp_path / "best"
+    best.mkdir()
+    (best / "shared.safetensors").write_bytes(b"weights")
+    monkeypatch.setattr(web, "CHECKPOINT_ROOT", tmp_path)
+
+    assert web._agent_spec({"kind": "model", "checkpoint": "shared"}) == {
+        "kind": "model",
+        "checkpoint": "shared",
+    }

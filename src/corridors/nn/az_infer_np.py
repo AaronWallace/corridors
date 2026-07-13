@@ -19,6 +19,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 from .actions import NUM_ACTIONS
+from .checkpoints import resolve_checkpoint_path
 from .encoding import NCOLS, NROWS, NUM_PLANES
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -112,7 +113,7 @@ class NumpyAZNet:
 
 
 def _read_meta(name: str) -> dict:
-    p = CHECKPOINT_ROOT / (name if name.endswith(".meta.json") else name + ".meta.json")
+    p = resolve_checkpoint_path(CHECKPOINT_ROOT, name).with_suffix(".meta.json")
     if not p.exists():
         return {}
     try:
@@ -125,8 +126,7 @@ def load_np(name: str) -> NumpyAZNet:
     """Load an AZ checkpoint (by name) for torch-free inference."""
     from safetensors.numpy import load_file
     meta = _read_meta(name)
-    fname = name if name.endswith(".safetensors") else name + ".safetensors"
-    weights = load_file(str(CHECKPOINT_ROOT / fname))
+    weights = load_file(str(resolve_checkpoint_path(CHECKPOINT_ROOT, name)))
     return NumpyAZNet(weights, int(meta.get("channels", CHANNELS)),
                       int(meta.get("blocks", BLOCKS)))
 
