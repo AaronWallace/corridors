@@ -17,7 +17,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from .checkpoints import ranked_checkpoint_paths
+from .checkpoints import ranked_checkpoint_paths, resolve_checkpoint_path
 
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
@@ -27,7 +27,7 @@ CHECKPOINT_ROOT = _PROJECT_ROOT / "nn_checkpoints"
 
 
 def _read_meta(name: str) -> dict:
-    p = CHECKPOINT_ROOT / (name + ".meta.json") if not name.endswith(".meta.json") else CHECKPOINT_ROOT / name
+    p = resolve_checkpoint_path(CHECKPOINT_ROOT, name).with_suffix(".meta.json")
     if not p.exists():
         return {}
     try:
@@ -697,7 +697,7 @@ def _train() -> None:
     # Resume from existing?
     resume = ""
 
-    if (CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists():
+    if resolve_checkpoint_path(CHECKPOINT_ROOT, ckpt_name).exists():
         if Confirm.ask(f"[dim]resume from existing '{ckpt_name}'?[/dim]", default=True):
             resume = ckpt_name
 
@@ -757,12 +757,12 @@ def _seed_loop_checkpoint(src: str, dst: str) -> bool:
     Returns True on success."""
     import json
     import shutil
-    src_w = CHECKPOINT_ROOT / f"{src}.safetensors"
+    src_w = resolve_checkpoint_path(CHECKPOINT_ROOT, src)
     if not src_w.exists():
         return False
     shutil.copy2(src_w, CHECKPOINT_ROOT / f"{dst}.safetensors")
     dst_m = CHECKPOINT_ROOT / f"{dst}.meta.json"
-    src_m = CHECKPOINT_ROOT / f"{src}.meta.json"
+    src_m = src_w.with_suffix(".meta.json")
     meta = {}
     if src_m.exists():
         try:
@@ -809,7 +809,7 @@ def _full_loop() -> None:
     run_name = Prompt.ask("[dim]Dataset/run name[/dim]", default=auto_name).strip() or auto_name
     ckpt_name = f"{run_name}_best"
     candidate_name = f"{run_name}_candidate"
-    ckpt_path = CHECKPOINT_ROOT / f"{ckpt_name}.safetensors"
+    ckpt_path = resolve_checkpoint_path(CHECKPOINT_ROOT, ckpt_name)
 
     # Optionally seed the loop from an existing checkpoint (e.g. az_latest). The
     # loop otherwise bootstraps from {run_name}_best if it exists, else random init.
@@ -863,8 +863,8 @@ def _full_loop() -> None:
             console.print(f"\n[bold]═══ Iteration {it}/{iterations} ═══[/bold]")
 
             # --- Self-play ---
-            checkpoint = ckpt_name if (
-                CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
+            checkpoint = ckpt_name if resolve_checkpoint_path(
+                CHECKPOINT_ROOT, ckpt_name).exists() else ""
             using = checkpoint or "random init"
             console.print(f"\n  [bold]Self-play[/bold] [dim]· {games_per_iter} games "
                           f"· {sims} sims · {max_plies} max plies · net: {using}[/dim]")
@@ -927,8 +927,8 @@ def _full_loop() -> None:
                 epochs=epochs_per_iter, batch_size=train_batch_size, lr=lr,
                 checkpoint_name=candidate_name,
             )
-            resume = ckpt_name if (
-                CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists() else ""
+            resume = ckpt_name if resolve_checkpoint_path(
+                CHECKPOINT_ROOT, ckpt_name).exists() else ""
 
             def on_epoch(e):
                 star = " [green]*best*[/green]" if e.is_best else ""

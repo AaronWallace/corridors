@@ -7,6 +7,29 @@ import math
 from pathlib import Path
 
 
+def local_checkpoint_path(root: Path, name: str) -> Path:
+    """Writable machine-local path for a logical checkpoint name."""
+    if name.endswith(".safetensors"):
+        name = name[:-len(".safetensors")]
+    return root / f"{name}.safetensors"
+
+
+def curated_checkpoint_path(root: Path, name: str) -> Path:
+    """Git-tracked curated path for a logical checkpoint name."""
+    if name.endswith(".safetensors"):
+        name = name[:-len(".safetensors")]
+    return root / "best" / f"{name}.safetensors"
+
+
+def resolve_checkpoint_path(root: Path, name: str) -> Path:
+    """Prefer a local checkpoint, falling back transparently to best/."""
+    local = local_checkpoint_path(root, name)
+    if local.exists():
+        return local
+    curated = curated_checkpoint_path(root, name)
+    return curated if curated.exists() else local
+
+
 def _numeric_elo(value) -> float | None:
     if isinstance(value, bool):
         return None
@@ -45,7 +68,10 @@ def ranked_checkpoint_paths(root: Path) -> list[Path]:
     if not root.exists():
         return []
     ratings = load_elo_ratings(root)
-    paths = list(root.glob("*.safetensors"))
+    # A local checkpoint shadows a curated copy with the same logical name.
+    by_name = {path.stem: path for path in (root / "best").glob("*.safetensors")}
+    by_name.update({path.stem: path for path in root.glob("*.safetensors")})
+    paths = list(by_name.values())
     elo_by_path = {path: checkpoint_elo(path, ratings) for path in paths}
     return sorted(
         paths,

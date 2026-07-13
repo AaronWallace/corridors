@@ -37,6 +37,38 @@ def test_rename_checkpoint_will_not_overwrite_existing_checkpoint(tmp_path, monk
     assert (tmp_path / "new.safetensors").read_bytes() == b"new"
 
 
+def test_copy_checkpoint_to_best_copies_weights_and_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(model, "CHECKPOINT_ROOT", tmp_path)
+    (tmp_path / "winner.safetensors").write_bytes(b"weights")
+    (tmp_path / "winner.meta.json").write_text(
+        json.dumps({"epoch": 12, "elo": 345}), encoding="utf-8"
+    )
+
+    target = model.copy_checkpoint_to_best("winner")
+
+    assert target == tmp_path / "best" / "winner.safetensors"
+    assert target.read_bytes() == b"weights"
+    assert json.loads(target.with_suffix(".meta.json").read_text()) == {
+        "epoch": 12,
+        "elo": 345,
+    }
+
+
+def test_curated_checkpoint_is_listed_but_runtime_metadata_stays_immutable(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(model, "CHECKPOINT_ROOT", tmp_path)
+    best = tmp_path / "best"
+    best.mkdir()
+    (best / "shared.safetensors").write_bytes(b"weights")
+    meta_path = best / "shared.meta.json"
+    meta_path.write_text(json.dumps({"epoch": 7, "elo": 80}), encoding="utf-8")
+
+    assert model.list_checkpoints()[0]["name"] == "shared"
+    assert model.list_checkpoints()[0]["in_best"] is True
+    model.update_meta("shared", {"elo": 999})
+    assert json.loads(meta_path.read_text()) == {"epoch": 7, "elo": 80}
+
+
 def test_rename_elo_checkpoint_updates_saved_history(tmp_path, monkeypatch):
     elo_path = tmp_path / "elo.json"
     monkeypatch.setattr(tournament, "ELO_PATH", elo_path)

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 from .actions import NUM_ACTIONS
+from .checkpoints import resolve_checkpoint_path
 from .encoding import NCOLS, NROWS, NUM_PLANES
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -116,7 +117,7 @@ def save_checkpoint(model: AZNet, name: str, meta: Optional[Dict] = None) -> Pat
 
 
 def read_meta(name: str) -> Dict:
-    p = meta_path(name)
+    p = resolve_checkpoint_path(CHECKPOINT_ROOT, name).with_suffix(".meta.json")
     if not p.exists():
         return {}
     try:
@@ -131,7 +132,7 @@ def load_checkpoint(name: str, device: str = "cpu") -> AZNet:
         channels=int(meta.get("channels", CHANNELS)),
         blocks=int(meta.get("blocks", BLOCKS)),
     )
-    state = load_file(str(checkpoint_path(name)), device=device)
+    state = load_file(str(resolve_checkpoint_path(CHECKPOINT_ROOT, name)), device=device)
     model.load_state_dict(state)
     model.to(device)
     model.eval()
