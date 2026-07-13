@@ -75,11 +75,13 @@ def _detect_and_show_hw() -> dict:
     console = _console()
     hw = detect_hardware()
     source = "benchmark" if hw.get("benchmark_tuned") else "hardware heuristic"
+    ram = hw.get("avail_gb", 0.0)
+    ram_tag = f" · {ram:.0f} GB free RAM" if ram > 0 else ""
     if hw["device"] == "cuda":
         gpu_n = hw.get("gpu_count", 1)
         gpu_tag = f"{gpu_n}× {hw['gpu_name']}" if gpu_n > 1 else hw['gpu_name']
         console.print(f"\n[dim]detected:[/dim] [white]{gpu_tag}[/white] "
-                      f"[dim]({hw['vram_gb']:.0f} GB VRAM each) · {hw['ncpu']} CPUs[/dim]")
+                      f"[dim]({hw['vram_gb']:.0f} GB VRAM each) · {hw['ncpu']} CPUs{ram_tag}[/dim]")
         if gpu_n > 1:
             console.print(f"[yellow]note:[/yellow] [dim]only cuda:0 is used. To use the "
                           f"other {gpu_n - 1}, run separate jobs pinned with "
@@ -88,9 +90,12 @@ def _detect_and_show_hw() -> dict:
                       f"{hw['inference_batch']} · games/iter {hw['games_per_iter']} · "
                       f"train batch {hw['train_batch']}[/dim]")
     else:
-        console.print(f"\n[dim]detected: CPU only ({hw['ncpu']} cores), no CUDA GPU[/dim]")
+        console.print(f"\n[dim]detected: CPU only ({hw['ncpu']} cores{ram_tag}), no CUDA GPU[/dim]")
         console.print(f"[dim]defaults ({source}): workers {hw['workers']} · "
                       f"games/iter {hw['games_per_iter']} · train batch {hw['train_batch']}[/dim]")
+    if hw.get("mem_capped"):
+        console.print(f"[yellow]note:[/yellow] [dim]workers capped to {hw['workers']} to fit "
+                      f"~{ram:.0f} GB RAM (each worker ~0.3 GB); raise only if you have headroom.[/dim]")
     return hw
 
 

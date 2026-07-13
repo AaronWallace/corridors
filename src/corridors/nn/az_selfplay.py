@@ -31,7 +31,7 @@ from .encoding import NROWS, NUM_PLANES, encode_state
 _SHUTDOWN = None
 _BATCH_TIMEOUT = 0.005  # 5ms — wait this long to fill a batch
 SHARD_EVERY = 25  # flush to disk every N games
-_EVAL_CACHE_MAX = 200_000  # per-game NN-eval cache cap (positions, not usually hit)
+_EVAL_CACHE_MAX = 20_000  # per-game NN-eval cache cap (~22 MB/worker worst case)
 
 # Where self-play shards are written / training reads them. Defined here (a
 # torch-free module) so CPU self-play never imports az_train (and thus torch).
@@ -479,19 +479,95 @@ def resolve_device(device: str) -> str:
         return "cpu"
 
 
+_WORKER_MEM_MB = 300  # conservative per-worker RSS estimate for the memory cap
+
+
+def _read_int_file(path: str):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _cgroup_available_gb() -> float:
+    """Available RAM within this process's cgroup (containers/pods report the
+    HOST's memory in /proc/meminfo, so the cgroup limit is what actually applies).
+    0.0 if there's no cgroup limit."""
+    _NO_LIMIT = 1 << 62
+    # cgroup v2
+    limit = _read_int_file("/sys/fs/cgroup/memory.max")  # None if 'max' (no limit)
+    if limit is not None and 0 < limit < _NO_LIMIT:
+        cur = _read_int_file("/sys/fs/cgroup/memory.current") or 0
+        return max(0.0, (limit - cur) / (1024 ** 3))
+    # cgroup v1
+    limit = _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if limit is not None and 0 < limit < _NO_LIMIT:
+        usage = _read_int_file("/sys/fs/cgroup/memory/memory.usage_in_bytes") or 0
+        return max(0.0, (limit - usage) / (1024 ** 3))
+    return 0.0
+
+
+def available_memory_gb() -> float:
+    """Best-effort available RAM in GB (0.0 if it can't be determined). Takes the
+    min of host-available and the cgroup limit so it's correct inside containers."""
+    candidates = []
+    try:
+        with open("/proc/meminfo") as f:  # Linux host view
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    candidates.append(int(line.split()[1]) / (1024 * 1024))  # kB -> GB
+                    break
+    except Exception:
+        pass
+    cg = _cgroup_available_gb()  # container limit (0 if none)
+    if cg > 0:
+        candidates.append(cg)
+    if candidates:
+        return min(candidates)
+    try:
+        import ctypes  # Windows
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        ms = _MS()
+        ms.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return ms.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
+def memory_worker_cap(per_worker_mb: int = _WORKER_MEM_MB) -> Optional[int]:
+    """Max workers that fit in ~75% of available RAM (None if RAM is unknown)."""
+    avail = available_memory_gb()
+    if avail <= 0:
+        return None
+    return max(1, int(avail * 1024 * 0.75 / per_worker_mb))
+
+
 def auto_workers(mode: str = "gpu") -> int:
     ncpu = os.cpu_count() or 4
     if mode == "cpu":
         # Each worker is pinned to a single thread, so one worker per core is
         # optimal; leave one core for the collecting coordinator.
-        return max(2, ncpu - 1)
-    # GPU mode: workers drive MCTS (CPU-bound; ~1 core each due to the GIL) to
-    # feed a single inference server. Self-play is usually CPU-bound, so scale
-    # with cores, but cap it — past ~a couple hundred, the single request queue
-    # (one server draining all workers) becomes the bottleneck, not cores. On
-    # huge-core hosts, raise Workers manually and watch whether iterations speed
-    # up; if they plateau, the single server is saturated.
-    return max(2, min(ncpu - 2, 128))
+        n = max(2, ncpu - 1)
+    else:
+        # GPU mode: workers drive MCTS (CPU-bound; ~1 core each due to the GIL) to
+        # feed a single inference server. Scale with cores but cap it — past ~a
+        # couple hundred, the single request queue becomes the bottleneck.
+        n = max(2, min(ncpu - 2, 128))
+    # Also cap by RAM: each worker holds a model/cache/tree, so on memory-light
+    # hosts core count alone will OOM (each worker is ~300 MB).
+    mem_cap = memory_worker_cap()
+    if mem_cap is not None:
+        n = min(n, mem_cap)
+    return max(1, n)
 
 
 def _auto_concurrency(batch_size: int, num_workers: int) -> int:
@@ -554,6 +630,7 @@ def detect_hardware() -> dict:
     CPU values if torch or a GPU is unavailable.
     """
     ncpu = os.cpu_count() or 4
+    avail_gb = available_memory_gb()
     device, gpu_name, vram_gb, gpu_count = "cpu", "", 0.0, 0
     try:
         import torch
@@ -573,10 +650,14 @@ def detect_hardware() -> dict:
     if isinstance(cpu_profile.get("workers"), int) and cpu_profile["workers"] > 0:
         cpu_workers = cpu_profile["workers"]
 
+    mem_cap = memory_worker_cap()
+    mem_capped = mem_cap is not None and mem_cap < (ncpu - 1 if mode == "cpu"
+                                                    else min(ncpu - 2, 128))
     if mode == "cpu":
         result = {
             "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
-            "gpu_count": gpu_count, "ncpu": ncpu, "workers": workers,
+            "gpu_count": gpu_count, "ncpu": ncpu, "avail_gb": avail_gb,
+            "mem_capped": mem_capped, "workers": workers,
             "cpu_workers": cpu_workers,
             "inference_batch": 64, "concurrency": 1,
             "games_per_iter": max(64, workers * 4), "train_batch": 256,
@@ -606,7 +687,8 @@ def detect_hardware() -> dict:
     games_per_iter = int(min(512, max(128, in_flight)))
     result = {
         "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
-        "gpu_count": gpu_count, "ncpu": ncpu, "workers": workers,
+        "gpu_count": gpu_count, "ncpu": ncpu, "avail_gb": avail_gb,
+        "mem_capped": mem_capped, "workers": workers,
         "cpu_workers": cpu_workers,
         "inference_batch": inference_batch, "concurrency": concurrency,
         "games_per_iter": games_per_iter, "train_batch": train_batch,
