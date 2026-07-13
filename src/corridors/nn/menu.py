@@ -16,7 +16,7 @@ from typing import List, Optional
 
 from rich import box
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -275,6 +275,23 @@ def _tournament() -> None:
 # 4/5. Manage datasets & checkpoints
 # ---------------------------------------------------------------------------
 
+def _numbered_selections(items: List[dict], raw: str) -> List[dict]:
+    """Return unique, valid numbered selections in the order entered."""
+    selected = []
+    seen = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            index = int(part) - 1
+        except ValueError:
+            continue
+        if 0 <= index < len(items) and index not in seen:
+            selected.append(items[index])
+            seen.add(index)
+    return selected
+
 def _print_datasets(items: List[dict]) -> None:
     console = _console()
     t = Table(box=box.SIMPLE, header_style="dim", title="Datasets", title_style="bold")
@@ -302,14 +319,14 @@ def _manage_datasets() -> None:
         console.print("[yellow]no datasets.[/yellow]")
         return
     _print_datasets(items)
-    raw = Prompt.ask("[dim]delete <name>, or Enter to go back[/dim]", default="").strip()
-    if raw.startswith("delete "):
-        name = raw[len("delete "):].strip()
-        if Confirm.ask(f"[red]really delete dataset '{name}'?[/red]", default=False):
-            if ds_mod.delete_dataset(name):
-                console.print(f"[dim]deleted {name}[/dim]")
-            else:
-                console.print("[red]not found[/red]")
+    raw = Prompt.ask(
+        "[dim]Delete dataset # (comma-separated; Enter to go back)[/dim]",
+        default="",
+    ).strip()
+    for item in _numbered_selections(items, raw):
+        name = item["name"]
+        if ds_mod.delete_dataset(name):
+            console.print(f"[dim]deleted {name}[/dim]")
 
 
 def _manage_checkpoints() -> None:
@@ -348,14 +365,14 @@ def _manage_checkpoints() -> None:
             f"{c['size_mb']:.1f}",
         )
     console.print(t)
-    raw = Prompt.ask("[dim]delete <name>, or Enter to go back[/dim]", default="").strip()
-    if raw.startswith("delete "):
-        name = raw[len("delete "):].strip()
-        if Confirm.ask(f"[red]really delete checkpoint '{name}'?[/red]", default=False):
-            if model_mod.delete_checkpoint(name):
-                console.print(f"[dim]deleted {name}[/dim]")
-            else:
-                console.print("[red]not found[/red]")
+    raw = Prompt.ask(
+        "[dim]Delete checkpoint # (comma-separated; Enter to go back)[/dim]",
+        default="",
+    ).strip()
+    for item in _numbered_selections(items, raw):
+        name = item["name"]
+        if model_mod.delete_checkpoint(name):
+            console.print(f"[dim]deleted {name}[/dim]")
 
 
 # ---------------------------------------------------------------------------
