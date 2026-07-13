@@ -1,0 +1,37 @@
+{
+  "epoch": 9,
+  "epochs": 15,
+  "val_loss": 1.449658,
+  "val_policy_loss": 1.427461,
+  "val_value_loss": 0.022196,
+  "train_loss": 1.367396,
+  "positions": 38361,
+  "batch_size": 1024,
+  "lr": 0.002,
+  "device": "cuda",
+  "resumed_from": "azloop_from_best_mcts100_best",
+  "seeded_from": "best_so_far",
+  "data_run": "azloop_from_best_mcts100",
+  "data_runs": [
+    "azloop_from_best_mcts100"
+  ],
+  "data_shards": 12,
+  "data_shard_names": [
+    "azloop_from_best_mcts100/shard_0000.npz",
+    "azloop_from_best_mcts100/shard_0001.npz",
+    "azloop_from_best_mcts100/shard_0002.npz",
+    "azloop_from_best_mcts100/shard_0003.npz",
+    "azloop_from_best_mcts100/shard_0004.npz",
+    "azloop_from_best_mcts100/shard_0005.npz",
+    "azloop_from_best_mcts100/shard_0006.npz",
+    "azloop_from_best_mcts100/shard_0007.npz",
+    "azloop_from_best_mcts100/shard_0008.npz",
+    "azloop_from_best_mcts100/shard_0009.npz",
+    "azloop_from_best_mcts100/shard_0010.npz",
+    "azloop_from_best_mcts100/shard_0011.npz"
+  ],
+  "data_sha": "6415269d03d98a15",
+  "arch": "az",
+  "channels": 128,
+  "blocks": 10
+}
