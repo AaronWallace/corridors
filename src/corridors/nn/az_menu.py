@@ -149,41 +149,24 @@ def _prompt_search_params() -> dict:
     }
 
 
-def _setting_token(value: float) -> str:
-    """Compact, path-safe representation of a numeric setting."""
-    return f"{value:g}".replace("-", "m").replace(".", "p")
-
-
 def _auto_dataset_name(*, prefix: str, games: int, simulations: int,
                        max_plies: int, device: str, workers: int,
                        batch_size: int, concurrency: int,
                        search_params: dict, timestamp: Optional[str] = None) -> str:
-    """Build a unique dataset name that records all self-play search settings."""
-    values = {
-        "c_puct": 1.5,
-        "dirichlet_alpha": 0.3,
-        "dirichlet_frac": 0.25,
-        "temperature_moves": 20,
-        "temp_high": 1.0,
-        "temp_low": 0.1,
-        **search_params,
-    }
+    """Build a short recognizable name; full settings live in run metadata."""
     stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
-    parts = [
-        prefix, stamp, f"g{games}", f"s{simulations}", f"p{max_plies}",
-        device, f"w{workers}",
-    ]
-    if device != "cpu":
-        parts.extend((f"b{batch_size}", f"c{concurrency or 'auto'}"))
-    parts.extend((
-        f"cp{_setting_token(values['c_puct'])}",
-        f"da{_setting_token(values['dirichlet_alpha'])}",
-        f"df{_setting_token(values['dirichlet_frac'])}",
-        f"tm{values['temperature_moves']}",
-        f"th{_setting_token(values['temp_high'])}",
-        f"tl{_setting_token(values['temp_low'])}",
-    ))
-    return "_".join(str(part) for part in parts)
+    return f"{prefix}_{stamp}_g{games}_s{simulations}"
+
+
+def _select_checkpoint(checkpoints, prompt: str) -> str:
+    """Show checkpoints one per line and accept either an index or exact name."""
+    console = _console()
+    for index, name in enumerate(checkpoints, 1):
+        console.print(f"  [dim]{index:>2}.[/dim] {name}")
+    raw = Prompt.ask(f"[dim]{prompt} (#, name, or Enter)[/dim]", default="").strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(checkpoints):
+        return checkpoints[int(raw) - 1]
+    return raw if raw in checkpoints else ""
 
 
 def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
@@ -525,16 +508,11 @@ def _selfplay() -> None:
     ckpts = []
     if CHECKPOINT_ROOT.exists():
         ckpts = [f.stem for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors"))
-                 if _is_az_checkpoint(f.stem)]
+                 if _is_az_checkpoint(f.stem) and not f.stem.endswith("_candidate")]
     checkpoint = ""
     if ckpts:
-        console.print(f"[dim]Available AZ checkpoints: {', '.join(ckpts)}[/dim]")
-        raw = Prompt.ask("[dim]Checkpoint (name or Enter for random init)[/dim]",
-                         default="").strip()
-        if raw in ckpts:
-            checkpoint = raw
-        elif raw:
-            console.print(f"[yellow]'{raw}' not found — using random init[/yellow]")
+        console.print("[dim]Available AZ checkpoints:[/dim]")
+        checkpoint = _select_checkpoint(ckpts, "Checkpoint; blank = random init")
 
     auto_name = _auto_dataset_name(
         prefix="az", games=num_games, simulations=sims, max_plies=max_plies,
@@ -555,8 +533,9 @@ def _selfplay() -> None:
         **search_params,
     )
 
-    from .az_selfplay import AZ_DATA_ROOT  # torch-free — standalone self-play needs no torch
+    from .az_selfplay import AZ_DATA_ROOT, save_run_config
     save_dir = str(AZ_DATA_ROOT / run_name)
+    save_run_config(run_name, config, mode="standalone")
     t0 = time.monotonic()
 
     try:
@@ -585,6 +564,20 @@ def _selfplay() -> None:
 def _is_az_checkpoint(name: str) -> bool:
     meta = _read_meta(name)
     return meta.get("arch") == "az"
+
+
+def _batch_progress_text(info) -> Text:
+    percent = 100.0 * info.batch / max(info.batches, 1)
+    rate = info.batch / max(info.elapsed, 1e-9)
+    remaining = (info.batches - info.batch) / rate if rate > 0 else 0
+    return Text.assemble(
+        (f"  epoch {info.epoch}/{info.epochs}  ", "bold"),
+        (f"{info.phase} {percent:5.1f}%", "cyan"),
+        (f"  {info.batch:,}/{info.batches:,} batches", "white"),
+        (f"  loss {info.loss:.4f}", "white"),
+        (f"  {rate:.1f} batch/s", "dim"),
+        (f"  ETA {remaining:.0f}s", "green"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -630,9 +623,22 @@ def _train() -> None:
         console.print("[red]no valid runs selected[/red]")
         return
 
-    console.print(f"[dim]loading {len(selected)} run(s): {', '.join(selected)}...[/dim]")
+    console.print(f"[dim]loading {len(selected)} selected run(s)...[/dim]")
     try:
-        states, policies, outcomes = load_training_datasets(selected)
+        from rich.live import Live
+        with Live(Text("  preparing replay shards…", style="dim"), console=console,
+                  refresh_per_second=4, transient=True) as live:
+            def on_load(phase, done, total, run, shard, positions):
+                if phase == "combining":
+                    message = f"  combining {positions:,} positions in memory…"
+                else:
+                    pct = 100 * done / max(total, 1)
+                    message = (f"  loading shards {done:,}/{total:,} ({pct:.0f}%) · "
+                               f"{positions:,} positions" + (f" · {run}" if run else ""))
+                live.update(Text(message, style="cyan"))
+
+            states, policies, outcomes = load_training_datasets(
+                selected, on_progress=on_load)
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
         return
@@ -672,9 +678,14 @@ def _train() -> None:
         )
 
     try:
-        res = train_az(states, policies, outcomes, config,
-                       resume_from=resume, on_epoch=on_epoch,
-                       data_meta=dataset_provenance(selected))
+        from rich.live import Live
+        with Live(Text("  preparing training split…", style="dim"), console=console,
+                  refresh_per_second=4, transient=True) as live:
+            res = train_az(
+                states, policies, outcomes, config,
+                resume_from=resume, on_epoch=on_epoch,
+                on_batch=lambda info: live.update(_batch_progress_text(info)),
+                data_meta=dataset_provenance(selected))
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]training interrupted — best checkpoint saved.[/dim]")
         return
@@ -721,7 +732,7 @@ def _seed_loop_checkpoint(src: str, dst: str) -> bool:
 
 def _full_loop() -> None:
     console = _console()
-    from .az_selfplay import SelfPlayConfig, SelfPlayPool
+    from .az_selfplay import SelfPlayConfig, SelfPlayPool, save_run_config
     from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
                            load_training_data, train_az)
     from .az_arena import promote_candidate, run_arena
@@ -756,17 +767,15 @@ def _full_loop() -> None:
     # Optionally seed the loop from an existing checkpoint (e.g. az_latest). The
     # loop otherwise bootstraps from {run_name}_best if it exists, else random init.
     seed_choices = [f.stem for f in sorted(CHECKPOINT_ROOT.glob("*.safetensors"))
-                    if _is_az_checkpoint(f.stem) and f.stem not in (ckpt_name, candidate_name)]
+                    if (_is_az_checkpoint(f.stem)
+                        and not f.stem.endswith("_candidate")
+                        and f.stem not in (ckpt_name, candidate_name))]
     if seed_choices:
-        console.print(f"[dim]AZ checkpoints: {', '.join(seed_choices)}[/dim]")
+        console.print("[dim]AZ checkpoints:[/dim]")
         default_hint = f"continue {ckpt_name}" if ckpt_path.exists() else "random init"
-        seed_from = Prompt.ask(
-            f"[dim]Seed from checkpoint (name / Enter = {default_hint})[/dim]",
-            default="").strip()
-        if seed_from and seed_from not in seed_choices:
-            console.print(f"[yellow]'{seed_from}' is not an AZ checkpoint — using "
-                          f"{default_hint}[/yellow]")
-        elif seed_from:
+        seed_from = _select_checkpoint(
+            seed_choices, f"Seed checkpoint; blank = {default_hint}")
+        if seed_from:
             overwrite = (not ckpt_path.exists()) or Confirm.ask(
                 f"[yellow]{ckpt_name} exists — overwrite it with {seed_from}?[/yellow]",
                 default=True)
@@ -787,6 +796,12 @@ def _full_loop() -> None:
         workers=workers, batch_size=sp_batch_size,
         concurrent_games=concurrency, device=device,
         **search_params,
+    )
+    save_run_config(
+        run_name, sp_config, mode="loop", iterations=iterations,
+        epochs_per_iteration=epochs_per_iter, training_batch=train_batch_size,
+        learning_rate=lr, replay_iterations=max_data_iters,
+        arena_games=arena_games, promotion_score=promotion_score,
     )
     pool = SelfPlayPool(sp_config)
 
@@ -874,11 +889,16 @@ def _full_loop() -> None:
                     f"{e.elapsed:.0f}s[/dim]{star}"
                 )
 
-            res = train_az(all_s, all_p, all_o, train_config,
-                           resume_from=resume, on_epoch=on_epoch,
-                           data_meta=dataset_provenance(
-                               run_name,
-                               max_iterations=max_data_iters if max_data_iters > 0 else 0))
+            from rich.live import Live
+            with Live(Text("    preparing training split…", style="dim"), console=console,
+                      refresh_per_second=4, transient=True) as live:
+                res = train_az(
+                    all_s, all_p, all_o, train_config,
+                    resume_from=resume, on_epoch=on_epoch,
+                    on_batch=lambda info: live.update(_batch_progress_text(info)),
+                    data_meta=dataset_provenance(
+                        run_name,
+                        max_iterations=max_data_iters if max_data_iters > 0 else 0))
             console.print(
                 f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
                 f"({res['elapsed']:.0f}s on {res['device']})[/dim]"

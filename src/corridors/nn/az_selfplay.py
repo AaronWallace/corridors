@@ -14,6 +14,7 @@ Designed to saturate a single GPU (RTX 3070 to H200) with batched inference.
 from __future__ import annotations
 
 import multiprocessing as mp
+import json
 import os
 import random
 import time
@@ -37,6 +38,19 @@ _EVAL_CACHE_MAX = 20_000  # per-game NN-eval cache cap (~22 MB/worker worst case
 # torch-free module) so CPU self-play never imports az_train (and thus torch).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 AZ_DATA_ROOT = _PROJECT_ROOT / "nn_data" / "alphazero"
+
+
+def save_run_config(name: str, config: "SelfPlayConfig", **extra) -> Path:
+    """Persist complete generation settings beside a run's shard files."""
+    from dataclasses import asdict
+    directory = AZ_DATA_ROOT / name
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "run.json"
+    payload = {"name": name, "selfplay": asdict(config), **extra}
+    tmp = path.with_name(".run.json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+    return path
 
 # Env vars that native math libraries (OpenMP/MKL/OpenBLAS) read at import time to
 # size their thread pools. We pin these to 1 in each worker so N single-threaded

@@ -22,7 +22,7 @@ from typing import Callable, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from . import az_net
 from .az_selfplay import AZ_DATA_ROOT  # single source of truth (torch-free module)
@@ -59,6 +59,17 @@ class AZEpochInfo:
     lr: float
     elapsed: float
     is_best: bool
+
+
+@dataclass
+class AZBatchInfo:
+    epoch: int
+    epochs: int
+    phase: str
+    batch: int
+    batches: int
+    elapsed: float
+    loss: float
 
 
 def resolve_device(device: str) -> str:
@@ -107,16 +118,28 @@ def load_training_data(
     return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
 
 
-def load_training_datasets(names) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load and concatenate the shards of one or more runs (names: str or list)."""
+def load_training_datasets(names, on_progress: Optional[Callable] = None
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load and concatenate runs, optionally reporting shard-level progress."""
     if isinstance(names, str):
         names = [names]
     ss, ps, os_ = [], [], []
-    for name in names:
-        s, p, o = load_training_data(name)
-        ss.append(s); ps.append(p); os_.append(o)
+    files = [(name, path) for name in names for path in _shard_files(name)]
+    positions = 0
+    total = len(files)
+    if on_progress:
+        on_progress("loading", 0, total, "", "", positions)
+    for done, (name, path) in enumerate(files, 1):
+        with np.load(path) as z:
+            s, p, o = z["states"], z["policies"], z["outcomes"]
+            ss.append(s); ps.append(p); os_.append(o)
+            positions += len(s)
+        if on_progress:
+            on_progress("loading", done, total, name, path.name, positions)
     if not ss:
         raise FileNotFoundError("no runs selected")
+    if on_progress:
+        on_progress("combining", total, total, "", "", positions)
     return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
 
 
@@ -158,6 +181,7 @@ def train_az(
     on_epoch: Optional[Callable[[AZEpochInfo], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
     data_meta: Optional[dict] = None,
+    on_batch: Optional[Callable[[AZBatchInfo], None]] = None,
 ) -> dict:
     """Train the AZNet. Returns summary dict.
 
@@ -182,18 +206,17 @@ def train_az(
     n_val = max(1, int(n * config.val_frac))
     val_idx, train_idx = idx[:n_val], idx[n_val:]
 
-    def _to_tensors(ix):
-        return (
-            torch.from_numpy(states[ix]),
-            torch.from_numpy(policies[ix]),
-            torch.from_numpy(outcomes[ix]),
-        )
-
-    train_set = TensorDataset(*_to_tensors(train_idx))
-    val_set = TensorDataset(*_to_tensors(val_idx))
+    # Keep zero-copy views of the loaded NumPy arrays. Subset stores only the
+    # split indices; the previous advanced indexing duplicated every tensor.
+    full_set = TensorDataset(
+        torch.from_numpy(states), torch.from_numpy(policies), torch.from_numpy(outcomes))
+    train_set = Subset(full_set, train_idx)
+    val_set = Subset(full_set, val_idx)
+    pin = device.startswith("cuda")
     train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True,
-                              drop_last=len(train_set) > config.batch_size)
-    val_loader = DataLoader(val_set, batch_size=config.batch_size)
+                              drop_last=len(train_set) > config.batch_size,
+                              pin_memory=pin)
+    val_loader = DataLoader(val_set, batch_size=config.batch_size, pin_memory=pin)
     reflection_permutation = None
     if config.reflection_prob > 0:
         from .actions import REFLECT_ACTION_INDEX
@@ -221,6 +244,8 @@ def train_az(
         model.train()
         total_loss = total_ploss = total_vloss = 0.0
         batches = 0
+        phase_t0 = time.monotonic()
+        train_batches = len(train_loader)
         for xb, pb, ob in train_loader:
             if config.reflection_prob > 0:
                 reflect = torch.rand(len(xb)) < config.reflection_prob
@@ -233,9 +258,9 @@ def train_az(
                     reflected_policy = torch.empty_like(pb[reflect])
                     reflected_policy[:, reflection_permutation] = pb[reflect]
                     pb[reflect] = reflected_policy
-            xb = xb.to(device)
-            pb = pb.to(device)
-            ob = ob.to(device)
+            xb = xb.to(device, non_blocking=pin)
+            pb = pb.to(device, non_blocking=pin)
+            ob = ob.to(device, non_blocking=pin)
 
             policy_logits, value = model(xb)
 
@@ -256,6 +281,11 @@ def train_az(
             total_ploss += policy_loss.item()
             total_vloss += value_loss.item()
             batches += 1
+            if on_batch and (batches == 1 or batches == train_batches
+                             or batches % max(1, train_batches // 20) == 0):
+                on_batch(AZBatchInfo(
+                    epoch, config.epochs, "training", batches, train_batches,
+                    time.monotonic() - phase_t0, total_loss / batches))
 
         sched.step()
         train_loss = total_loss / max(batches, 1)
@@ -266,9 +296,15 @@ def train_az(
         model.eval()
         v_loss = v_ploss = v_vloss = 0.0
         v_n = 0
-        with torch.no_grad():
+        val_batches = len(val_loader)
+        val_batch = 0
+        phase_t0 = time.monotonic()
+        with torch.inference_mode():
             for xb, pb, ob in val_loader:
-                xb, pb, ob = xb.to(device), pb.to(device), ob.to(device)
+                val_batch += 1
+                xb = xb.to(device, non_blocking=pin)
+                pb = pb.to(device, non_blocking=pin)
+                ob = ob.to(device, non_blocking=pin)
                 policy_logits, value = model(xb)
                 log_probs = F.log_softmax(policy_logits, dim=1)
                 pl = -(pb * log_probs).sum(dim=1).mean()
@@ -277,6 +313,11 @@ def train_az(
                 v_vloss += vl.item() * len(xb)
                 v_loss += (config.policy_weight * pl + config.value_weight * vl).item() * len(xb)
                 v_n += len(xb)
+                if on_batch and (val_batch == 1 or val_batch == val_batches
+                                 or val_batch % max(1, val_batches // 10) == 0):
+                    on_batch(AZBatchInfo(
+                        epoch, config.epochs, "validation", val_batch, val_batches,
+                        time.monotonic() - phase_t0, v_loss / max(v_n, 1)))
 
         val_loss = v_loss / max(v_n, 1)
         val_ploss = v_ploss / max(v_n, 1)
