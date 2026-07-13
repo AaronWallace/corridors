@@ -32,7 +32,7 @@ corridors_tt.sqlite3-shm
 
 # NN artifacts (datasets and checkpoints are large and regenerable)
 nn_data/
-nn_checkpoints/
+# nn_checkpoints/
 
 # Claude Code local settings
 .claude/settings.local.json
