@@ -121,29 +121,84 @@ def config_mismatch(name: str, config: DatasetConfig) -> Optional[str]:
     return ", ".join(diffs) if diffs else None
 
 
+def _shard_files(d: Path) -> List[Path]:
+    """Shard files for a dataset dir. Self-play writes ``shard_*.npz``; the legacy
+    AlphaZero loop writes ``iter_*.npz``."""
+    return sorted(d.glob("shard_*.npz")) + sorted(d.glob("iter_*.npz"))
+
+
+def is_dataset_dir(d: Path) -> bool:
+    """A directory holds a dataset iff it directly contains shard files or a
+    metadata file. A pure *container* of nested runs (e.g. ``nn_data/alphazero``)
+    holds neither directly, so it is never treated as a deletable dataset."""
+    if not d.is_dir():
+        return False
+    return ((d / "manifest.json").exists() or (d / "run.json").exists()
+            or bool(_shard_files(d)))
+
+
+def _read_meta(d: Path) -> Optional[dict]:
+    """Normalize a dataset dir's metadata (classical ``manifest.json`` or
+    AlphaZero ``run.json``) into a common shape for listing."""
+    for fname, cfg_key in (("manifest.json", "config"), ("run.json", "selfplay")):
+        p = d / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        return {
+            "games": data.get("games", "?"),
+            "positions": data.get("positions", "?"),
+            "config": data.get(cfg_key, {}),
+        }
+    return None
+
+
+def _dataset_entry(d: Path, name: str) -> Dict:
+    m = _read_meta(d)
+    shards = _shard_files(d)
+    size = sum(f.stat().st_size for f in shards)
+    return {
+        "name": name,
+        "games": m["games"] if m else "?",
+        "positions": m["positions"] if m else "?",
+        "shards": len(shards),
+        "size_mb": size / 1e6,
+        "config": (m or {}).get("config", {}),
+    }
+
+
 def list_datasets() -> List[Dict]:
-    out = []
+    """List every manageable dataset. Leaf dataset dirs under ``nn_data/`` are
+    listed directly; a container dir (one holding only nested run dirs, such as
+    ``alphazero``) is expanded so each run is listed individually as
+    ``<container>/<run>`` rather than as the whole folder."""
+    out: List[Dict] = []
     if not DATA_ROOT.exists():
         return out
     for d in sorted(DATA_ROOT.iterdir()):
         if not d.is_dir():
             continue
-        m = read_manifest(d.name)
-        size = sum(f.stat().st_size for f in d.glob("shard_*.npz"))
-        out.append({
-            "name": d.name,
-            "games": m.get("games", "?") if m else "?",
-            "positions": m.get("positions", "?") if m else "?",
-            "shards": len(list(d.glob("shard_*.npz"))),
-            "size_mb": size / 1e6,
-            "config": (m or {}).get("config", {}),
-        })
+        if is_dataset_dir(d):
+            out.append(_dataset_entry(d, d.name))
+            continue
+        # Container: surface its nested runs individually.
+        for sub in sorted(d.iterdir()):
+            if is_dataset_dir(sub):
+                out.append(_dataset_entry(sub, f"{d.name}/{sub.name}"))
     return out
 
 
 def delete_dataset(name: str) -> bool:
+    """Delete a single dataset dir. Refuses anything that is not a leaf dataset
+    dir strictly inside ``nn_data/`` — so a container like ``alphazero`` (or
+    ``nn_data`` itself) can never be wiped, only the runs beneath it."""
     d = dataset_dir(name)
-    if not d.exists() or not d.is_dir():
+    if not d.exists() or not d.is_dir() or not is_dataset_dir(d):
+        return False
+    if DATA_ROOT.resolve() not in d.resolve().parents:
         return False
     shutil.rmtree(d)
     return True

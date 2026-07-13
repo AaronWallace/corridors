@@ -16,7 +16,7 @@ from typing import List, Optional
 
 from rich import box
 from rich.panel import Panel
-from rich.prompt import Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -323,10 +323,23 @@ def _manage_datasets() -> None:
         "[dim]Delete dataset # (comma-separated; Enter to go back)[/dim]",
         default="",
     ).strip()
-    for item in _numbered_selections(items, raw):
+    selected = _numbered_selections(items, raw)
+    if not selected:
+        return
+    total_mb = sum(d["size_mb"] for d in selected)
+    for d in selected:
+        console.print(f"  [red]{d['name']}[/red] "
+                      f"[dim]({d['shards']} shards, {d['size_mb']:.1f} MB)[/dim]")
+    if not Confirm.ask(f"[bold red]Delete {len(selected)} dataset(s), "
+                       f"{total_mb:.1f} MB?[/bold red]", default=False):
+        console.print("[dim]cancelled[/dim]")
+        return
+    for item in selected:
         name = item["name"]
         if ds_mod.delete_dataset(name):
             console.print(f"[dim]deleted {name}[/dim]")
+        else:
+            console.print(f"[yellow]skipped {name} (not a deletable dataset)[/yellow]")
 
 
 def _manage_checkpoints() -> None:

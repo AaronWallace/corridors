@@ -160,11 +160,48 @@ def _auto_dataset_name(*, prefix: str, games: int, simulations: int,
     return f"{prefix}_{stamp}_g{games}_s{simulations}"
 
 
-def _select_checkpoint(checkpoints, prompt: str) -> str:
-    """Show checkpoints one per line and accept either an index or exact name."""
-    console = _console()
+def _checkpoint_table(checkpoints, title: str = "AZ checkpoints") -> Table:
+    """Build the ranked checkpoint table shown by AlphaZero setup prompts."""
+    from . import model as model_mod
+
+    details = {item["name"]: item for item in model_mod.list_checkpoints()}
+    table = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("checkpoint", max_width=48, overflow="ellipsis", no_wrap=True)
+    table.add_column("Elo", justify="right")
+    table.add_column("epoch", justify="right")
+    table.add_column("training data", style="dim", max_width=28,
+                     overflow="ellipsis", no_wrap=True)
+    table.add_column("ancestry", style="dim", max_width=30,
+                     overflow="ellipsis", no_wrap=True)
+    table.add_column("MB", justify="right")
     for index, name in enumerate(checkpoints, 1):
-        console.print(f"  [dim]{index:>2}.[/dim] {name}")
+        item = details.get(name, {})
+        elo = item.get("elo")
+        if item.get("seeded_from"):
+            ancestry = f"seed: {item['seeded_from']}"
+        elif item.get("resumed_from") and item["resumed_from"] != name:
+            ancestry = f"resume: {item['resumed_from']}"
+        else:
+            ancestry = "-"
+        size = item.get("size_mb")
+        table.add_row(
+            str(index),
+            name,
+            f"{elo:+.0f}" if isinstance(elo, (int, float)) else "-",
+            str(item.get("epoch") or "-"),
+            str(item.get("dataset") or "-"),
+            ancestry,
+            f"{size:.1f}" if isinstance(size, (int, float)) else "-",
+        )
+    return table
+
+
+def _select_checkpoint(checkpoints, prompt: str,
+                       title: str = "AZ checkpoints") -> str:
+    """Show ranked checkpoint details and accept either an index or exact name."""
+    console = _console()
+    console.print(_checkpoint_table(checkpoints, title))
     raw = Prompt.ask(f"[dim]{prompt} (#, name, or Enter)[/dim]", default="").strip()
     if raw.isdigit() and 1 <= int(raw) <= len(checkpoints):
         return checkpoints[int(raw) - 1]
@@ -513,8 +550,8 @@ def _selfplay() -> None:
                  if _is_az_checkpoint(f.stem) and not f.stem.endswith("_candidate")]
     checkpoint = ""
     if ckpts:
-        console.print("[dim]Available AZ checkpoints:[/dim]")
-        checkpoint = _select_checkpoint(ckpts, "Checkpoint; blank = random init")
+        checkpoint = _select_checkpoint(
+            ckpts, "Checkpoint; blank = random init", "Available AZ checkpoints")
 
     auto_name = _auto_dataset_name(
         prefix="az", games=num_games, simulations=sims, max_plies=max_plies,
@@ -773,7 +810,6 @@ def _full_loop() -> None:
                         and not f.stem.endswith("_candidate")
                         and f.stem not in (ckpt_name, candidate_name))]
     if seed_choices:
-        console.print("[dim]AZ checkpoints:[/dim]")
         default_hint = f"continue {ckpt_name}" if ckpt_path.exists() else "random init"
         seed_from = _select_checkpoint(
             seed_choices, f"Seed checkpoint; blank = {default_hint}")
