@@ -20,6 +20,7 @@ from . import datasets as ds_mod
 
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
+TOURNAMENT_DISPLAY_LIMIT = 10
 
 
 def _console():
@@ -156,6 +157,10 @@ def _train_model() -> None:
 # 3. Tournament
 # ---------------------------------------------------------------------------
 
+def _ranked_ratings(ratings, limit: int = TOURNAMENT_DISPLAY_LIMIT):
+    """Highest Elo entries with deterministic alphabetical tie-breaking."""
+    return sorted(ratings.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
 def _print_head_to_head(console, results, ratings) -> None:
     """Crosstable of each model's W-L-D vs every other model (row's perspective).
     Rows/columns are ordered by Elo; columns are numbered to keep it compact."""
@@ -173,11 +178,13 @@ def _print_head_to_head(console, results, ratings) -> None:
         else:
             rec[a][b][2] += 1; rec[b][a][2] += 1      # draw
 
-    order = sorted(names, key=lambda n: (-ratings.get(n, 0.0), n))
+    order = [name for name, _ in _ranked_ratings(
+        {name: ratings.get(name, 0.0) for name in names})]
     idx = {n: i + 1 for i, n in enumerate(order)}
 
-    t = Table(box=box.SIMPLE, header_style="dim",
-              title="Head-to-head (W-L-D, row vs column)", title_style="bold")
+    title = "Head-to-head top 10 (W-L-D, row vs column)" if len(names) > len(order) \
+        else "Head-to-head (W-L-D, row vs column)"
+    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
     t.add_column("#", justify="right", style="dim")
     t.add_column("model")
     for n in order:
@@ -252,11 +259,14 @@ def _tournament() -> None:
         console.print("\n[dim]tournament interrupted — no ratings written.[/dim]")
         return
 
-    t = Table(box=box.SIMPLE, header_style="dim", title="Elo standings", title_style="bold")
+    all_ratings = data["ratings"]
+    title = (f"Elo standings · top {TOURNAMENT_DISPLAY_LIMIT} of {len(all_ratings)}"
+             if len(all_ratings) > TOURNAMENT_DISPLAY_LIMIT else "Elo standings")
+    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
     t.add_column("#", justify="right", style="dim")
     t.add_column("model")
     t.add_column("Elo", justify="right")
-    ratings = sorted(data["ratings"].items(), key=lambda kv: -kv[1])
+    ratings = _ranked_ratings(all_ratings)
     for i, (name, elo) in enumerate(ratings, 1):
         style = "bold white" if name == "classical" else STYLE_HINT
         t.add_row(str(i), Text(name, style=style), f"{elo:+.0f}")
