@@ -93,24 +93,49 @@ def save_training_data(
     return path
 
 
-def _shard_files(name: str, max_iterations: int = 0):
-    """The shard files that would be loaded for `name` (most recent N if capped)."""
+def _shard_positions(path: Path) -> int:
+    """Number of positions in a shard, read from the .npy header only (no data
+    load). Falls back to loading the array if the header format is unexpected."""
+    try:
+        import zipfile
+        from numpy.lib import format as npf
+        with zipfile.ZipFile(path) as zf:
+            name = "states.npy" if "states.npy" in zf.namelist() else "states"
+            with zf.open(name) as f:
+                shape, _, _ = npf._read_array_header(f, npf.read_magic(f))
+                return int(shape[0])
+    except Exception:
+        with np.load(path) as z:
+            return int(z["states"].shape[0])
+
+
+def _shard_files(name: str, max_positions: int = 0):
+    """The shard files that would be loaded for `name`. If max_positions > 0, keep
+    the most recent shards whose combined positions reach that many (a rolling
+    replay window over the freshest self-play, measured in positions/samples)."""
     d = AZ_DATA_ROOT / name
     files = sorted(f for f in d.glob("*.npz") if not f.name.startswith("."))
     if not files:
         raise FileNotFoundError(f"no training data in {d}")
-    if max_iterations > 0:
-        files = files[-max_iterations:]
+    if max_positions > 0:
+        kept, total = [], 0
+        for f in reversed(files):  # newest shard first
+            kept.append(f)
+            total += _shard_positions(f)
+            if total >= max_positions:
+                break
+        files = list(reversed(kept))  # back to chronological order
     return files
 
 
 def load_training_data(
     name: str,
-    max_iterations: int = 0,
+    max_positions: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load self-play data. If max_iterations > 0, only load the most recent N."""
+    """Load self-play data. If max_positions > 0, only the most recent that many
+    positions (rolling replay window)."""
     ss, ps, os_ = [], [], []
-    for f in _shard_files(name, max_iterations):
+    for f in _shard_files(name, max_positions):
         with np.load(f) as z:
             ss.append(z["states"])
             ps.append(z["policies"])
@@ -143,9 +168,10 @@ def load_training_datasets(names, on_progress: Optional[Callable] = None
     return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
 
 
-def dataset_provenance(names, max_iterations: int = 0) -> dict:
+def dataset_provenance(names, max_positions: int = 0) -> dict:
     """Fingerprint the dataset(s) that would be loaded, for stamping into a
-    checkpoint. `names` is a run name or a list of run names.
+    checkpoint. `names` is a run name or a list of run names. max_positions mirrors
+    load_training_data's rolling window so the provenance matches what was trained.
 
     The hash is over each shard's (run/name, size, mtime) — cheap (no file reads)
     and changes if any shard is added, removed, or regenerated. Lets you later
@@ -156,7 +182,7 @@ def dataset_provenance(names, max_iterations: int = 0) -> dict:
     all_runs, shard_names, total = [], [], 0
     h = hashlib.sha256()
     for name in names:
-        files = _shard_files(name, max_iterations)
+        files = _shard_files(name, max_positions)
         for f in files:
             st = f.stat()
             h.update(f"{name}/{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())

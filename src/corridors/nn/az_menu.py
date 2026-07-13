@@ -795,7 +795,9 @@ def _full_loop() -> None:
     device, workers, sp_batch_size, concurrency, inference_servers = \
         _prompt_selfplay_params(games_per_iter, hw)
     search_params = _prompt_search_params()
-    max_data_iters = _prompt_int("Replay buffer (keep last N iterations, 0=all)", 0, 0, 1000)
+    max_positions = _prompt_int(
+        "Replay buffer: keep last N positions (0=all; e.g. 300000 ≈ recent games)",
+        0, 0, 1_000_000_000)
     arena_games = _prompt_int("Arena games before promotion", 20, 2, 1000)
     promotion_score = _prompt_float("Candidate promotion score", 0.55, 0.5, 1.0)
 
@@ -845,7 +847,7 @@ def _full_loop() -> None:
     save_run_config(
         run_name, sp_config, mode="loop", iterations=iterations,
         epochs_per_iteration=epochs_per_iter, training_batch=train_batch_size,
-        learning_rate=lr, replay_iterations=max_data_iters,
+        learning_rate=lr, replay_positions=max_positions,
         arena_games=arena_games, promotion_score=promotion_score,
     )
     pool = SelfPlayPool(sp_config)
@@ -915,7 +917,7 @@ def _full_loop() -> None:
 
             # --- Train ---
             all_s, all_p, all_o = load_training_data(
-                run_name, max_iterations=max_data_iters if max_data_iters > 0 else 0)
+                run_name, max_positions=max_positions)
             console.print(
                 f"\n  [bold]Training[/bold] [dim]· {epochs_per_iter} epochs "
                 f"· batch {train_batch_size} · replay buffer: {len(all_s):,} positions[/dim]"
@@ -946,9 +948,7 @@ def _full_loop() -> None:
                     all_s, all_p, all_o, train_config,
                     resume_from=resume, on_epoch=on_epoch,
                     on_batch=lambda info: live.update(_batch_progress_text(info)),
-                    data_meta=dataset_provenance(
-                        run_name,
-                        max_iterations=max_data_iters if max_data_iters > 0 else 0))
+                    data_meta=dataset_provenance(run_name, max_positions=max_positions))
             console.print(
                 f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
                 f"({res['elapsed']:.0f}s on {res['device']})[/dim]"
