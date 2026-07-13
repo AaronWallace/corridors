@@ -284,10 +284,14 @@ def _mover(state: State) -> Tuple[Pos, Pos, int]:
 def legal_pawn_moves(state: State) -> List[Pos]:
     me, opp, _ = _mover(state)
     m = blocked_mask_for(state.walls)
+    # A player's own end-zone row is a one-way starting area: the initial pawn
+    # move enters the board, and the pawn may never return to that row. End-zone
+    # cells are already disconnected laterally by the adjacency graph.
+    own_start_row = P1_END_ROW if state.turn == 1 else P2_END_ROW
     seen = set()
     out = []
     for t in _pawn_targets(me, opp, m):
-        if t == me or t in seen:
+        if t == me or t in seen or t[0] == own_start_row:
             continue
         seen.add(t)
         out.append(t)

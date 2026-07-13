@@ -1,5 +1,6 @@
 """Sanity tests for the game engine and solver."""
 
+from dataclasses import replace
 import random
 
 import pytest
@@ -94,6 +95,33 @@ def test_endzone_pawn_can_only_step_forward():
     _, s = State.start(4, 4)  # P1 at (10,4), P2 at (0,4)
     p_moves = legal_pawn_moves(s)
     assert p_moves == [(9, 4)]
+
+
+def test_pawn_cannot_return_to_own_starting_row():
+    """The end-zone entry is one-way after a pawn moves onto the board."""
+    board, start = State.start(4, 6)
+    p1_on_board = State(
+        p1=(9, 4), p2=start.p2,
+        p1_walls_left=9, p2_walls_left=9,
+        walls=frozenset(), turn=1,
+    )
+    assert (10, 4) not in legal_pawn_moves(p1_on_board)
+
+    p2_on_board = State(
+        p1=start.p1, p2=(1, 6),
+        p1_walls_left=9, p2_walls_left=9,
+        walls=frozenset(), turn=2,
+    )
+    assert (0, 6) not in legal_pawn_moves(p2_on_board)
+
+
+def test_starting_row_has_no_lateral_moves():
+    """A pawn starts through the single vertical edge into the board."""
+    _, start = State.start(4, 6)
+    assert legal_pawn_moves(start) == [(9, 4)]
+
+    p2_turn = replace(start, turn=2)
+    assert legal_pawn_moves(p2_turn) == [(1, 6)]
 
 
 def test_reaching_opponent_start_wins():
