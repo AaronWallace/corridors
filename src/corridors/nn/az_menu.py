@@ -610,6 +610,15 @@ def _is_az_checkpoint(name: str) -> bool:
     return meta.get("arch") == "az"
 
 
+def _training_checkpoint_choices() -> list[str]:
+    """Ranked AlphaZero checkpoints eligible to initialize option-2 training."""
+    return [
+        path.stem
+        for path in ranked_checkpoint_paths(CHECKPOINT_ROOT)
+        if _is_az_checkpoint(path.stem)
+    ]
+
+
 def _batch_progress_text(info) -> Text:
     percent = 100.0 * info.batch / max(info.batches, 1)
     rate = info.batch / max(info.elapsed, 1e-9)
@@ -692,14 +701,29 @@ def _train() -> None:
     epochs = _prompt_int("Epochs", 10, 1, 1000)
     batch_size = _prompt_int("Batch size", 256, 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
-    ckpt_name = Prompt.ask("[dim]Checkpoint name[/dim]", default="az_latest").strip()
 
-    # Resume from existing?
+    # Initialization and output are deliberately separate. This lets a training
+    # run inherit a strong model without overwriting the baseline checkpoint.
+    choices = _training_checkpoint_choices()
     resume = ""
+    if choices:
+        resume = _select_checkpoint(
+            choices,
+            "Initialize from checkpoint; blank = random weights",
+            "Initialize AlphaZero training",
+        )
+    else:
+        console.print("[dim]no AlphaZero checkpoints available · using random weights[/dim]")
 
-    if (CHECKPOINT_ROOT / f"{ckpt_name}.safetensors").exists():
-        if Confirm.ask(f"[dim]resume from existing '{ckpt_name}'?[/dim]", default=True):
-            resume = ckpt_name
+    # Keep the suggested name concise, and never default to overwriting the
+    # selected baseline when that baseline is already named az_latest.
+    default_output = "az_trained" if resume == "az_latest" else "az_latest"
+    ckpt_name = Prompt.ask(
+        "[dim]Output checkpoint name[/dim]", default=default_output
+    ).strip() or default_output
+    console.print(
+        f"[dim]initial weights: {resume or 'random'} · output: {ckpt_name}[/dim]"
+    )
 
     config = AZTrainConfig(
         epochs=epochs, batch_size=batch_size, lr=lr,

@@ -46,6 +46,10 @@ fi
 echo "Installing dependencies..."
 "$PYTHON" -m pip install --upgrade pip -q
 "$PYTHON" -m pip install -e . -q
+# Checkpoint serialization is required by training, inference, and the web app.
+# Keep this explicit here as well as in pyproject.toml so setup failures identify
+# the missing package directly.
+"$PYTHON" -m pip install "safetensors>=0.4" -q
 
 # Install PyTorch with CUDA if nvidia-smi is available
 if command -v nvidia-smi &>/dev/null; then
@@ -108,6 +112,7 @@ echo "=== Verifying ==="
 "$PYTHON" -c "from corridors.game import State; print('  game engine: OK')"
 "$PYTHON" -c "from corridors.solver import best_move; print('  solver:      OK')"
 "$PYTHON" -c "from corridors.nn.encoding import encode_state; print('  nn encoding: OK')"
+"$PYTHON" -c "import safetensors; print('  safetensors: OK')"
 if "$PYTHON" -c 'import torch' 2>/dev/null; then
     echo "  torch:       OK (training + tournaments enabled)"
 else

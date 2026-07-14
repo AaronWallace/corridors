@@ -3,7 +3,7 @@
 import json
 
 from corridors.nn.az_menu import _auto_dataset_name
-from corridors.nn import az_selfplay
+from corridors.nn import az_menu, az_selfplay
 
 
 def test_cpu_dataset_name_is_short_and_descriptive():
@@ -37,3 +37,19 @@ def test_full_generation_settings_are_saved_beside_shards(tmp_path, monkeypatch)
     assert saved["selfplay"]["simulations"] == 500
     assert saved["selfplay"]["batch_size"] == 64
     assert saved["promotion_score"] == 0.51
+
+
+def test_training_checkpoint_choices_include_only_ranked_alphazero_models(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(az_menu, "CHECKPOINT_ROOT", tmp_path)
+    for name, arch, elo in (
+        ("az_low", "az", 10),
+        ("value_high", "value", 500),
+        ("az_high", "az", 100),
+    ):
+        (tmp_path / f"{name}.safetensors").write_bytes(b"weights")
+        (tmp_path / f"{name}.meta.json").write_text(
+            json.dumps({"arch": arch, "elo": elo}), encoding="utf-8"
+        )
+
+    assert az_menu._training_checkpoint_choices() == ["az_high", "az_low"]
