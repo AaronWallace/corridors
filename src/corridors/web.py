@@ -14,7 +14,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from . import solver
-from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, legal_moves
+from .game import (
+    NCOLS, State, WALLS_PER_PLAYER, apply_move, is_threefold_repetition,
+    legal_moves,
+)
+from .settings import DEFAULTS
 from .nn.checkpoints import (
     checkpoint_elo,
     load_elo_ratings,
@@ -118,6 +122,9 @@ class WebGame:
     players: dict
     mode: str
     history: list = field(default_factory=list)
+    state_history: list[State] = field(default_factory=list)
+    max_plies: int = int(DEFAULTS["max_plies"])
+    draw_reason: str | None = None
     last_info: dict | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
@@ -132,14 +139,29 @@ def _move_json(move):
     return {"kind": kind, "at": list(arg)}
 
 
+def _game_over(game: WebGame) -> bool:
+    return game.state.winner(game.board) is not None or game.draw_reason is not None
+
+
+def _adjudicate_draw(game: WebGame) -> None:
+    if game.state.winner(game.board) is not None:
+        return
+    if is_threefold_repetition(game.state_history):
+        game.draw_reason = "threefold repetition"
+    elif len(game.history) >= game.max_plies:
+        game.draw_reason = "maximum plies"
+
+
 def _game_json(game_id: str, game: WebGame) -> dict:
     state, board = game.state, game.board
-    moves = [] if state.winner(board) is not None else legal_moves(state, board)
+    moves = [] if _game_over(game) else legal_moves(state, board)
     return {
         "id": game_id,
         "mode": game.mode,
         "turn": state.turn,
         "winner": state.winner(board),
+        "gameOver": _game_over(game),
+        "drawReason": game.draw_reason,
         "pawns": {"1": list(state.p1), "2": list(state.p2)},
         "goals": {"1": list(board.p1_goal), "2": list(board.p2_goal)},
         "walls": [list(w) for w in sorted(state.walls)],
@@ -163,7 +185,9 @@ def _new_game(payload: dict) -> tuple[str, WebGame]:
         ai_side = "2" if human_side == "1" else "1"
         players = {human_side: {"kind": "human"}, ai_side: _agent_spec(payload.get("ai"))}
     game_id = uuid.uuid4().hex[:12]
-    game = WebGame(board, state, players, mode)
+    max_plies = max(1, int(payload.get("maxPlies", DEFAULTS["max_plies"])))
+    game = WebGame(board, state, players, mode, state_history=[state],
+                   max_plies=max_plies)
     with GAMES_LOCK:
         GAMES[game_id] = game
     return game_id, game
@@ -237,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
             if not game:
                 return self._json(404, {"error": "game not found"})
             with game.lock:
-                if game.state.winner(game.board) is not None:
+                if _game_over(game):
                     raise ValueError("game is over")
                 player = game.players[str(game.state.turn)]
                 if action == "move":
@@ -255,7 +279,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(404, {"error": "not found"})
                 mover = game.state.turn
                 game.state = apply_move(game.state, move)
+                game.state_history.append(game.state)
                 game.history.append({"player": mover, **_move_json(move), **game.last_info})
+                _adjudicate_draw(game)
                 return self._json(200, _game_json(game_id, game))
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             return self._json(400, {"error": str(exc)})

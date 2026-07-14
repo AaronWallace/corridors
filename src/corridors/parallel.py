@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from . import solver
-from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, blocked_mask_for, shortest_dist
+from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, is_threefold_repetition
 
 
 @dataclass(frozen=True)
@@ -45,23 +45,6 @@ class WorkerConfig:
     record_shard_index: int = 0            # this worker's shard number
     p1_agent: str = "classical"
     p2_agent: str = "classical"
-
-
-NO_PROGRESS_WINDOW = 25
-
-
-def _draw_by_no_progress(prev_states: List[State], board) -> bool:
-    if len(prev_states) <= NO_PROGRESS_WINDOW:
-        return False
-    baseline = prev_states[-NO_PROGRESS_WINDOW - 1]
-    latest = prev_states[-1]
-    m0 = blocked_mask_for(baseline.walls)
-    m1 = blocked_mask_for(latest.walls)
-    d1b = shortest_dist(baseline.p1, board.p1_goal, m0) or 10_000
-    d1a = shortest_dist(latest.p1, board.p1_goal, m1) or 10_000
-    d2b = shortest_dist(baseline.p2, board.p2_goal, m0) or 10_000
-    d2a = shortest_dist(latest.p2, board.p2_goal, m1) or 10_000
-    return d1a >= d1b and d2a >= d2b
 
 
 def run_worker(cfg: WorkerConfig, queue) -> None:
@@ -131,7 +114,7 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                 if w is not None:
                     winner = w
                     break
-                if plies >= cfg.max_plies or _draw_by_no_progress(states_seen, board):
+                if plies >= cfg.max_plies or is_threefold_repetition(states_seen):
                     winner = None
                     break
 

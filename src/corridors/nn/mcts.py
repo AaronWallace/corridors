@@ -13,7 +13,8 @@ Key features:
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from collections import Counter
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -108,6 +109,8 @@ def run_mcts(
     c_puct: float = C_PUCT,
     dirichlet_alpha: float = DIRICHLET_ALPHA,
     dirichlet_frac: float = DIRICHLET_FRAC,
+    state_history: Optional[Sequence[State]] = None,
+    remaining_plies: Optional[int] = None,
 ) -> Tuple[np.ndarray, float, Optional[Move], Optional["Node"]]:
     """Run MCTS from root_state.
     Returns (policy_target, root_value, selected_move, selected_child).
@@ -120,6 +123,14 @@ def run_mcts(
         expanded, its accumulated visits/values are kept and we only run enough
         new simulations to top up to num_simulations. Pass the returned
         selected_child back in as reuse_root next move.
+
+    state_history: actual game positions through ``root_state``. A simulation
+        that produces a third occurrence of an exact position is scored as a
+        draw. When omitted, the root is treated as its first occurrence.
+
+    remaining_plies: optional number of moves before the game's maximum-ply
+        draw. Simulations reaching that horizon are scored as draws, except
+        when the final move wins the game.
 
     policy_target: normalized visit counts over the 227-action space (training target).
     root_value: average value at root after all simulations.
@@ -137,6 +148,10 @@ def run_mcts(
         pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
         return pi, root.terminal_value, None, None
 
+    history_counts = Counter(state_history or ())
+    if not state_history or state_history[-1] != root_state:
+        history_counts[root_state] += 1
+
     if not root.expanded:
         policy, value = evaluate_fn(root_state, board)
         root.expand(policy)
@@ -151,6 +166,8 @@ def run_mcts(
     while root.n_total < num_simulations:
         node = root
         path: List[Tuple[Node, int]] = []
+        path_counts: Counter[State] = Counter()
+        adjudicated_draw = False
 
         # Selection — descend to a leaf
         while node.expanded and not node.is_terminal:
@@ -164,8 +181,20 @@ def run_mcts(
                 node.children[ci] = child
             node = child
 
+            path_counts[node.state] += 1
+            occurrences = history_counts[node.state] + path_counts[node.state]
+            if not node.is_terminal and occurrences >= 3:
+                adjudicated_draw = True
+                break
+            if (not node.is_terminal and remaining_plies is not None
+                    and len(path) >= remaining_plies):
+                adjudicated_draw = True
+                break
+
         # Evaluation
-        if node.is_terminal:
+        if adjudicated_draw:
+            leaf_value = 0.0
+        elif node.is_terminal:
             leaf_value = node.terminal_value
         else:
             p, v = evaluate_fn(node.state, node.board)

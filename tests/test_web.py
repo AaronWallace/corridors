@@ -19,6 +19,38 @@ def test_new_human_game_exposes_legal_moves():
         web.GAMES.pop(game_id, None)
 
 
+def test_web_game_stops_on_threefold_repetition():
+    game_id, game = web._new_game({
+        "mode": "human-ai", "humanSide": "1",
+        "ai": {"kind": "classical", "depth": 1, "timeLimit": 0.1},
+        "p1Col": 4, "p2Col": 5,
+    })
+    try:
+        game.state_history = [game.state, game.state, game.state]
+        web._adjudicate_draw(game)
+        payload = web._game_json(game_id, game)
+        assert payload["gameOver"] is True
+        assert payload["drawReason"] == "threefold repetition"
+        assert payload["winner"] is None
+        assert payload["legal"] == []
+    finally:
+        web.GAMES.pop(game_id, None)
+
+
+def test_web_game_retains_maximum_ply_fallback():
+    game_id, game = web._new_game({
+        "mode": "human-ai", "humanSide": "1",
+        "ai": {"kind": "classical", "depth": 1, "timeLimit": 0.1},
+        "p1Col": 4, "p2Col": 5, "maxPlies": 2,
+    })
+    try:
+        game.history = [{}, {}]
+        web._adjudicate_draw(game)
+        assert game.draw_reason == "maximum plies"
+    finally:
+        web.GAMES.pop(game_id, None)
+
+
 def test_agent_spec_rejects_missing_checkpoint():
     try:
         web._agent_spec({"kind": "model", "checkpoint": "does_not_exist"})

@@ -14,6 +14,7 @@ from corridors.game import (
     apply_move,
     blocked_mask_for,
     has_path,
+    is_threefold_repetition,
     legal_moves,
     legal_pawn_moves,
     legal_wall_moves,
@@ -162,6 +163,14 @@ def test_finished_game_has_no_legal_moves():
     assert legal_pawn_moves(finished, board) == []
     assert legal_wall_moves(finished, board) == []
     assert legal_moves(finished, board) == []
+
+
+def test_threefold_repetition_requires_three_exact_occurrences():
+    _, start = State.start(4, 6)
+    advanced = apply_move(start, ("m", (9, 4)))
+    assert not is_threefold_repetition([start, advanced, start])
+    assert is_threefold_repetition([start, advanced, start, advanced, start])
+    assert not is_threefold_repetition([])
 
 
 @pytest.mark.parametrize("p1_col,p2_col", [(-1, 4), (9, 4), (4, -1), (4, 9)])

@@ -24,7 +24,9 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..game import NCOLS, WALLS_PER_PLAYER, State, apply_move
+from ..game import (
+    NCOLS, WALLS_PER_PLAYER, State, apply_move, is_threefold_repetition,
+)
 from .actions import NUM_ACTIONS, move_to_index
 from .encoding import NROWS, NUM_PLANES, encode_state
 
@@ -302,6 +304,7 @@ def _play_one_game(
 
     record = GameRecord()
     ply = 0
+    state_history = [state]
     reuse = None  # tree reuse: carry the chosen subtree to the next move
     last_heartbeat = _time.monotonic()
     while True:
@@ -310,6 +313,9 @@ def _play_one_game(
             record.winner = w
             break
         if ply >= config.max_plies:
+            record.winner = None
+            break
+        if is_threefold_repetition(state_history):
             record.winner = None
             break
 
@@ -324,6 +330,8 @@ def _play_one_game(
             c_puct=config.c_puct,
             dirichlet_alpha=config.dirichlet_alpha,
             dirichlet_frac=config.dirichlet_frac,
+            state_history=state_history,
+            remaining_plies=config.max_plies - ply,
         )
         if move is None:
             record.winner = 2 if state.turn == 1 else 1
@@ -333,6 +341,7 @@ def _play_one_game(
         record.policies.append(pi)
         record.turns.append(state.turn)
         state = apply_move(state, move)
+        state_history.append(state)
         ply += 1
 
         now = _time.monotonic()
@@ -912,6 +921,7 @@ def run_selfplay_single(
             states, policies, turns = [], [], []
             ply = 0
             winner = None
+            state_history = [state]
             reuse = None
             eval_cache = {}
 
@@ -930,6 +940,8 @@ def run_selfplay_single(
                     break
                 if ply >= config.max_plies:
                     break
+                if is_threefold_repetition(state_history):
+                    break
 
                 temp = config.temp_high if ply < config.temperature_moves else config.temp_low
                 pi, _, move, reuse = run_mcts(state, board, cached_eval,
@@ -937,7 +949,9 @@ def run_selfplay_single(
                                               reuse_root=reuse,
                                               c_puct=config.c_puct,
                                               dirichlet_alpha=config.dirichlet_alpha,
-                                              dirichlet_frac=config.dirichlet_frac)
+                                              dirichlet_frac=config.dirichlet_frac,
+                                              state_history=state_history,
+                                              remaining_plies=config.max_plies - ply)
                 if move is None:
                     winner = 2 if state.turn == 1 else 1
                     break
@@ -946,6 +960,7 @@ def run_selfplay_single(
                 policies.append(pi)
                 turns.append(state.turn)
                 state = apply_move(state, move)
+                state_history.append(state)
                 ply += 1
 
             outcomes = []

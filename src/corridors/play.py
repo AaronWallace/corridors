@@ -46,6 +46,7 @@ from .game import (
     Wall,
     WALLS_PER_PLAYER,
     apply_move,
+    is_threefold_repetition,
 )
 
 COL_LETTERS = "ABCDEFGHI"
@@ -596,22 +597,6 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
 # Game runner
 # ---------------------------------------------------------------------------
 
-def _draw_by_no_progress(prev_states: List[State], board: Board) -> bool:
-    NO_PROGRESS_WINDOW = 25
-    if len(prev_states) <= NO_PROGRESS_WINDOW:
-        return False
-    from .game import blocked_mask_for, shortest_dist
-    baseline = prev_states[-NO_PROGRESS_WINDOW - 1]
-    latest = prev_states[-1]
-    m0 = blocked_mask_for(baseline.walls)
-    m1 = blocked_mask_for(latest.walls)
-    d1b = shortest_dist(baseline.p1, board.p1_goal, m0) or 10_000
-    d1a = shortest_dist(latest.p1, board.p1_goal, m1) or 10_000
-    d2b = shortest_dist(baseline.p2, board.p2_goal, m0) or 10_000
-    d2a = shortest_dist(latest.p2, board.p2_goal, m1) or 10_000
-    return d1a >= d1b and d2a >= d2b
-
-
 def _run_one_game(
     params: AutoplayParams,
     session: SessionStats,
@@ -649,7 +634,7 @@ def _run_one_game(
         if plies >= params.max_plies:
             winner = None
             break
-        if _draw_by_no_progress(states_seen, board):
+        if is_threefold_repetition(states_seen):
             winner = None
             break
 

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import Dict, FrozenSet, Iterator, List, Optional, Tuple
+from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
 NROWS = 11
 NCOLS = 9
@@ -25,6 +25,7 @@ P2_END_ROW = 0
 PLAY_MIN = 1
 PLAY_MAX = 9
 WALLS_PER_PLAYER = 9
+REPETITIONS_FOR_DRAW = 3
 
 Pos = Tuple[int, int]
 Wall = Tuple[int, int, str]
@@ -249,6 +250,18 @@ class State:
         if self.p2 == board.p2_goal:
             return 2
         return None
+
+
+def is_threefold_repetition(states: Sequence[State]) -> bool:
+    """Whether the latest exact position has now occurred three times.
+
+    ``State`` includes both pawns, side to move, placed walls, and walls left.
+    Goals live on ``Board`` and remain fixed for the duration of a game.
+    """
+    if not states:
+        return False
+    latest = states[-1]
+    return sum(state == latest for state in states) >= REPETITIONS_FOR_DRAW
 
 
 def _edge_open(a: Pos, b: Pos, blocked_mask: int) -> bool:

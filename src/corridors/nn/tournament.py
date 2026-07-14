@@ -27,8 +27,7 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import solver
-from ..game import NCOLS, State, WALLS_PER_PLAYER, apply_move
-from ..parallel import _draw_by_no_progress
+from ..game import NCOLS, State, WALLS_PER_PLAYER, apply_move, is_threefold_repetition
 from .az_selfplay import (_THREAD_ENV_VARS, _limit_blas_threads, auto_workers,
                           resolve_device)
 
@@ -110,7 +109,7 @@ def _get_mover(spec: AgentSpec, seed: int, device: str):
 def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
                    device: str = "cpu", max_plies: int = MAX_PLIES) -> float:
     """Play one game; 'a' moves first as P1. Returns score for a: 1 / 0.5 / 0.
-    A game reaching `max_plies` half-moves (or a no-progress draw) scores 0.5."""
+    Threefold repetition or reaching `max_plies` half-moves scores 0.5."""
     seed = hash((a.name, b.name, game_idx)) & 0x7FFFFFFF
     rng = random.Random(seed)
     p1_col = rng.randint(0, NCOLS - 1)
@@ -124,7 +123,7 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
         w = state.winner(board)
         if w is not None:
             return 1.0 if w == 1 else 0.0
-        if plies >= max_plies or _draw_by_no_progress(states_seen, board):
+        if plies >= max_plies or is_threefold_repetition(states_seen):
             return 0.5
         mv = movers[state.turn](state, board)
         state = apply_move(state, mv)
