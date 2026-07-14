@@ -92,8 +92,8 @@ def test_apply_move_returns_new_state():
 
 def test_endzone_pawn_can_only_step_forward():
     """A pawn in its own end zone has exactly one legal pawn move: into the playable area."""
-    _, s = State.start(4, 4)  # P1 at (10,4), P2 at (0,4)
-    p_moves = legal_pawn_moves(s)
+    board, s = State.start(4, 4)  # P1 at (10,4), P2 at (0,4)
+    p_moves = legal_pawn_moves(s, board)
     assert p_moves == [(9, 4)]
 
 
@@ -105,23 +105,47 @@ def test_pawn_cannot_return_to_own_starting_row():
         p1_walls_left=9, p2_walls_left=9,
         walls=frozenset(), turn=1,
     )
-    assert (10, 4) not in legal_pawn_moves(p1_on_board)
+    assert (10, 4) not in legal_pawn_moves(p1_on_board, board)
 
     p2_on_board = State(
         p1=start.p1, p2=(1, 6),
         p1_walls_left=9, p2_walls_left=9,
         walls=frozenset(), turn=2,
     )
-    assert (0, 6) not in legal_pawn_moves(p2_on_board)
+    assert (0, 6) not in legal_pawn_moves(p2_on_board, board)
 
 
 def test_starting_row_has_no_lateral_moves():
     """A pawn starts through the single vertical edge into the board."""
-    _, start = State.start(4, 6)
-    assert legal_pawn_moves(start) == [(9, 4)]
+    board, start = State.start(4, 6)
+    assert legal_pawn_moves(start, board) == [(9, 4)]
 
     p2_turn = replace(start, turn=2)
-    assert legal_pawn_moves(p2_turn) == [(1, 6)]
+    assert legal_pawn_moves(p2_turn, board) == [(1, 6)]
+
+
+def test_only_exact_goal_cell_can_be_entered_in_opponent_end_zone():
+    board, start = State.start(4, 6)
+    p1_at_wrong_column = replace(start, p1=(1, 5), p2=(5, 8), turn=1)
+    assert (0, 5) not in legal_pawn_moves(p1_at_wrong_column, board)
+
+    p1_at_goal_column = replace(p1_at_wrong_column, p1=(1, 6))
+    assert board.p1_goal in legal_pawn_moves(p1_at_goal_column, board)
+
+    p2_at_wrong_column = replace(start, p1=(5, 8), p2=(9, 3), turn=2)
+    assert (10, 3) not in legal_pawn_moves(p2_at_wrong_column, board)
+
+    p2_at_goal_column = replace(p2_at_wrong_column, p2=(9, 4))
+    assert board.p2_goal in legal_pawn_moves(p2_at_goal_column, board)
+
+
+def test_jump_into_opponent_end_zone_must_land_on_exact_goal():
+    board, start = State.start(4, 6)
+    wrong_column = replace(start, p1=(2, 5), p2=(1, 5), turn=1)
+    assert (0, 5) not in legal_pawn_moves(wrong_column, board)
+
+    goal_column = replace(start, p1=(2, 6), p2=(1, 6), turn=1)
+    assert board.p1_goal in legal_pawn_moves(goal_column, board)
 
 
 def test_reaching_opponent_start_wins():
@@ -130,6 +154,25 @@ def test_reaching_opponent_start_wins():
     s = State(p1=board.p1_goal, p2=s.p2, p1_walls_left=9, p2_walls_left=9,
               walls=frozenset(), turn=2)
     assert s.winner(board) == 1
+
+
+def test_finished_game_has_no_legal_moves():
+    board, start = State.start(0, 8)
+    finished = replace(start, p1=board.p1_goal, turn=2)
+    assert legal_pawn_moves(finished, board) == []
+    assert legal_wall_moves(finished, board) == []
+    assert legal_moves(finished, board) == []
+
+
+@pytest.mark.parametrize("p1_col,p2_col", [(-1, 4), (9, 4), (4, -1), (4, 9)])
+def test_start_rejects_columns_outside_the_board(p1_col, p2_col):
+    with pytest.raises(ValueError):
+        State.start(p1_col, p2_col)
+
+
+def test_start_rejects_negative_wall_count():
+    with pytest.raises(ValueError):
+        State.start(4, 4, walls=-1)
 
 
 def test_wall_blocks_edge():
@@ -191,13 +234,13 @@ def test_jump_over_adjacent_opponent():
         p1_walls_left=9, p2_walls_left=9,
         walls=frozenset(), turn=1,
     )
-    moves = legal_pawn_moves(s)
+    moves = legal_pawn_moves(s, board)
     # P1 can step down/left/right (regular) or jump over P2 up to (3,4).
     assert (3, 4) in moves
 
 
-def test_side_jump_when_straight_blocked():
-    """Straight jump blocked by wall => side-jumps become legal."""
+def test_side_jump_is_not_allowed_when_straight_jump_is_blocked():
+    """This variant never permits side-jumps around an adjacent pawn."""
     board, _ = State.start(4, 4)
     # P1 at (5,4), P2 at (4,4). Wall behind P2 blocking (3,4)-(4,4).
     walls = frozenset({(3, 3, "H"), (3, 4, "H")})  # both would overlap; pick one that blocks
@@ -208,11 +251,11 @@ def test_side_jump_when_straight_blocked():
         p1_walls_left=9, p2_walls_left=9,
         walls=walls, turn=1,
     )
-    moves = set(legal_pawn_moves(s))
-    # Straight jump (3,4) blocked. Side jumps (4,3) and (4,5) should be available.
+    moves = set(legal_pawn_moves(s, board))
+    # The wall blocks the straight jump. Moving diagonally around P2 is illegal.
     assert (3, 4) not in moves
-    assert (4, 3) in moves
-    assert (4, 5) in moves
+    assert (4, 3) not in moves
+    assert (4, 5) not in moves
 
 
 def test_bfs_finds_path_on_empty_board():

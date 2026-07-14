@@ -5,7 +5,8 @@ are end-zone strips. Each end-zone cell connects only to the playable cell in
 the same column (single edge); end-zone cells never connect to each other.
 
 Each player picks a starting cell in their own end zone; that cell becomes the
-opponent's goal.
+opponent's goal. A pawn may leave its own end zone only once, may never return
+to it, and may enter the opponent's end zone only through that exact goal cell.
 
 Walls occupy an interior 8x8 grid of slots (rows 1..8, cols 0..7) with H or V
 orientation, each blocking two edges. Walls never sit on the goal-entry edges.
@@ -210,8 +211,10 @@ class Board:
     p2_goal: Pos  # P2 pawn must reach this cell (in row 10, P1's start col)
 
     def __post_init__(self) -> None:
-        if self.p1_goal[0] != P2_END_ROW or self.p2_goal[0] != P1_END_ROW:
-            raise ValueError("goals must sit in opponent's end zone row")
+        if not is_endzone(*self.p1_goal) or self.p1_goal[0] != P2_END_ROW:
+            raise ValueError("P1's goal must be a valid cell in P2's end zone")
+        if not is_endzone(*self.p2_goal) or self.p2_goal[0] != P1_END_ROW:
+            raise ValueError("P2's goal must be a valid cell in P1's end zone")
 
 
 @dataclass(frozen=True)
@@ -225,6 +228,10 @@ class State:
 
     @staticmethod
     def start(p1_col: int, p2_col: int, walls: int = WALLS_PER_PLAYER) -> "Tuple[Board, State]":
+        if not 0 <= p1_col < NCOLS or not 0 <= p2_col < NCOLS:
+            raise ValueError(f"starting columns must be between 0 and {NCOLS - 1}")
+        if walls < 0:
+            raise ValueError("starting wall count cannot be negative")
         board = Board(p1_goal=(P2_END_ROW, p2_col), p2_goal=(P1_END_ROW, p1_col))
         state = State(
             p1=(P1_END_ROW, p1_col),
@@ -263,16 +270,12 @@ def _pawn_targets(me: Pos, opp: Pos, blocked_mask: int) -> Iterator[Pos]:
         if step != opp:
             yield step
             continue
-        # opponent blocks the step: try straight jump, then side jumps
+        # The opponent may be crossed only with a straight jump. If the cell
+        # behind them is blocked or outside the board, this direction has no
+        # legal pawn move; this variant does not allow side-jumps.
         straight = (step[0] + dr, step[1] + dc)
         if valid(*straight) and _edge_open(step, straight, blocked_mask):
             yield straight
-            continue
-        perps = ((-1, 0), (1, 0)) if dr == 0 else ((0, -1), (0, 1))
-        for pdr, pdc in perps:
-            side = (step[0] + pdr, step[1] + pdc)
-            if valid(*side) and _edge_open(step, side, blocked_mask):
-                yield side
 
 
 def _mover(state: State) -> Tuple[Pos, Pos, int]:
@@ -281,17 +284,23 @@ def _mover(state: State) -> Tuple[Pos, Pos, int]:
     return state.p2, state.p1, state.p2_walls_left
 
 
-def legal_pawn_moves(state: State) -> List[Pos]:
+def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
+    if state.winner(board) is not None:
+        return []
     me, opp, _ = _mover(state)
     m = blocked_mask_for(state.walls)
     # A player's own end-zone row is a one-way starting area: the initial pawn
     # move enters the board, and the pawn may never return to that row. End-zone
     # cells are already disconnected laterally by the adjacency graph.
     own_start_row = P1_END_ROW if state.turn == 1 else P2_END_ROW
+    opponent_end_row = P2_END_ROW if state.turn == 1 else P1_END_ROW
+    goal = board.p1_goal if state.turn == 1 else board.p2_goal
     seen = set()
     out = []
     for t in _pawn_targets(me, opp, m):
         if t == me or t in seen or t[0] == own_start_row:
+            continue
+        if t[0] == opponent_end_row and t != goal:
             continue
         seen.add(t)
         out.append(t)
@@ -328,6 +337,8 @@ def _shortest_path_edges(pos: Pos, goal: Pos, blocked_mask: int) -> FrozenSet[Tu
 
 
 def legal_wall_moves(state: State, board: Board) -> List[Wall]:
+    if state.winner(board) is not None:
+        return []
     _, _, walls_left = _mover(state)
     if walls_left <= 0:
         return []
@@ -360,7 +371,9 @@ def legal_wall_moves(state: State, board: Board) -> List[Wall]:
 
 
 def legal_moves(state: State, board: Board) -> List[Move]:
-    moves: List[Move] = [("m", p) for p in legal_pawn_moves(state)]
+    if state.winner(board) is not None:
+        return []
+    moves: List[Move] = [("m", p) for p in legal_pawn_moves(state, board)]
     moves.extend(("w", w) for w in legal_wall_moves(state, board))
     return moves
 

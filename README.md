@@ -41,8 +41,9 @@ checkpoints from `nn_checkpoints`, and supports human-vs-AI and AI-vs-AI games.
 
 - 11 rows (0..10) x 9 cols (A..I). Rows 1..9 are playable; rows 0 and 10 are end zones.
 - Each player picks a starting column in their own end zone. That cell becomes the opponent's goal.
-- Pawns move one step in the 4 compass directions. Jump over an adjacent opponent; side-jump if blocked behind.
-- Each player has 9 walls. Walls span two cells and cannot fully cut off either player's path.
+- End-zone rows have no lateral movement. A pawn's first move is straight onto the board, it cannot return to its own end zone, and it may enter the opponent's end zone only at the exact goal cell.
+- Pawns move one step in the 4 compass directions. An adjacent opponent may be jumped only straight ahead when the landing cell is open; side-jumps are not allowed.
+- Each player has 9 walls. Walls span two cells, cannot overlap or cross, and cannot fully cut off either player's path.
 - Reach the opponent's starting cell to win.
 
 ## Features
