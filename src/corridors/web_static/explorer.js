@@ -291,7 +291,7 @@ function renderWeights() {
 
 function renderFacts() {
   const model = catalog.find(item => item.name === checkpoint()) || {};
-  $('#modelFacts').innerHTML = `<strong>${analysis.architecture === 'az' ? 'AlphaZero policy + value' : 'Value network'}</strong><br>${fmt(analysis.parameters)} parameters · ${model.blocks || analysis.layers.filter(l => l.name.startsWith('block_')).length} residual blocks${model.elo != null ? ` · Elo ${Math.round(model.elo)}` : ''}`;
+  $('#modelFacts').innerHTML = `<strong>${analysis.architecture === 'az' ? 'AlphaZero policy + value' : 'Value network'}</strong><br>${fmt(analysis.parameters)} parameters · ${model.blocks || analysis.layers.filter(l => l.name.startsWith('block_')).length} residual blocks · modified ${model.modified}${model.elo != null ? ` · Elo ${Math.round(model.elo)}` : ''}`;
 }
 
 function render() {
@@ -313,7 +313,7 @@ $('#playDelay').oninput = event => { $('#delayValue').textContent = +event.targe
   const config = await api('/api/config');
   catalog = config.models.filter(model => !model.loadError);
   if (!catalog.length) throw Error('No loadable neural checkpoints found.');
-  $('#modelSelect').innerHTML = catalog.map(model => `<option value="${model.name}">${model.name}${model.elo == null ? '' : ` · Elo ${Math.round(model.elo)}`}</option>`).join('');
+  $('#modelSelect').innerHTML = catalog.map(model => `<option value="${model.name}">${model.name} · ${model.modified}${model.elo == null ? '' : ` · Elo ${Math.round(model.elo)}`}</option>`).join('');
   gameNumber = 0;
   await newPosition();
 })().catch(error => { $('#modelFacts').textContent = error.message; $('#loading').classList.remove('visible'); });

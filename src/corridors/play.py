@@ -515,17 +515,30 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
         p2_col = int(cfg["p2_col"])
 
     agent_choices = ["classical"]
+    agent_modified = {}
     if allow_neural:
         from .nn.checkpoints import ranked_checkpoint_paths
         checkpoint_root = Path(__file__).resolve().parent.parent.parent / "nn_checkpoints"
-        agent_choices.extend(f.stem for f in ranked_checkpoint_paths(checkpoint_root))
+        checkpoint_paths = ranked_checkpoint_paths(checkpoint_root)
+        agent_choices.extend(f.stem for f in checkpoint_paths)
+        agent_modified = {
+            f.stem: time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(f.stat().st_mtime)
+            )
+            for f in checkpoint_paths
+        }
 
     def choose_agent(player: int) -> str:
         saved = str(cfg.get(f"p{player}_agent", "classical"))
         default = saved if saved in agent_choices else "classical"
         if len(agent_choices) == 1:
             return "classical"
-        console.print(f"[dim]P{player} agents:[/dim] " + ", ".join(agent_choices))
+        displayed = [
+            choice if choice == "classical"
+            else f"{choice} (modified {agent_modified[choice]})"
+            for choice in agent_choices
+        ]
+        console.print(f"[dim]P{player} agents:[/dim] " + ", ".join(displayed))
         return Prompt.ask(f"[dim]Player {player} AI[/dim]",
                           choices=agent_choices, default=default)
 

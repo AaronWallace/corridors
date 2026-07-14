@@ -7,6 +7,7 @@ and promotion of a machine-local checkpoint into the Git-shared best folder.
 from __future__ import annotations
 
 import os
+import time
 from typing import List, Optional
 
 from rich import box
@@ -20,7 +21,6 @@ from . import datasets as ds_mod
 
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
-TOURNAMENT_DISPLAY_LIMIT = 10
 
 
 def _console():
@@ -52,6 +52,13 @@ def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
         except ValueError:
             pass
         console.print(f"[red]  must be a number {lo}..{hi}[/red]")
+
+
+def _format_modified(value) -> str:
+    """Compact local date/time used by every dataset/checkpoint table."""
+    if not isinstance(value, (int, float)):
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
 
 
 # ---------------------------------------------------------------------------
@@ -157,14 +164,16 @@ def _train_model() -> None:
 # 3. Tournament
 # ---------------------------------------------------------------------------
 
-def _ranked_ratings(ratings, limit: int = TOURNAMENT_DISPLAY_LIMIT):
+def _ranked_ratings(ratings, limit: Optional[int] = None):
     """Highest Elo entries with deterministic alphabetical tie-breaking."""
-    return sorted(ratings.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    ranked = sorted(ratings.items(), key=lambda item: (-item[1], item[0]))
+    return ranked if limit is None else ranked[:limit]
 
-def _print_head_to_head(console, results, ratings) -> None:
+def _print_head_to_head(console, results, ratings, modified=None) -> None:
     """Crosstable of each model's W-L-D vs every other model (row's perspective).
     Rows/columns are ordered by Elo; columns are numbered to keep it compact."""
     from collections import defaultdict
+    modified = modified or {}
     if not results:
         return
     rec = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))  # rec[a][b] = [W,L,D]
@@ -182,11 +191,16 @@ def _print_head_to_head(console, results, ratings) -> None:
         {name: ratings.get(name, 0.0) for name in names})]
     idx = {n: i + 1 for i, n in enumerate(order)}
 
-    title = "Head-to-head top 10 (W-L-D, row vs column)" if len(names) > len(order) \
-        else "Head-to-head (W-L-D, row vs column)"
-    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
+    t = Table(
+        box=box.SIMPLE,
+        header_style="dim",
+        title="Round robin (W-L-D, row vs column)",
+        title_style="bold",
+    )
     t.add_column("#", justify="right", style="dim")
+    t.add_column("Elo", justify="right")
     t.add_column("model")
+    t.add_column("Modified", no_wrap=True)
     for n in order:
         t.add_column(str(idx[n]), justify="center")
     for r in order:
@@ -202,7 +216,10 @@ def _print_head_to_head(console, results, ratings) -> None:
                 colour = "green" if w > l else ("red" if l > w else "yellow")
                 cells.append(f"[{colour}]{w}-{l}-{d}[/{colour}]")
         style = "bold white" if r == "classical" else STYLE_HINT
-        t.add_row(str(idx[r]), Text(r, style=style), *cells)
+        t.add_row(
+            str(idx[r]), f"{ratings.get(r, 0.0):+.0f}",
+            Text(r, style=style), _format_modified(modified.get(r)), *cells,
+        )
     console.print(t)
 
 
@@ -259,21 +276,14 @@ def _tournament() -> None:
         console.print("\n[dim]tournament interrupted — no ratings written.[/dim]")
         return
 
-    all_ratings = data["ratings"]
-    title = (f"Elo standings · top {TOURNAMENT_DISPLAY_LIMIT} of {len(all_ratings)}"
-             if len(all_ratings) > TOURNAMENT_DISPLAY_LIMIT else "Elo standings")
-    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
-    t.add_column("#", justify="right", style="dim")
-    t.add_column("model")
-    t.add_column("Elo", justify="right")
-    ratings = _ranked_ratings(all_ratings)
-    for i, (name, elo) in enumerate(ratings, 1):
-        style = "bold white" if name == "classical" else STYLE_HINT
-        t.add_row(str(i), Text(name, style=style), f"{elo:+.0f}")
-    console.print(t)
-
-    _print_head_to_head(console, data.get("last_run", {}).get("results", []),
-                        data["ratings"])
+    checkpoint_modified = {
+        item["name"]: item.get("modified")
+        for item in model_mod.list_checkpoints()
+    }
+    _print_head_to_head(
+        console, data.get("last_run", {}).get("results", []),
+        data["ratings"], checkpoint_modified,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +316,7 @@ def _print_datasets(items: List[dict]) -> None:
     t.add_column("positions", justify="right")
     t.add_column("shards", justify="right")
     t.add_column("MB", justify="right")
+    t.add_column("Modified", no_wrap=True)
     t.add_column("config", style="dim")
     for i, d in enumerate(items, 1):
         c = d["config"]
@@ -321,7 +332,8 @@ def _print_datasets(items: List[dict]) -> None:
                        f"{c.get('starts', '?')}") if c else "-"
         t.add_row(str(i), d["name"], str(d["games"]), f"{d['positions']:,}" if
                   isinstance(d["positions"], int) else str(d["positions"]),
-                  str(d["shards"]), f"{d['size_mb']:.1f}", cfg_str)
+                  str(d["shards"]), f"{d['size_mb']:.1f}",
+                  _format_modified(d.get("modified")), cfg_str)
     console.print(t)
 
 
@@ -376,6 +388,7 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
     t.add_column("lineage", style="dim")
     t.add_column("best", justify="center")
     t.add_column("MB", justify="right")
+    t.add_column("Modified", no_wrap=True)
     for i, c in enumerate(items, 1):
         e = elo.get(c["name"], c.get("elo"))
         # Weight lineage: seed origin (cross-lineage) beats a self-resume.
@@ -393,6 +406,7 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
             lineage,
             "✓" if c.get("in_best") else "-",
             f"{c['size_mb']:.1f}",
+            _format_modified(c.get("modified")),
         )
     console.print(t)
     if copy_only:

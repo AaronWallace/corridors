@@ -43,6 +43,9 @@ def _model_catalog() -> list[dict]:
                 pass
         catalog.append({
             "name": weights.stem,
+            "modified": time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(weights.stat().st_mtime)
+            ),
             "architecture": meta.get("arch", "value"),
             "channels": meta.get("channels"),
             "blocks": meta.get("blocks"),

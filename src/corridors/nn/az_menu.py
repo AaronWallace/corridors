@@ -215,6 +215,7 @@ def _auto_dataset_name(*, prefix: str, games: int, simulations: int,
 def _checkpoint_table(checkpoints, title: str = "AZ checkpoints") -> Table:
     """Build the ranked checkpoint table shown by AlphaZero setup prompts."""
     from . import model as model_mod
+    from .menu import _format_modified
 
     details = {item["name"]: item for item in model_mod.list_checkpoints()}
     table = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
@@ -227,6 +228,7 @@ def _checkpoint_table(checkpoints, title: str = "AZ checkpoints") -> Table:
     table.add_column("ancestry", style="dim", max_width=30,
                      overflow="ellipsis", no_wrap=True)
     table.add_column("MB", justify="right")
+    table.add_column("Modified", no_wrap=True)
     for index, name in enumerate(checkpoints, 1):
         item = details.get(name, {})
         elo = item.get("elo")
@@ -245,6 +247,7 @@ def _checkpoint_table(checkpoints, title: str = "AZ checkpoints") -> Table:
             str(item.get("dataset") or "-"),
             ancestry,
             f"{size:.1f}" if isinstance(size, (int, float)) else "-",
+            _format_modified(item.get("modified")),
         )
     return table
 
@@ -738,15 +741,18 @@ def _train() -> None:
         console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
         return
 
-    runs = sorted(d.name for d in AZ_DATA_ROOT.iterdir() if d.is_dir())
-    if not runs:
+    from .menu import _print_datasets
+    run_items = [
+        {**item, "name": item["name"].split("/", 1)[1]}
+        for item in ds_mod.list_datasets()
+        if item.get("kind") == "alphazero"
+        and item["name"].startswith("alphazero/")
+    ]
+    if not run_items:
         console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
         return
-
-    for i, r in enumerate(runs, 1):
-        d = AZ_DATA_ROOT / r
-        files = [f for f in d.glob("*.npz") if not f.name.startswith(".")]
-        console.print(f"  [dim]{i}.[/dim] {r} [dim]({len(files)} data file(s))[/dim]")
+    _print_datasets(run_items)
+    runs = [item["name"] for item in run_items]
 
     # Select one, several, or all runs — train on the combined data.
     raw = Prompt.ask("[dim]Runs to train on (#, names, comma-separated, or 'all')[/dim]",
@@ -1003,6 +1009,7 @@ def _full_loop() -> None:
     cumulative_positions = 0
     cumulative_wins = {1: 0, 2: 0}
     cumulative_draws = 0
+    interrupted = False
 
     try:
         for it in range(1, iterations + 1):
@@ -1202,10 +1209,14 @@ def _full_loop() -> None:
             )
 
     except (KeyboardInterrupt, EOFError):
-        console.print("\n[dim]loop interrupted — last best checkpoint is saved.[/dim]")
-        return
+        interrupted = True
+        console.print("\n[dim]interrupt received — stopping self-play workers…[/dim]")
     finally:
-        pool.close()
+        pool.close(grace_period=0.25 if interrupted else 2.0)
+
+    if interrupted:
+        console.print("[dim]training loop stopped — completed data and the last best checkpoint are saved.[/dim]")
+        return
 
     loop_elapsed = time.monotonic() - loop_t0
     console.print(Panel(

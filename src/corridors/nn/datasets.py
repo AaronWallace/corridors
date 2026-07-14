@@ -279,12 +279,21 @@ def _dataset_entry(d: Path, name: str) -> Dict:
     shards = _shard_files(d)
     m = _read_meta(d, shards)
     size = sum(f.stat().st_size for f in shards)
+    dated_files = [
+        path for path in [*shards, d / "manifest.json", d / "run.json"]
+        if path.exists()
+    ]
+    modified = max(
+        (path.stat().st_mtime for path in dated_files),
+        default=d.stat().st_mtime,
+    )
     return {
         "name": name,
         "games": m["games"] if m else "?",
         "positions": m["positions"] if m else "?",
         "shards": len(shards),
         "size_mb": size / 1e6,
+        "modified": modified,
         "config": (m or {}).get("config", {}),
         "kind": (m or {}).get("kind", "unknown"),
     }

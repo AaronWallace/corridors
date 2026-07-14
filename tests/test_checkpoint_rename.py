@@ -1,8 +1,23 @@
 import json
+import os
 
 import pytest
 
 from corridors.nn import model, tournament
+
+
+def test_checkpoint_listing_reports_weight_modified_time(tmp_path, monkeypatch):
+    monkeypatch.setattr(model, "CHECKPOINT_ROOT", tmp_path)
+    weights = tmp_path / "dated.safetensors"
+    weights.write_bytes(b"weights")
+    os.utime(weights, (3_000, 3_000))
+    meta = tmp_path / "dated.meta.json"
+    meta.write_text(json.dumps({"epoch": 1}), encoding="utf-8")
+    os.utime(meta, (4_000, 4_000))
+
+    [item] = model.list_checkpoints()
+
+    assert item["modified"] == 3_000
 
 
 def test_rename_checkpoint_moves_weights_metadata_and_self_reference(tmp_path, monkeypatch):

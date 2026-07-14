@@ -156,6 +156,7 @@ def list_checkpoints() -> list:
         out.append({
             "name": name,
             "size_mb": f.stat().st_size / 1e6,
+            "modified": f.stat().st_mtime,
             "epoch": meta.get("epoch"),
             "val_mse": meta.get("val_mse"),
             "val_sign_acc": meta.get("val_sign_acc"),

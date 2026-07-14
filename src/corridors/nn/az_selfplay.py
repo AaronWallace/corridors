@@ -1452,7 +1452,14 @@ class SelfPlayPool:
         }
         return writer.get_all()
 
-    def close(self) -> None:
+    def close(self, grace_period: float = 2.0) -> None:
+        """Stop the pool within one bounded grace period.
+
+        The grace period is shared by every child rather than applied once per
+        process.  That distinction matters on large compute pods: 128 workers
+        at five seconds each previously made an interrupt appear to hang for
+        more than ten minutes.
+        """
         if self._closed:
             return
         self._closed = True
@@ -1466,13 +1473,44 @@ class SelfPlayPool:
                 rq.put((_CMD_TAG, "stop", ""))
             except Exception:
                 pass
-        for w in self.workers:
-            w.join(timeout=5)
-        for srv in self.servers:
-            srv.join(timeout=5)
-        for proc in (*self.workers, *self.servers):
+
+        processes = [*self.workers, *self.servers]
+        deadline = time.monotonic() + max(0.0, grace_period)
+        for proc in processes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            proc.join(timeout=remaining)
+
+        alive = [proc for proc in processes if proc.is_alive()]
+        for proc in alive:
+            proc.terminate()
+        terminate_deadline = time.monotonic() + 2.0
+        for proc in alive:
+            remaining = terminate_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            proc.join(timeout=remaining)
+        for proc in alive:
             if proc.is_alive():
-                proc.terminate()
+                kill = getattr(proc, "kill", None)
+                if kill is not None:
+                    kill()
+                proc.join(timeout=0.1)
+
+        # Multiprocessing queue feeder threads can otherwise keep the parent
+        # alive after every child has gone away.
+        queues = [self.result_queue, *self.cmd_queues, *self.request_queues]
+        if self.response_queues:
+            queues.extend(self.response_queues.values())
+        if self.ack_queue is not None:
+            queues.append(self.ack_queue)
+        for queue in queues:
+            try:
+                queue.cancel_join_thread()
+                queue.close()
+            except Exception:
+                pass
 
     def __enter__(self) -> "SelfPlayPool":
         return self

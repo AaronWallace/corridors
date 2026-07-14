@@ -57,7 +57,7 @@ function agentEditor(root, player) {
   root.innerHTML = `<legend>Player ${player}</legend>
     <div class="field"><label>Controller</label><select class="kind">
       <option value="classical">Classical solver</option>
-      ${config.models.map(model => `<option value="model:${model.name}">${model.name}</option>`).join('')}
+      ${config.models.map(model => `<option value="model:${model.name}">${model.name} · ${model.modified}</option>`).join('')}
     </select></div>
     <div class="classical">
       <div class="field"><label>Time per move</label><input class="time" type="number" value="0.5" min="0" max="600" step="0.1"></div>
@@ -70,7 +70,7 @@ function agentEditor(root, player) {
     const name = select.value.slice(6);
     const model = config.models.find(item => item.name === name);
     root.querySelector('.model-note').textContent = model
-      ? `${model.architecture.toUpperCase()}${model.elo != null ? ' · Elo ' + model.elo : ''}${model.positions ? ' · ' + fmt(model.positions) + ' positions' : ''}${model.dataset ? ' · ' + model.dataset : ''}${model.loaded ? ' · preloaded' : ''}`
+      ? `${model.architecture.toUpperCase()} · modified ${model.modified}${model.elo != null ? ' · Elo ' + model.elo : ''}${model.positions ? ' · ' + fmt(model.positions) + ' positions' : ''}${model.dataset ? ' · ' + model.dataset : ''}${model.loaded ? ' · preloaded' : ''}`
       : 'Iterative deepening with a persistent move cache.';
   };
   select.onchange = sync;

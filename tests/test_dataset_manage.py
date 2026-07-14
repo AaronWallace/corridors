@@ -3,6 +3,7 @@ individually, and the ``alphazero`` container must never be deletable as a
 single "dataset" (that once wiped every run at once)."""
 
 import json
+import os
 
 import numpy as np
 import pytest
@@ -67,6 +68,19 @@ def test_legacy_alphazero_run_reports_useful_metadata(data_root):
     assert item["kind"] == "alphazero"
     assert item["config"]["simulations"] == 200
     assert item["config"]["max_plies"] == 120
+
+
+def test_dataset_modified_time_uses_newest_shard_or_manifest(data_root):
+    run = data_root / "alphazero" / "dated"
+    _write_shard(run)
+    manifest = run / "run.json"
+    manifest.write_text(json.dumps({"selfplay": {}}), encoding="utf-8")
+    os.utime(run / "shard_0000.npz", (1_000, 1_000))
+    os.utime(manifest, (2_000, 2_000))
+
+    [item] = ds.list_datasets()
+
+    assert item["modified"] == 2_000
 
 
 def test_pre_metadata_alphazero_name_recovers_useful_fields(data_root):
