@@ -1,12 +1,7 @@
 """Neural-network training menu.
 
-Options:
-  1. Generate self-play data  (runs the autoplay wizard, records a dataset)
-  2. Train a model            (choose dataset + hyperparameters)
-  3. Round-robin tournament   (all checkpoints + classical anchor, Elo)
-  4. List / manage datasets
-  5. List / manage checkpoints
-  6. Back
+Includes data generation, training, tournaments, dataset/checkpoint management,
+and promotion of a machine-local checkpoint into the Git-shared best folder.
 """
 
 from __future__ import annotations
@@ -25,6 +20,7 @@ from . import datasets as ds_mod
 
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
+TOURNAMENT_DISPLAY_LIMIT = 10
 
 
 def _console():
@@ -161,6 +157,10 @@ def _train_model() -> None:
 # 3. Tournament
 # ---------------------------------------------------------------------------
 
+def _ranked_ratings(ratings, limit: int = TOURNAMENT_DISPLAY_LIMIT):
+    """Highest Elo entries with deterministic alphabetical tie-breaking."""
+    return sorted(ratings.items(), key=lambda item: (-item[1], item[0]))[:limit]
+
 def _print_head_to_head(console, results, ratings) -> None:
     """Crosstable of each model's W-L-D vs every other model (row's perspective).
     Rows/columns are ordered by Elo; columns are numbered to keep it compact."""
@@ -178,11 +178,13 @@ def _print_head_to_head(console, results, ratings) -> None:
         else:
             rec[a][b][2] += 1; rec[b][a][2] += 1      # draw
 
-    order = sorted(names, key=lambda n: (-ratings.get(n, 0.0), n))
+    order = [name for name, _ in _ranked_ratings(
+        {name: ratings.get(name, 0.0) for name in names})]
     idx = {n: i + 1 for i, n in enumerate(order)}
 
-    t = Table(box=box.SIMPLE, header_style="dim",
-              title="Head-to-head (W-L-D, row vs column)", title_style="bold")
+    title = "Head-to-head top 10 (W-L-D, row vs column)" if len(names) > len(order) \
+        else "Head-to-head (W-L-D, row vs column)"
+    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
     t.add_column("#", justify="right", style="dim")
     t.add_column("model")
     for n in order:
@@ -257,11 +259,14 @@ def _tournament() -> None:
         console.print("\n[dim]tournament interrupted — no ratings written.[/dim]")
         return
 
-    t = Table(box=box.SIMPLE, header_style="dim", title="Elo standings", title_style="bold")
+    all_ratings = data["ratings"]
+    title = (f"Elo standings · top {TOURNAMENT_DISPLAY_LIMIT} of {len(all_ratings)}"
+             if len(all_ratings) > TOURNAMENT_DISPLAY_LIMIT else "Elo standings")
+    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
     t.add_column("#", justify="right", style="dim")
     t.add_column("model")
     t.add_column("Elo", justify="right")
-    ratings = sorted(data["ratings"].items(), key=lambda kv: -kv[1])
+    ratings = _ranked_ratings(all_ratings)
     for i, (name, elo) in enumerate(ratings, 1):
         style = "bold white" if name == "classical" else STYLE_HINT
         t.add_row(str(i), Text(name, style=style), f"{elo:+.0f}")
@@ -342,7 +347,7 @@ def _manage_datasets() -> None:
             console.print(f"[yellow]skipped {name} (not a deletable dataset)[/yellow]")
 
 
-def _manage_checkpoints() -> None:
+def _manage_checkpoints(copy_only: bool = False) -> None:
     console = _console()
     from . import model as model_mod
     from .tournament import load_elo, rename_elo_checkpoint
@@ -359,6 +364,7 @@ def _manage_checkpoints() -> None:
     t.add_column("epoch", justify="right")
     t.add_column("dataset", style="dim")
     t.add_column("lineage", style="dim")
+    t.add_column("best", justify="center")
     t.add_column("MB", justify="right")
     for i, c in enumerate(items, 1):
         e = elo.get(c["name"], c.get("elo"))
@@ -375,13 +381,39 @@ def _manage_checkpoints() -> None:
             str(c.get("epoch") or "-"),
             str(c.get("dataset") or "-"),
             lineage,
+            "✓" if c.get("in_best") else "-",
             f"{c['size_mb']:.1f}",
         )
     console.print(t)
+    if copy_only:
+        raw = Prompt.ask(
+            "[dim]Checkpoint # to copy to shared best (Enter to go back)[/dim]",
+            default="",
+        ).strip()
+        selected = _numbered_selections(items, raw)
+        if not selected:
+            return
+        if len(selected) != 1:
+            console.print("[yellow]choose one checkpoint number to copy[/yellow]")
+            return
+        name = selected[0]["name"]
+        target = model_mod.copy_checkpoint_to_best(name)
+        console.print(f"[dim]copied {name} to {target.parent.name}/[/dim]")
+        return
     raw = Prompt.ask(
-        "[dim]Delete # (comma-separated), r # to rename, or Enter to go back[/dim]",
+        "[dim]Delete # (comma-separated), r # to rename, c # to copy to best, "
+        "or Enter to go back[/dim]",
         default="",
     ).strip()
+    if raw.lower().startswith("c "):
+        selected = _numbered_selections(items, raw[2:])
+        if len(selected) != 1:
+            console.print("[yellow]choose one checkpoint number to copy[/yellow]")
+            return
+        name = selected[0]["name"]
+        target = model_mod.copy_checkpoint_to_best(name)
+        console.print(f"[dim]copied {name} to {target.parent.name}/[/dim]")
+        return
     if raw.lower().startswith("r "):
         selected = _numbered_selections(items, raw[2:])
         if len(selected) != 1:
@@ -418,10 +450,14 @@ def nn_menu() -> None:
         table.add_row("4", "Round-robin tournament (Elo)")
         table.add_row("5", "List / manage datasets")
         table.add_row("6", "List / manage checkpoints")
-        table.add_row("7", "Back")
+        table.add_row("7", "Copy checkpoint to shared best")
+        table.add_row("8", "Back")
         console.print(Panel(table, title="[bold]Neural network training[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6", "7"], default="1")
+        choice = Prompt.ask(
+            "Choose", choices=["1", "2", "3", "4", "5", "6", "7", "8"],
+            default="1",
+        )
         if choice == "1":
             from .az_menu import az_menu
             az_menu()
@@ -435,5 +471,7 @@ def nn_menu() -> None:
             _manage_datasets()
         elif choice == "6":
             _manage_checkpoints()
+        elif choice == "7":
+            _manage_checkpoints(copy_only=True)
         else:
             return

@@ -15,6 +15,7 @@ tournament results).
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -22,7 +23,13 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
 
-from .checkpoints import checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths
+from .checkpoints import (
+    checkpoint_elo,
+    curated_checkpoint_path,
+    load_elo_ratings,
+    ranked_checkpoint_paths,
+    resolve_checkpoint_path,
+)
 from .encoding import NUM_PLANES
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -101,7 +108,7 @@ def save_checkpoint(model: ValueNet, name: str, meta: Optional[Dict] = None) -> 
 
 
 def read_meta(name: str) -> Dict:
-    p = meta_path(name)
+    p = resolve_checkpoint_path(CHECKPOINT_ROOT, name).with_suffix(".meta.json")
     if not p.exists():
         return {}
     try:
@@ -111,6 +118,11 @@ def read_meta(name: str) -> Dict:
 
 
 def update_meta(name: str, updates: Dict) -> None:
+    # Curated checkpoints are immutable runtime inputs. Elo and tournament state
+    # remain machine-local in ignored elo.json instead of dirtying Git metadata.
+    resolved = resolve_checkpoint_path(CHECKPOINT_ROOT, name)
+    if resolved.parent == CHECKPOINT_ROOT / "best":
+        return
     m = read_meta(name)
     m.update(updates)
     p = meta_path(name)
@@ -126,7 +138,7 @@ def load_checkpoint(name: str, device: str = "cpu") -> ValueNet:
         channels=int(meta.get("channels", CHANNELS)),
         blocks=int(meta.get("blocks", BLOCKS)),
     )
-    state = load_file(str(checkpoint_path(name)), device=device)
+    state = load_file(str(resolve_checkpoint_path(CHECKPOINT_ROOT, name)), device=device)
     model.load_state_dict(state)
     model.to(device)
     model.eval()
@@ -152,6 +164,7 @@ def list_checkpoints() -> list:
             "seeded_from": meta.get("seeded_from"),
             "resumed_from": meta.get("resumed_from"),
             "elo": checkpoint_elo(f, ratings),
+            "in_best": curated_checkpoint_path(CHECKPOINT_ROOT, name).exists(),
         })
     return out
 
@@ -203,3 +216,25 @@ def rename_checkpoint(name: str, new_name: str) -> bool:
     if updates:
         update_meta(new_name, updates)
     return True
+
+
+def copy_checkpoint_to_best(name: str) -> Path:
+    """Copy checkpoint weights and metadata into the Git-tracked best folder."""
+    source = resolve_checkpoint_path(CHECKPOINT_ROOT, name)
+    if not source.exists():
+        raise FileNotFoundError(f"checkpoint '{name}' not found")
+    target = curated_checkpoint_path(CHECKPOINT_ROOT, name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() != target.resolve():
+        tmp = target.with_name(f".{target.name}.tmp")
+        shutil.copy2(source, tmp)
+        tmp.replace(target)
+        source_meta = source.with_suffix(".meta.json")
+        target_meta = target.with_suffix(".meta.json")
+        if source_meta.exists():
+            tmp_meta = target_meta.with_name(f".{target_meta.name}.tmp")
+            shutil.copy2(source_meta, tmp_meta)
+            tmp_meta.replace(target_meta)
+        elif target_meta.exists():
+            target_meta.unlink()
+    return target

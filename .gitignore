@@ -30,9 +30,12 @@ corridors_tt.sqlite3-journal
 corridors_tt.sqlite3-wal
 corridors_tt.sqlite3-shm
 
-# NN artifacts (datasets and checkpoints are large and regenerable)
+# NN artifacts. Checkpoints are machine-local except for manually curated models
+# copied into nn_checkpoints/best/ from the checkpoint-management menu.
 nn_data/
-# nn_checkpoints/
+nn_checkpoints/*
+!nn_checkpoints/best/
+!nn_checkpoints/best/**
 
 # Claude Code local settings
 .claude/settings.local.json

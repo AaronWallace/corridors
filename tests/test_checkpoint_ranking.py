@@ -1,6 +1,6 @@
 import json
 
-from corridors.nn.checkpoints import ranked_checkpoint_paths
+from corridors.nn.checkpoints import ranked_checkpoint_paths, resolve_checkpoint_path
 
 
 def _checkpoint(root, name, elo=None):
@@ -31,3 +31,16 @@ def test_tournament_elo_takes_priority_over_checkpoint_metadata(tmp_path):
     )
 
     assert [path.stem for path in ranked_checkpoint_paths(tmp_path)] == ["b", "a"]
+
+
+def test_curated_checkpoints_are_discovered_and_local_copy_takes_priority(tmp_path):
+    best = tmp_path / "best"
+    best.mkdir()
+    _checkpoint(best, "curated", 50)
+
+    assert resolve_checkpoint_path(tmp_path, "curated") == best / "curated.safetensors"
+    assert [path.stem for path in ranked_checkpoint_paths(tmp_path)] == ["curated"]
+
+    _checkpoint(tmp_path, "curated", 100)
+    assert resolve_checkpoint_path(tmp_path, "curated") == tmp_path / "curated.safetensors"
+    assert ranked_checkpoint_paths(tmp_path) == [tmp_path / "curated.safetensors"]

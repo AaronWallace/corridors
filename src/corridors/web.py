@@ -15,7 +15,12 @@ from urllib.parse import urlparse
 
 from . import solver
 from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, legal_moves
-from .nn.checkpoints import checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths
+from .nn.checkpoints import (
+    checkpoint_elo,
+    load_elo_ratings,
+    ranked_checkpoint_paths,
+    resolve_checkpoint_path,
+)
 
 STATIC_ROOT = Path(__file__).with_name("web_static")
 CHECKPOINT_ROOT = Path(__file__).resolve().parent.parent.parent / "nn_checkpoints"
@@ -50,7 +55,7 @@ def _agent_spec(raw: dict | None) -> dict:
     kind = raw.get("kind", "classical")
     if kind == "model":
         name = str(raw.get("checkpoint", ""))
-        if not (CHECKPOINT_ROOT / f"{name}.safetensors").exists():
+        if not resolve_checkpoint_path(CHECKPOINT_ROOT, name).exists():
             raise ValueError(f"checkpoint not found: {name}")
         return {"kind": "model", "checkpoint": name}
     return {
