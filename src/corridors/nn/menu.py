@@ -307,9 +307,9 @@ def _numbered_selections(items: List[dict], raw: str) -> List[dict]:
             seen.add(index)
     return selected
 
-def _print_datasets(items: List[dict]) -> None:
+def _print_datasets(items: List[dict], title: str = "Datasets") -> None:
     console = _console()
-    t = Table(box=box.SIMPLE, header_style="dim", title="Datasets", title_style="bold")
+    t = Table(box=box.SIMPLE, header_style="dim", title=title, title_style="bold")
     t.add_column("#", justify="right", style="dim")
     t.add_column("name")
     t.add_column("games", justify="right")
@@ -322,7 +322,15 @@ def _print_datasets(items: List[dict]) -> None:
         c = d["config"]
         if d.get("kind") == "alphazero":
             useful = []
-            if c.get("simulations") is not None:
+            min_mcts = c.get("min_mcts", 0)
+            max_mcts = c.get("max_mcts", 0)
+            if min_mcts and max_mcts and min_mcts != max_mcts:
+                bias = max(0.01, float(c.get("mcts_bias", 3.0)))
+                expected = min_mcts + bias / (bias + 1.0) * (max_mcts - min_mcts)
+                useful.append(
+                    f"{min_mcts}-{max_mcts} sims (~{expected:.0f} avg)"
+                )
+            elif c.get("simulations") is not None:
                 useful.append(f"{c['simulations']} sims")
             if c.get("max_plies") is not None:
                 useful.append(f"{c['max_plies']} max plies")
@@ -337,36 +345,92 @@ def _print_datasets(items: List[dict]) -> None:
     console.print(t)
 
 
-def _manage_datasets() -> None:
+def _delete_datasets(items: List[dict], *, archived: bool = False) -> None:
     console = _console()
-    items = ds_mod.list_datasets()
-    if not items:
-        console.print("[yellow]no datasets.[/yellow]")
+    total_mb = sum(d["size_mb"] for d in items)
+    location = "archived " if archived else ""
+    if not Confirm.ask(
+            f"[bold red]Permanently delete {len(items)} {location}dataset(s), "
+            f"{total_mb:.1f} MB?[/bold red]", default=False):
+        console.print("[dim]cancelled[/dim]")
         return
-    _print_datasets(items)
+    delete = ds_mod.delete_archived_dataset if archived else ds_mod.delete_dataset
+    for item in items:
+        name = item["name"]
+        if delete(name):
+            console.print(f"[dim]deleted {name}[/dim]")
+        else:
+            console.print(f"[yellow]skipped {name}[/yellow]")
+
+
+def _manage_archived_datasets() -> None:
+    console = _console()
+    items = ds_mod.list_archived_datasets()
+    if not items:
+        console.print("[yellow]no archived datasets.[/yellow]")
+        return
+    _print_datasets(items, "Archived datasets")
     raw = Prompt.ask(
-        "[dim]Delete dataset # (comma-separated), or q to go back[/dim]",
+        "[dim]r # to restore, d # to permanently delete, or q to go back[/dim]",
         default="q",
     ).strip()
     if raw.lower() == "q":
         return
-    selected = _numbered_selections(items, raw)
+    action, _, selection = raw.partition(" ")
+    selected = _numbered_selections(items, selection)
     if not selected:
         return
-    total_mb = sum(d["size_mb"] for d in selected)
-    for d in selected:
-        console.print(f"  [red]{d['name']}[/red] "
-                      f"[dim]({d['shards']} shards, {d['size_mb']:.1f} MB)[/dim]")
-    if not Confirm.ask(f"[bold red]Delete {len(selected)} dataset(s), "
-                       f"{total_mb:.1f} MB?[/bold red]", default=False):
-        console.print("[dim]cancelled[/dim]")
+    if action.lower() == "d":
+        _delete_datasets(selected, archived=True)
         return
-    for item in selected:
-        name = item["name"]
-        if ds_mod.delete_dataset(name):
-            console.print(f"[dim]deleted {name}[/dim]")
+    if action.lower() == "r":
+        for item in selected:
+            name = item["name"]
+            if ds_mod.restore_dataset(name):
+                console.print(f"[dim]restored {name}[/dim]")
+            else:
+                console.print(f"[yellow]could not restore {name}; active name may exist[/yellow]")
+
+
+def _manage_datasets() -> None:
+    console = _console()
+    items = ds_mod.list_datasets()
+    archived = ds_mod.list_archived_datasets()
+    if not items:
+        if archived:
+            console.print("[dim]no active datasets; opening archive[/dim]")
+            _manage_archived_datasets()
         else:
-            console.print(f"[yellow]skipped {name} (not a deletable dataset)[/yellow]")
+            console.print("[yellow]no datasets.[/yellow]")
+        return
+    _print_datasets(items)
+    raw = Prompt.ask(
+        f"[dim]a # to archive, d # to delete, v to view archive ({len(archived)}), "
+        "or q to go back[/dim]",
+        default="q",
+    ).strip()
+    if raw.lower() == "q":
+        return
+    if raw.lower() == "v":
+        _manage_archived_datasets()
+        return
+    action, separator, selection = raw.partition(" ")
+    # Retain the old bare-number delete shorthand.
+    if not separator:
+        action, selection = "d", raw
+    selected = _numbered_selections(items, selection)
+    if not selected:
+        return
+    if action.lower() == "d":
+        _delete_datasets(selected)
+        return
+    if action.lower() == "a":
+        for item in selected:
+            name = item["name"]
+            if ds_mod.archive_dataset(name):
+                console.print(f"[dim]archived {name}[/dim]")
+            else:
+                console.print(f"[yellow]could not archive {name}; archived name may exist[/yellow]")
 
 
 def _manage_checkpoints(copy_only: bool = False) -> None:

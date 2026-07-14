@@ -27,6 +27,9 @@ import numpy as np
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 DATA_ROOT = _PROJECT_ROOT / "nn_data"
+ARCHIVE_DIRNAME = "archive"
+INDEX_FILENAME = ".dataset-index.json"
+INDEX_VERSION = 1
 
 
 @dataclass
@@ -40,6 +43,64 @@ class DatasetConfig:
 
 def dataset_dir(name: str) -> Path:
     return DATA_ROOT / name
+
+
+def archive_root() -> Path:
+    return DATA_ROOT / ARCHIVE_DIRNAME
+
+
+def _index_path(d: Path) -> Path:
+    return d / INDEX_FILENAME
+
+
+def _read_index(d: Path) -> dict:
+    path = _index_path(d)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") == INDEX_VERSION and isinstance(data.get("shards"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": INDEX_VERSION, "shards": {}}
+
+
+def _write_index(d: Path, data: dict) -> None:
+    d.mkdir(parents=True, exist_ok=True)
+    path = _index_path(d)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _index_summary(records: Dict[str, dict]) -> dict:
+    positions = [record.get("positions") for record in records.values()]
+    games = [record.get("games") for record in records.values()]
+    return {
+        "shards": len(records),
+        "size": sum(record.get("size", 0) for record in records.values()),
+        "positions": (sum(positions) if positions
+                      and all(isinstance(value, int) for value in positions) else None),
+        "games": (sum(games) if games
+                  and all(isinstance(value, int) for value in games) else None),
+        "latest_mtime_ns": max(
+            (record.get("mtime_ns", 0) for record in records.values()), default=0),
+    }
+
+
+def register_shard_metadata(path: Path, positions: int,
+                            games: Optional[int] = None) -> None:
+    """Record a newly-written shard without reopening its compressed arrays."""
+    stat = path.stat()
+    data = _read_index(path.parent)
+    record = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "positions": int(positions),
+        "games": int(games) if games is not None else None,
+    }
+    data["shards"][path.name] = record
+    data["summary"] = _index_summary(data["shards"])
+    _write_index(path.parent, data)
 
 
 def default_dataset_name(games: int, depth: int, eps: int) -> str:
@@ -111,6 +172,10 @@ def register_run(name: str, config: DatasetConfig, new_shards: List[str],
     manifest["games"] = manifest.get("games", 0) + games
     manifest["positions"] = manifest.get("positions", 0) + positions
     write_manifest(name, manifest)
+    # Worker processes may have written several shards concurrently. Index them
+    # once here in the parent rather than racing on one metadata file.
+    d = dataset_dir(name)
+    _refresh_shard_index(d, _shard_files(d))
 
 
 def config_mismatch(name: str, config: DatasetConfig) -> Optional[str]:
@@ -192,6 +257,61 @@ def _legacy_az_game_starts(path: Path) -> Optional[int]:
         return None
 
 
+def _refresh_shard_index(d: Path, shards: List[Path]) -> Dict[str, dict]:
+    """Stat every shard but open only files absent from or changed in the index."""
+    data = _read_index(d)
+    records = data["shards"]
+    current = {path.name for path in shards}
+    changed = not _index_path(d).exists()
+
+    # Only nameless, metadata-free legacy AZ runs need the expensive initial
+    # position scan used to infer game starts. Cache that result too.
+    needs_starts = (
+        d.parent.name == "alphazero"
+        and not (d / "run.json").exists()
+        and re.search(r"_g\d+_s\d+", d.name) is None
+    )
+    for path in shards:
+        stat = path.stat()
+        record = records.get(path.name)
+        valid = (
+            isinstance(record, dict)
+            and record.get("size") == stat.st_size
+            and record.get("mtime_ns") == stat.st_mtime_ns
+            and "positions" in record
+            and "games" in record
+            and (not needs_starts or "game_starts" in record)
+        )
+        if valid:
+            continue
+        record = {
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "positions": _npz_array_rows(path),
+            "games": _npz_games(path),
+        }
+        if needs_starts:
+            record["game_starts"] = _legacy_az_game_starts(path)
+        records[path.name] = record
+        changed = True
+
+    for missing in set(records) - current:
+        del records[missing]
+        changed = True
+    summary = _index_summary(records)
+    if data.get("summary") != summary:
+        data["summary"] = summary
+        changed = True
+    if changed:
+        _write_index(d, data)
+    return records
+
+
+def _indexed_sum(records: Dict[str, dict], key: str) -> Optional[int]:
+    values = [record.get(key) for record in records.values()]
+    return sum(values) if values and all(isinstance(v, int) for v in values) else None
+
+
 def _legacy_az_games(data: dict, shard_count: int) -> int | str:
     """Best available game count for run.json files created before counters."""
     config = data.get("selfplay", {})
@@ -212,9 +332,10 @@ def _legacy_az_games(data: dict, shard_count: int) -> int | str:
     return f">={minimum}"
 
 
-def _legacy_name_meta(d: Path, shards: List[Path]) -> Optional[dict]:
+def _legacy_name_meta(d: Path, shards: List[Path],
+                      records: Dict[str, dict]) -> Optional[dict]:
     """Recover useful metadata from pre-run.json AlphaZero dataset names."""
-    positions = _shard_positions(shards)
+    positions = _indexed_sum(records, "positions")
     is_az = d.parent.name == "alphazero"
     if not is_az:
         return {
@@ -223,20 +344,25 @@ def _legacy_name_meta(d: Path, shards: List[Path]) -> Optional[dict]:
             "config": {},
             "kind": "unknown",
         }
-    match = re.search(r"_g(\d+)_s(\d+)(?:_p(\d+))?", d.name)
+    match = re.search(r"_g(\d+)_s(\d+)(?:-(\d+))?(?:_p(\d+))?", d.name)
     config = {}
     games: int | str = "?"
     if match:
         per_round = int(match.group(1))
-        config["simulations"] = int(match.group(2))
-        if match.group(3):
-            config["max_plies"] = int(match.group(3))
+        minimum = int(match.group(2))
+        maximum = int(match.group(3) or minimum)
+        config["simulations"] = maximum
+        if minimum != maximum:
+            config["min_mcts"] = minimum
+            config["max_mcts"] = maximum
+        if match.group(4):
+            config["max_plies"] = int(match.group(4))
         games = _legacy_az_games(
             {"mode": "loop", "selfplay": {"num_games": per_round}},
             len(shards),
         )
     else:
-        starts = [_legacy_az_game_starts(path) for path in shards]
+        starts = [records[path.name].get("game_starts") for path in shards]
         if all(count is not None for count in starts):
             games = sum(starts)
     return {
@@ -247,7 +373,7 @@ def _legacy_name_meta(d: Path, shards: List[Path]) -> Optional[dict]:
     }
 
 
-def _read_meta(d: Path, shards: List[Path]) -> Optional[dict]:
+def _read_meta(d: Path, shards: List[Path], records: Dict[str, dict]) -> Optional[dict]:
     """Normalize a dataset dir's metadata (classical ``manifest.json`` or
     AlphaZero ``run.json``) into a common shape for listing."""
     for fname, cfg_key in (("manifest.json", "config"), ("run.json", "selfplay")):
@@ -259,26 +385,35 @@ def _read_meta(d: Path, shards: List[Path]) -> Optional[dict]:
         except (OSError, ValueError):
             continue
         positions = data.get("positions")
-        if positions is None or (positions == 0 and shards):
-            positions = _shard_positions(shards)
+        indexed_positions = _indexed_sum(records, "positions")
+        if indexed_positions is not None:
+            positions = indexed_positions
         games = data.get("games")
-        if fname == "run.json" and (games is None or (games == 0 and shards)):
-            games = _shard_games(shards)
-            if games is None:
+        if fname == "run.json":
+            indexed_games = _indexed_sum(records, "games")
+            if indexed_games is not None:
+                games = indexed_games
+            elif games is None or (games == 0 and shards):
                 games = _legacy_az_games(data, len(shards))
+        else:
+            expected = set(data.get("shards", []))
+            actual = {path.name for path in shards}
+            if expected and expected != actual:
+                games = "?"
         return {
             "games": games if games is not None else "?",
             "positions": positions if positions is not None else "?",
             "config": data.get(cfg_key, {}),
             "kind": "alphazero" if fname == "run.json" else "classical",
         }
-    return _legacy_name_meta(d, shards) if shards else None
+    return _legacy_name_meta(d, shards, records) if shards else None
 
 
 def _dataset_entry(d: Path, name: str) -> Dict:
     shards = _shard_files(d)
-    m = _read_meta(d, shards)
-    size = sum(f.stat().st_size for f in shards)
+    records = _refresh_shard_index(d, shards)
+    m = _read_meta(d, shards, records)
+    size = sum(record["size"] for record in records.values())
     dated_files = [
         path for path in [*shards, d / "manifest.json", d / "run.json"]
         if path.exists()
@@ -308,7 +443,7 @@ def list_datasets() -> List[Dict]:
     if not DATA_ROOT.exists():
         return out
     for d in sorted(DATA_ROOT.iterdir()):
-        if not d.is_dir():
+        if not d.is_dir() or d.name == ARCHIVE_DIRNAME:
             continue
         if is_dataset_dir(d):
             out.append(_dataset_entry(d, d.name))
@@ -317,19 +452,92 @@ def list_datasets() -> List[Dict]:
         for sub in sorted(d.iterdir()):
             if is_dataset_dir(sub):
                 out.append(_dataset_entry(sub, f"{d.name}/{sub.name}"))
+    out.sort(key=lambda item: (-item["modified"], item["name"]))
     return out
+
+
+def list_archived_datasets() -> List[Dict]:
+    """Archived datasets, kept separate from every training-data selector."""
+    root = archive_root()
+    if not root.exists():
+        return []
+    out = []
+    for d in root.rglob("*"):
+        if d.is_dir() and is_dataset_dir(d):
+            name = d.relative_to(root).as_posix()
+            out.append({**_dataset_entry(d, name), "archived": True})
+    out.sort(key=lambda item: (-item["modified"], item["name"]))
+    return out
+
+
+def _safe_named_path(root: Path, name: str) -> Optional[Path]:
+    candidate = Path(name)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        return None
+    resolved_root = root.resolve()
+    resolved = (root / candidate).resolve()
+    return resolved if resolved_root in resolved.parents else None
+
+
+def _remove_empty_parents(path: Path, stop: Path) -> None:
+    parent = path.parent
+    stop = stop.resolve()
+    while parent.resolve() != stop:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
+def archive_dataset(name: str) -> bool:
+    if Path(name).parts[:1] == (ARCHIVE_DIRNAME,):
+        return False
+    source = _safe_named_path(DATA_ROOT, name)
+    target = _safe_named_path(archive_root(), name)
+    if source is None or target is None or not is_dataset_dir(source) or target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(target))
+    _remove_empty_parents(source, DATA_ROOT)
+    return True
+
+
+def restore_dataset(name: str) -> bool:
+    if Path(name).parts[:1] == (ARCHIVE_DIRNAME,):
+        return False
+    source = _safe_named_path(archive_root(), name)
+    target = _safe_named_path(DATA_ROOT, name)
+    if source is None or target is None or not is_dataset_dir(source) or target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(target))
+    _remove_empty_parents(source, archive_root())
+    return True
+
+
+def delete_archived_dataset(name: str) -> bool:
+    d = _safe_named_path(archive_root(), name)
+    if d is None or not is_dataset_dir(d):
+        return False
+    shutil.rmtree(d)
+    _remove_empty_parents(d, archive_root())
+    return True
 
 
 def delete_dataset(name: str) -> bool:
     """Delete a single dataset dir. Refuses anything that is not a leaf dataset
     dir strictly inside ``nn_data/`` — so a container like ``alphazero`` (or
     ``nn_data`` itself) can never be wiped, only the runs beneath it."""
-    d = dataset_dir(name)
+    if Path(name).parts[:1] == (ARCHIVE_DIRNAME,):
+        return False
+    d = _safe_named_path(DATA_ROOT, name)
+    if d is None:
+        return False
     if not d.exists() or not d.is_dir() or not is_dataset_dir(d):
         return False
-    if DATA_ROOT.resolve() not in d.resolve().parents:
-        return False
     shutil.rmtree(d)
+    _remove_empty_parents(d, DATA_ROOT)
     return True
 
 

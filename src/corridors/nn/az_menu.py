@@ -206,10 +206,14 @@ def _prompt_search_params() -> dict:
 def _auto_dataset_name(*, prefix: str, games: int, simulations: int,
                        max_plies: int, device: str, workers: int,
                        batch_size: int, concurrency: int,
-                       search_params: dict, timestamp: Optional[str] = None) -> str:
+                       search_params: dict, timestamp: Optional[str] = None,
+                       min_mcts: int = 0, max_mcts: int = 0) -> str:
     """Build a short recognizable name; full settings live in run metadata."""
     stamp = timestamp or time.strftime("%Y%m%d-%H%M%S")
-    return f"{prefix}_{stamp}_g{games}_s{simulations}"
+    sim_label = (f"{min_mcts}-{max_mcts}"
+                 if min_mcts > 0 and max_mcts > 0 and min_mcts != max_mcts
+                 else str(simulations))
+    return f"{prefix}_{stamp}_g{games}_s{sim_label}"
 
 
 def _checkpoint_table(checkpoints, title: str = "AZ checkpoints") -> Table:
@@ -923,7 +927,8 @@ def _seed_loop_checkpoint(src: str, dst: str) -> bool:
 def _full_loop() -> None:
     console = _console()
     from .az_selfplay import (
-        SelfPlayConfig, SelfPlayPool, save_run_config, update_run_progress,
+        SelfPlayConfig, SelfPlayPool, expected_mcts_budget,
+        save_run_config, update_run_progress,
     )
     from .az_train import (
         AZ_DATA_ROOT, AZTrainConfig, _resolved_early_stop_min_epochs,
@@ -937,7 +942,15 @@ def _full_loop() -> None:
     hw = _detect_and_show_hw()
     iterations = _prompt_int("Number of iterations", 5, 1, 1000)
     games_per_iter = _prompt_int("Games per iteration", hw["games_per_iter"], 1, 100_000)
-    sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
+    min_mcts = _prompt_int("Minimum MCTS simulations per move", 100, 10, 5000)
+    max_mcts = _prompt_int("Maximum MCTS simulations per move", 250, min_mcts, 5000)
+    budget_config = SelfPlayConfig(
+        simulations=max_mcts, min_mcts=min_mcts, max_mcts=max_mcts)
+    sims = round(expected_mcts_budget(budget_config))
+    console.print(
+        f"[dim]weighted toward stronger searches · expected average {sims} sims/game · "
+        f"set both values equal for a fixed budget[/dim]"
+    )
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
     epochs_per_iter = _prompt_int("Target training epochs per iteration (adaptive)", 10, 1, 1000)
     train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
@@ -955,6 +968,7 @@ def _full_loop() -> None:
         prefix="azloop", games=games_per_iter, simulations=sims, max_plies=max_plies,
         device=device, workers=workers, batch_size=sp_batch_size,
         concurrency=concurrency, search_params=search_params,
+        min_mcts=min_mcts, max_mcts=max_mcts,
     )
     run_name = Prompt.ask("[dim]Dataset/run name[/dim]", default=auto_name).strip() or auto_name
     ckpt_name = f"{run_name}_best"
@@ -989,7 +1003,8 @@ def _full_loop() -> None:
     # not per iteration. The model checkpoint is reloaded at the start of each
     # round; other self-play params are fixed for the pool's lifetime.
     sp_config = SelfPlayConfig(
-        num_games=games_per_iter, simulations=sims, max_plies=max_plies,
+        num_games=games_per_iter, simulations=max_mcts,
+        min_mcts=min_mcts, max_mcts=max_mcts, max_plies=max_plies,
         workers=workers, batch_size=sp_batch_size,
         concurrent_games=concurrency, inference_servers=inference_servers,
         device=device,
@@ -1020,7 +1035,8 @@ def _full_loop() -> None:
                 CHECKPOINT_ROOT, ckpt_name).exists() else ""
             using = checkpoint or "random init"
             console.print(f"\n  [bold]Self-play[/bold] [dim]· {games_per_iter} games "
-                          f"· {sims} sims · {max_plies} max plies · net: {using}[/dim]")
+                          f"· {min_mcts}-{max_mcts} sims (weighted avg {sims}) "
+                          f"· {max_plies} max plies · net: {using}[/dim]")
 
             t0 = time.monotonic()
             # Self-play streams data to shards on disk; the round returns empty

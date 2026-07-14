@@ -185,6 +185,9 @@ class _ShardWriter:
         )
         import os as _os
         _os.replace(tmp, path)
+        from .datasets import register_shard_metadata
+        register_shard_metadata(
+            path, positions=len(s), games=self._games_since_flush)
         self._shard_idx += 1
         self._states.clear()
         self._policies.clear()
@@ -210,6 +213,9 @@ class _ShardWriter:
 class SelfPlayConfig:
     num_games: int = 100
     simulations: int = 200
+    min_mcts: int = 0         # 0/0 keeps the legacy fixed simulations setting
+    max_mcts: int = 0
+    mcts_bias: float = 3.0    # Beta(bias, 1); 3 gives a 75%-of-range mean
     workers: int = 0           # 0 = auto-detect
     concurrent_games: int = 0  # GPU mode: games in flight per worker (0 = auto)
     batch_size: int = 64       # max batch for GPU inference
@@ -223,6 +229,40 @@ class SelfPlayConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_frac: float = 0.25
     c_puct: float = 1.5
+
+
+def mcts_budget_bounds(config: SelfPlayConfig) -> Tuple[int, int]:
+    """Resolved inclusive per-game MCTS range, including legacy configs."""
+    if config.min_mcts <= 0 and config.max_mcts <= 0:
+        fixed = max(1, config.simulations)
+        return fixed, fixed
+    low = max(1, config.min_mcts or config.simulations)
+    high = max(1, config.max_mcts or config.simulations)
+    return (low, high) if low <= high else (high, low)
+
+
+def expected_mcts_budget(config: SelfPlayConfig) -> float:
+    """Mean of the configured high-biased Beta distribution."""
+    low, high = mcts_budget_bounds(config)
+    bias = max(0.01, config.mcts_bias)
+    return low + bias / (bias + 1.0) * (high - low)
+
+
+def sample_mcts_budget(config: SelfPlayConfig, rng) -> int:
+    """Choose one game's budget, biased high while covering the whole range."""
+    low, high = mcts_budget_bounds(config)
+    if low == high:
+        return low
+    bias = max(0.01, config.mcts_bias)
+    fraction = rng.random() ** (1.0 / bias)
+    return min(high, max(low, round(low + fraction * (high - low))))
+
+
+def mcts_budget_label(config: SelfPlayConfig) -> str:
+    low, high = mcts_budget_bounds(config)
+    if low == high:
+        return str(low)
+    return f"{low}-{high} (weighted avg {expected_mcts_budget(config):.0f})"
 
 
 @dataclass
@@ -314,6 +354,7 @@ def _play_one_game(
     p1_col = rng.randint(0, NCOLS - 1)
     p2_col = rng.randint(0, NCOLS - 1)
     board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+    game_simulations = sample_mcts_budget(config, rng)
 
     # Per-game NN-eval cache: board (goals) is fixed within a game, so key by
     # state. Deduplicates transpositions within a search and positions recurring
@@ -351,7 +392,7 @@ def _play_one_game(
         pi, root_val, move, reuse = run_mcts(
             state, board,
             evaluate_fn=cached_eval,
-            num_simulations=config.simulations,
+            num_simulations=game_simulations,
             temperature=temp,
             add_noise=True,
             reuse_root=reuse,
@@ -795,7 +836,7 @@ def run_selfplay(
         label = "local-inference" if device == "cpu" else "gpu-server"
         extra_info = f", concurrency={concurrency}" if device != "cpu" else ""
         on_status(f"device={device}, workers={num_workers}, mode={label}{extra_info}, "
-                  f"sims={config.simulations}, games={config.num_games}")
+                  f"sims={mcts_budget_label(config)}, games={config.num_games}")
 
     # Distribute games
     base, extra = divmod(config.num_games, num_workers)
@@ -913,7 +954,8 @@ def run_selfplay_single(
 
     device = resolve_device(config.device)
     if on_status:
-        on_status(f"single-process mode, device={device}, sims={config.simulations}")
+        on_status(f"single-process mode, device={device}, "
+                  f"sims={mcts_budget_label(config)}")
 
     if device == "cpu":
         # Torch-free NumPy inference — no torch needed for CPU self-play.
@@ -945,6 +987,7 @@ def run_selfplay_single(
             p1_col = random.randint(0, NCOLS - 1)
             p2_col = random.randint(0, NCOLS - 1)
             board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
+            game_simulations = sample_mcts_budget(config, random)
 
             states, policies, turns = [], [], []
             ply = 0
@@ -973,7 +1016,7 @@ def run_selfplay_single(
 
                 temp = config.temp_high if ply < config.temperature_moves else config.temp_low
                 pi, _, move, reuse = run_mcts(state, board, cached_eval,
-                                              config.simulations, temp, add_noise=True,
+                                              game_simulations, temp, add_noise=True,
                                               reuse_root=reuse,
                                               c_puct=config.c_puct,
                                               dirichlet_alpha=config.dirichlet_alpha,

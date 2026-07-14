@@ -25,16 +25,30 @@ def test_gpu_dataset_name_keeps_details_in_metadata_not_path():
     assert name == "azloop_20260712-120000_g140_s200"
 
 
+def test_weighted_mcts_range_is_visible_in_short_name():
+    name = _auto_dataset_name(
+        prefix="azloop", games=512, simulations=213, min_mcts=100,
+        max_mcts=250, max_plies=120, device="cuda", workers=128,
+        batch_size=512, concurrency=4, search_params={},
+        timestamp="20260712-120000",
+    )
+    assert name == "azloop_20260712-120000_g512_s100-250"
+
+
 def test_full_generation_settings_are_saved_beside_shards(tmp_path, monkeypatch):
     monkeypatch.setattr(az_selfplay, "AZ_DATA_ROOT", tmp_path)
     config = az_selfplay.SelfPlayConfig(
         num_games=140, simulations=500, workers=14, batch_size=64,
         concurrent_games=0, device="cuda", c_puct=1.5,
+        min_mcts=100, max_mcts=500,
     )
     path = az_selfplay.save_run_config(
         "azloop_short", config, mode="loop", promotion_score=0.51)
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["selfplay"]["simulations"] == 500
+    assert saved["selfplay"]["min_mcts"] == 100
+    assert saved["selfplay"]["max_mcts"] == 500
+    assert saved["selfplay"]["mcts_bias"] == 3.0
     assert saved["selfplay"]["batch_size"] == 64
     assert saved["selfplay"]["temperature_moves"] == 10
     assert saved["policy_balance"] == "pawn_wall_action_type_v1"

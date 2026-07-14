@@ -122,3 +122,78 @@ def test_delete_refuses_paths_outside_data_root(data_root, tmp_path):
 
 def test_delete_missing_dataset_returns_false(data_root):
     assert ds.delete_dataset("nope") is False
+
+
+def test_listing_indexes_only_new_or_changed_shards(data_root, monkeypatch):
+    run = data_root / "alphazero" / "cached"
+    _write_shard(run, 0)
+    calls = []
+    original = ds._npz_array_rows
+
+    def counted(path):
+        calls.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(ds, "_npz_array_rows", counted)
+    ds.list_datasets()
+    ds.list_datasets()
+    _write_shard(run, 1)
+    ds.list_datasets()
+
+    assert calls == ["shard_0000.npz", "shard_0001.npz"]
+    index = json.loads((run / ds.INDEX_FILENAME).read_text(encoding="utf-8"))
+    assert set(index["shards"]) == {"shard_0000.npz", "shard_0001.npz"}
+    assert index["summary"]["positions"] == 2
+
+
+def test_index_prunes_removed_shards_and_updates_positions(data_root):
+    run = data_root / "alphazero" / "trimmed"
+    _write_shard(run, 0)
+    _write_shard(run, 1)
+    [before] = ds.list_datasets()
+    assert before["positions"] == 2
+
+    (run / "shard_0000.npz").unlink()
+    [after] = ds.list_datasets()
+
+    assert after["positions"] == 1
+    index = json.loads((run / ds.INDEX_FILENAME).read_text(encoding="utf-8"))
+    assert set(index["shards"]) == {"shard_0001.npz"}
+    assert index["summary"]["positions"] == 1
+    assert index["summary"]["shards"] == 1
+
+
+def test_archive_hides_dataset_and_restore_returns_it(data_root):
+    _write_shard(data_root / "alphazero" / "run_a")
+
+    assert ds.archive_dataset("alphazero/run_a") is True
+    assert ds.list_datasets() == []
+    archived = ds.list_archived_datasets()
+    assert [item["name"] for item in archived] == ["alphazero/run_a"]
+    assert archived[0]["archived"] is True
+
+    assert ds.restore_dataset("alphazero/run_a") is True
+    assert [item["name"] for item in ds.list_datasets()] == ["alphazero/run_a"]
+    assert ds.list_archived_datasets() == []
+
+
+def test_archiving_refuses_to_overwrite_existing_archive(data_root):
+    _write_shard(data_root / "same")
+    _write_shard(data_root / ds.ARCHIVE_DIRNAME / "same")
+
+    assert ds.archive_dataset("same") is False
+    assert (data_root / "same").exists()
+
+
+def test_active_and_archived_lists_are_newest_first(data_root):
+    old = data_root / "old"
+    new = data_root / "new"
+    _write_shard(old)
+    _write_shard(new)
+    os.utime(old / "shard_0000.npz", (1_000, 1_000))
+    os.utime(new / "shard_0000.npz", (2_000, 2_000))
+
+    assert [item["name"] for item in ds.list_datasets()] == ["new", "old"]
+    assert ds.archive_dataset("new") is True
+    assert ds.archive_dataset("old") is True
+    assert [item["name"] for item in ds.list_archived_datasets()] == ["new", "old"]
