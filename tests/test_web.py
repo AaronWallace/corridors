@@ -1,8 +1,10 @@
 """Local web-game API tests."""
 
 import re
+from types import SimpleNamespace
 
 from corridors import web
+from corridors.nn.az_net import AZNet
 
 
 def test_rapid_autoplay_delays_allow_zero_seconds():
@@ -103,3 +105,27 @@ def test_web_rejects_an_illegal_ai_move(monkeypatch):
             raise AssertionError("web backend accepted an illegal AI move")
     finally:
         web.GAMES.pop(game_id, None)
+
+
+def test_cnn_explorer_analyzes_a_live_web_game():
+    checkpoint = "test_explorer_model"
+    web.REGISTRY.models[checkpoint] = SimpleNamespace(
+        model=AZNet(channels=4, blocks=1).eval(), arch="az",
+    )
+    game_id, _game = web._new_game({
+        "mode": "human-ai", "humanSide": "1",
+        "ai": {"kind": "classical", "depth": 1, "timeLimit": 0},
+        "p1Col": 2, "p2Col": 7,
+    })
+    try:
+        result = web._explore_game({
+            "checkpoint": checkpoint, "gameId": game_id,
+            "layer": "block_1", "channel": 2,
+        })
+        assert result["checkpoint"] == checkpoint
+        assert result["game"]["id"] == game_id
+        assert result["selectedActivation"]["layer"] == "block_1"
+        assert result["policy"]
+    finally:
+        web.GAMES.pop(game_id, None)
+        web.REGISTRY.models.pop(checkpoint, None)

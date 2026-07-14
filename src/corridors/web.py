@@ -44,6 +44,8 @@ def _model_catalog() -> list[dict]:
         catalog.append({
             "name": weights.stem,
             "architecture": meta.get("arch", "value"),
+            "channels": meta.get("channels"),
+            "blocks": meta.get("blocks"),
             "elo": checkpoint_elo(weights, ratings),
             "validationLoss": meta.get("val_loss"),
             "positions": meta.get("positions"),
@@ -161,6 +163,36 @@ def _validated_ai_move(game: WebGame, player: dict):
     return move, info
 
 
+def _explore_game(payload: dict) -> dict:
+    checkpoint = str(payload.get("checkpoint", ""))
+    game_id = str(payload.get("gameId", ""))
+    game = GAMES.get(game_id)
+    if not game:
+        raise ValueError("game not found")
+    agent = REGISTRY.models.get(checkpoint)
+    if agent is None:
+        if not resolve_checkpoint_path(CHECKPOINT_ROOT, checkpoint).exists():
+            raise ValueError(f"checkpoint not found: {checkpoint}")
+        from .nn.agent import NetworkAgent
+        agent = NetworkAgent(checkpoint, device="cpu", seed=0)
+        REGISTRY.models[checkpoint] = agent
+    from .nn.explorer import analyze_model
+    with game.lock, REGISTRY.lock:
+        analysis = analyze_model(
+            agent.model,
+            agent.arch,
+            game.state,
+            game.board,
+            selected_layer=str(payload.get("layer", "stem")),
+            channel=int(payload.get("channel", 0)),
+            weight_out=int(payload.get("weightOut", 0)),
+            weight_in=int(payload.get("weightIn", 0)),
+        )
+        analysis["game"] = _game_json(game_id, game)
+        analysis["checkpoint"] = checkpoint
+        return analysis
+
+
 def _game_json(game_id: str, game: WebGame) -> dict:
     state, board = game.state, game.board
     moves = [] if _game_over(game) else legal_moves(state, board)
@@ -260,6 +292,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             path, payload = urlparse(self.path).path, self._body()
+            if path == "/api/explorer/analyze":
+                return self._json(200, _explore_game(payload))
             if path == "/api/games":
                 game_id, game = _new_game(payload)
                 return self._json(201, _game_json(game_id, game))

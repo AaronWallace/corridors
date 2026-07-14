@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Corridors · CNN Explorer</title>
+  <meta name="description" content="Inspect Corridors neural-network activations, weights, value and policy decisions.">
+  <link rel="stylesheet" href="/explorer.css">
+</head>
+<body>
+  <main class="lab-shell">
+    <header class="lab-header">
+      <div><span class="kicker">CORRIDORS · INTERPRETABILITY LAB</span><h1>CNN Explorer</h1><p>Follow one board position from encoded input through the residual trunk and into policy and value.</p></div>
+      <a class="back-link" href="/">← Back to game</a>
+    </header>
+
+    <section class="control-deck glass">
+      <label>Checkpoint<select id="modelSelect"></select></label>
+      <button id="newPosition" class="button secondary">New position</button>
+      <button id="stepModel" class="button primary">Play one model move</button>
+      <button id="autoplay" class="button secondary">Autoplay</button>
+      <label class="speed">Delay <output id="delayValue">0.5s</output><input id="playDelay" type="range" min="0" max="3" value="0.5" step="0.1"></label>
+      <div id="modelFacts" class="model-facts"></div>
+    </section>
+
+    <section class="workspace">
+      <aside class="left-rail">
+        <section class="glass panel board-panel">
+          <div class="panel-title"><div><span class="section-label">LIVE INPUT</span><h2>Position</h2></div><span id="turnBadge" class="badge">P1 to move</span></div>
+          <div id="miniBoard" class="mini-board" aria-label="Current model input position"></div>
+          <div class="board-footer"><span id="gameState">Game 1 · turn 0</span><span id="wallCount">9 / 9 walls</span></div>
+        </section>
+        <section class="glass panel">
+          <div class="panel-title"><div><span class="section-label">9 × 11 × 9</span><h2>Input planes</h2></div></div>
+          <div id="planeTabs" class="plane-tabs"></div>
+          <canvas id="inputMap" width="270" height="330" aria-label="Selected input plane"></canvas>
+          <p id="planeDescription" class="microcopy"></p>
+        </section>
+      </aside>
+
+      <section class="center-stage">
+        <section class="glass panel architecture-panel">
+          <div class="panel-title"><div><span class="section-label">FORWARD PASS</span><h2>Network architecture</h2></div><span class="hint">Select a layer</span></div>
+          <div id="architecture" class="architecture"></div>
+          <div id="signalPath" class="signal-path"></div>
+        </section>
+        <section class="glass panel activation-panel">
+          <div class="panel-title"><div><span class="section-label">FEATURE SPACE</span><h2 id="activationTitle">Stem activation</h2></div><span id="activationShape" class="badge"></span></div>
+          <div class="activation-layout">
+            <div>
+              <canvas id="activationMap" width="360" height="440" aria-label="Selected activation channel"></canvas>
+              <div class="heat-scale"><span>inhibited</span><i></i><span>activated</span></div>
+            </div>
+            <div class="channel-browser">
+              <label>Channel <output id="channelValue">0</output><input id="channel" type="range" min="0" max="0" value="0"></label>
+              <div id="activationStats" class="stat-stack"></div>
+              <h3>Most active channels</h3>
+              <div id="topChannels" class="channel-list"></div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <aside class="right-rail">
+        <section class="glass panel decision-panel">
+          <div class="panel-title"><div><span class="section-label">VALUE HEAD</span><h2>Position judgment</h2></div></div>
+          <div class="value-orb"><strong id="valueScore">0.000</strong><span id="valuePerspective">side to move</span></div>
+          <div class="value-axis"><span>losing</span><i><b id="valueMarker"></b></i><span>winning</span></div>
+        </section>
+        <section class="glass panel policy-panel">
+          <div class="panel-title"><div><span class="section-label">POLICY HEAD</span><h2>Preferred moves</h2></div></div>
+          <div id="policyMoves" class="policy-moves"></div>
+        </section>
+        <section class="glass panel weights-panel">
+          <div class="panel-title"><div><span class="section-label">LEARNED PARAMETERS</span><h2>Weights</h2></div><span id="weightShape" class="badge"></span></div>
+          <canvas id="weightHistogram" width="320" height="150" aria-label="Weight distribution"></canvas>
+          <div class="weight-controls"><label>Output filter<input id="weightOut" type="number" min="0" value="0"></label><label>Input channel<input id="weightIn" type="number" min="0" value="0"></label></div>
+          <div class="kernel-wrap"><div><h3>Selected kernel</h3><p id="kernelLabel" class="microcopy"></p></div><div id="kernel" class="kernel"></div></div>
+          <div id="weightStats" class="stat-stack horizontal"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+  <div id="loading" class="loading"><span></span><p>Running forward pass…</p></div>
+  <script src="/explorer.js"></script>
+</body>
+</html>
