@@ -14,9 +14,11 @@ dataset adds shards (a config mismatch warns but is allowed).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
+import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -137,7 +139,115 @@ def is_dataset_dir(d: Path) -> bool:
             or bool(_shard_files(d)))
 
 
-def _read_meta(d: Path) -> Optional[dict]:
+def _npz_array_rows(path: Path) -> Optional[int]:
+    """Read the leading dimension from an NPZ array header without loading it."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            member = "states.npy" if "states.npy" in names else "tensors.npy"
+            with archive.open(member) as stream:
+                version = np.lib.format.read_magic(stream)
+                reader = (np.lib.format.read_array_header_1_0
+                          if version == (1, 0)
+                          else np.lib.format.read_array_header_2_0)
+                shape, _fortran, _dtype = reader(stream)
+            return int(shape[0]) if shape else 0
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+def _shard_positions(shards: List[Path]) -> Optional[int]:
+    counts = [_npz_array_rows(path) for path in shards]
+    return sum(counts) if all(count is not None for count in counts) else None
+
+
+def _npz_games(path: Path) -> Optional[int]:
+    """Read the small per-shard game counter used by newer AlphaZero shards."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if "games.npy" not in archive.namelist():
+                return None
+            with archive.open("games.npy") as stream:
+                return int(np.load(stream, allow_pickle=False))
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+def _shard_games(shards: List[Path]) -> Optional[int]:
+    counts = [_npz_games(path) for path in shards]
+    return sum(counts) if all(count is not None for count in counts) else None
+
+
+def _legacy_az_game_starts(path: Path) -> Optional[int]:
+    """Count unmistakable initial positions in a legacy AZ shard."""
+    try:
+        with np.load(path) as archive:
+            states = archive["states"]
+            if states.ndim != 4 or states.shape[1] < 2 or states.shape[2] < 11:
+                return None
+            p1_home = states[:, 0, 10, :].sum(axis=1) > 0.5
+            p2_home = states[:, 1, 0, :].sum(axis=1) > 0.5
+            return int(np.count_nonzero(p1_home & p2_home))
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _legacy_az_games(data: dict, shard_count: int) -> int | str:
+    """Best available game count for run.json files created before counters."""
+    config = data.get("selfplay", {})
+    per_round = int(config.get("num_games", 0) or 0)
+    if per_round <= 0 or shard_count <= 0:
+        return "?"
+    if data.get("mode") != "loop":
+        return per_round
+    shards_per_round = math.ceil(per_round / 25)
+    full_rounds, partial_shards = divmod(shard_count, shards_per_round)
+    configured_rounds = int(data.get("iterations", full_rounds) or full_rounds)
+    full_rounds = min(full_rounds, configured_rounds)
+    if partial_shards == 0:
+        return full_rounds * per_round
+    # Old shards did not record their game count. All but the final shard in a
+    # partial round hold 25 games; the final one holds at least one.
+    minimum = full_rounds * per_round + (partial_shards - 1) * 25 + 1
+    return f">={minimum}"
+
+
+def _legacy_name_meta(d: Path, shards: List[Path]) -> Optional[dict]:
+    """Recover useful metadata from pre-run.json AlphaZero dataset names."""
+    positions = _shard_positions(shards)
+    is_az = d.parent.name == "alphazero"
+    if not is_az:
+        return {
+            "games": "?",
+            "positions": positions if positions is not None else "?",
+            "config": {},
+            "kind": "unknown",
+        }
+    match = re.search(r"_g(\d+)_s(\d+)(?:_p(\d+))?", d.name)
+    config = {}
+    games: int | str = "?"
+    if match:
+        per_round = int(match.group(1))
+        config["simulations"] = int(match.group(2))
+        if match.group(3):
+            config["max_plies"] = int(match.group(3))
+        games = _legacy_az_games(
+            {"mode": "loop", "selfplay": {"num_games": per_round}},
+            len(shards),
+        )
+    else:
+        starts = [_legacy_az_game_starts(path) for path in shards]
+        if all(count is not None for count in starts):
+            games = sum(starts)
+    return {
+        "games": games,
+        "positions": positions if positions is not None else "?",
+        "config": config,
+        "kind": "alphazero",
+    }
+
+
+def _read_meta(d: Path, shards: List[Path]) -> Optional[dict]:
     """Normalize a dataset dir's metadata (classical ``manifest.json`` or
     AlphaZero ``run.json``) into a common shape for listing."""
     for fname, cfg_key in (("manifest.json", "config"), ("run.json", "selfplay")):
@@ -148,17 +258,26 @@ def _read_meta(d: Path) -> Optional[dict]:
             data = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        positions = data.get("positions")
+        if positions is None or (positions == 0 and shards):
+            positions = _shard_positions(shards)
+        games = data.get("games")
+        if fname == "run.json" and (games is None or (games == 0 and shards)):
+            games = _shard_games(shards)
+            if games is None:
+                games = _legacy_az_games(data, len(shards))
         return {
-            "games": data.get("games", "?"),
-            "positions": data.get("positions", "?"),
+            "games": games if games is not None else "?",
+            "positions": positions if positions is not None else "?",
             "config": data.get(cfg_key, {}),
+            "kind": "alphazero" if fname == "run.json" else "classical",
         }
-    return None
+    return _legacy_name_meta(d, shards) if shards else None
 
 
 def _dataset_entry(d: Path, name: str) -> Dict:
-    m = _read_meta(d)
     shards = _shard_files(d)
+    m = _read_meta(d, shards)
     size = sum(f.stat().st_size for f in shards)
     return {
         "name": name,
@@ -167,6 +286,7 @@ def _dataset_entry(d: Path, name: str) -> Dict:
         "shards": len(shards),
         "size_mb": size / 1e6,
         "config": (m or {}).get("config", {}),
+        "kind": (m or {}).get("kind", "unknown"),
     }
 
 

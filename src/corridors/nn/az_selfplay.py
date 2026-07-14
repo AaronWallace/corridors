@@ -50,6 +50,8 @@ def save_run_config(name: str, config: "SelfPlayConfig", **extra) -> Path:
     path = directory / "run.json"
     payload = {
         "name": name,
+        "games": 0,
+        "positions": 0,
         "selfplay": asdict(config),
         "policy_balance": "pawn_wall_action_type_v1",
         "legal_policy_support": "positive_epsilon_v1",
@@ -59,6 +61,20 @@ def save_run_config(name: str, config: "SelfPlayConfig", **extra) -> Path:
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(path)
     return path
+
+
+def update_run_progress(name: str, games: int, positions: int) -> None:
+    """Atomically persist completed AlphaZero generation totals."""
+    path = AZ_DATA_ROOT / name / "run.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    payload["games"] = int(games)
+    payload["positions"] = int(positions)
+    tmp = path.with_name(".run.json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 # Env vars that native math libraries (OpenMP/MKL/OpenBLAS) read at import time to
 # size their thread pools. We pin these to 1 in each worker so N single-threaded
@@ -160,7 +176,13 @@ class _ShardWriter:
         o = np.concatenate(self._outcomes)
         path = Path(self.save_dir) / f"shard_{self._shard_idx:04d}.npz"
         tmp = path.with_name(f".tmp_{path.name}")
-        np.savez_compressed(tmp, states=s, policies=p, outcomes=o)
+        np.savez_compressed(
+            tmp,
+            states=s,
+            policies=p,
+            outcomes=o,
+            games=np.asarray(self._games_since_flush, dtype=np.int32),
+        )
         import os as _os
         _os.replace(tmp, path)
         self._shard_idx += 1

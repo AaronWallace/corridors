@@ -577,7 +577,7 @@ def _selfplay() -> None:
         **search_params,
     )
 
-    from .az_selfplay import AZ_DATA_ROOT, save_run_config
+    from .az_selfplay import AZ_DATA_ROOT, save_run_config, update_run_progress
     save_dir = str(AZ_DATA_ROOT / run_name)
     save_run_config(run_name, config, mode="standalone")
     t0 = time.monotonic()
@@ -592,6 +592,7 @@ def _selfplay() -> None:
 
     elapsed = time.monotonic() - t0
     wins = stats["wins"][1] + stats["wins"][2]
+    update_run_progress(run_name, stats["done"], stats["positions"])
     console.print(Panel(
         Text.assemble(
             ("games ", "dim"), (f"{stats['done']}", "white"),
@@ -800,7 +801,9 @@ def _seed_loop_checkpoint(src: str, dst: str) -> bool:
 
 def _full_loop() -> None:
     console = _console()
-    from .az_selfplay import SelfPlayConfig, SelfPlayPool, save_run_config
+    from .az_selfplay import (
+        SelfPlayConfig, SelfPlayPool, save_run_config, update_run_progress,
+    )
     from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
                            load_training_data, train_az)
     from .az_arena import promote_candidate, run_arena
@@ -931,6 +934,7 @@ def _full_loop() -> None:
 
             cumulative_games += games_per_iter
             cumulative_positions += positions
+            update_run_progress(run_name, cumulative_games, cumulative_positions)
             cumulative_wins[1] += stats["wins"][1]
             cumulative_wins[2] += stats["wins"][2]
             cumulative_draws += stats["draws"]

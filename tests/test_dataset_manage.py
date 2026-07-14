@@ -2,6 +2,8 @@
 individually, and the ``alphazero`` container must never be deletable as a
 single "dataset" (that once wiped every run at once)."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -35,6 +37,48 @@ def test_container_is_expanded_into_individual_runs(data_root):
     assert names == {"classic", "alphazero/run_a", "alphazero/run_b"}
     # The container itself is never presented as a dataset.
     assert "alphazero" not in names
+
+
+def test_legacy_alphazero_run_reports_useful_metadata(data_root):
+    run = data_root / "alphazero" / "run_a"
+    run.mkdir(parents=True)
+    (run / "run.json").write_text(json.dumps({
+        "mode": "loop",
+        "iterations": 3,
+        "selfplay": {
+            "num_games": 50,
+            "simulations": 200,
+            "max_plies": 120,
+            "device": "cuda",
+            "workers": 64,
+        },
+    }), encoding="utf-8")
+    for index, positions in enumerate((3, 5)):
+        np.savez_compressed(
+            run / f"shard_{index:04d}.npz",
+            states=np.zeros((positions, 1), dtype=np.float32),
+            policies=np.zeros((positions, 1), dtype=np.float32),
+            outcomes=np.zeros((positions,), dtype=np.int8),
+        )
+
+    [item] = ds.list_datasets()
+    assert item["games"] == 50
+    assert item["positions"] == 8
+    assert item["kind"] == "alphazero"
+    assert item["config"]["simulations"] == 200
+    assert item["config"]["max_plies"] == 120
+
+
+def test_pre_metadata_alphazero_name_recovers_useful_fields(data_root):
+    run = data_root / "alphazero" / "azloop_20260712_g100_s200_p150_cuda_w14"
+    for index in range(4):
+        _write_shard(run, index)
+
+    [item] = ds.list_datasets()
+    assert item["games"] == 100
+    assert item["positions"] == 4
+    assert item["kind"] == "alphazero"
+    assert item["config"] == {"simulations": 200, "max_plies": 150}
 
 
 def test_delete_container_is_refused(data_root):

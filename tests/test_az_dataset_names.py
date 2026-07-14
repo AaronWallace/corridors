@@ -40,6 +40,13 @@ def test_full_generation_settings_are_saved_beside_shards(tmp_path, monkeypatch)
     assert saved["policy_balance"] == "pawn_wall_action_type_v1"
     assert saved["legal_policy_support"] == "positive_epsilon_v1"
     assert saved["promotion_score"] == 0.51
+    assert saved["games"] == 0
+    assert saved["positions"] == 0
+
+    az_selfplay.update_run_progress("azloop_short", 420, 31_337)
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    assert updated["games"] == 420
+    assert updated["positions"] == 31_337
 
 
 def test_training_checkpoint_choices_include_only_ranked_alphazero_models(

@@ -309,8 +309,16 @@ def _print_datasets(items: List[dict]) -> None:
     t.add_column("config", style="dim")
     for i, d in enumerate(items, 1):
         c = d["config"]
-        cfg_str = (f"d{c.get('depth', '?')} e{c.get('tiebreak_epsilon', '?')} "
-                   f"{c.get('starts', '?')}") if c else "-"
+        if d.get("kind") == "alphazero":
+            useful = []
+            if c.get("simulations") is not None:
+                useful.append(f"{c['simulations']} sims")
+            if c.get("max_plies") is not None:
+                useful.append(f"{c['max_plies']} max plies")
+            cfg_str = " · ".join(useful) or "-"
+        else:
+            cfg_str = (f"d{c.get('depth', '?')} e{c.get('tiebreak_epsilon', '?')} "
+                       f"{c.get('starts', '?')}") if c else "-"
         t.add_row(str(i), d["name"], str(d["games"]), f"{d['positions']:,}" if
                   isinstance(d["positions"], int) else str(d["positions"]),
                   str(d["shards"]), f"{d['size_mb']:.1f}", cfg_str)
