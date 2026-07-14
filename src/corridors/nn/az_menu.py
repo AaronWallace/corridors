@@ -26,6 +26,55 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 CHECKPOINT_ROOT = _PROJECT_ROOT / "nn_checkpoints"
 
 
+class _EpochFitTrend:
+    """Compact rolling signal for whether lower training loss generalizes."""
+
+    def __init__(self, lookback: int = 3, bar_width: int = 5) -> None:
+        self.lookback = lookback
+        self.bar_width = bar_width
+        self.history: list[tuple[float, float]] = []
+        self.divergence_streak = 0
+
+    def update(self, epoch) -> str:
+        train = float(epoch.train_loss)
+        val = float(epoch.val_loss)
+        gap = 100.0 * (val - train) / max(abs(train), 1e-9)
+        if not self.history:
+            self.history.append((train, val))
+            return (f"[dim]fit {'░' * self.bar_width} --  ·  "
+                    f"gap {gap:+.1f}%  ·  baseline[/dim]")
+
+        old_train, old_val = self.history[max(0, len(self.history) - self.lookback)]
+        train_gain = old_train - train
+        val_gain = old_val - val
+        tolerance = max(0.0005, abs(old_val) * 0.0002)
+        efficiency = val_gain / max(train_gain, 1e-9) if train_gain > 0 else 0.0
+        shown_efficiency = min(1.0, max(0.0, efficiency))
+        filled = round(shown_efficiency * self.bar_width)
+        bar = "█" * filled + "░" * (self.bar_width - filled)
+
+        if val_gain > tolerance:
+            self.divergence_streak = 0
+            label = "productive" if efficiency >= 0.15 else "slow gains"
+            style = "green" if efficiency >= 0.15 else "yellow"
+        elif val_gain < -tolerance and train_gain > 0:
+            self.divergence_streak += 1
+            label = "overfitting" if self.divergence_streak >= 2 else "watch divergence"
+            style = "red" if self.divergence_streak >= 2 else "yellow"
+        else:
+            self.divergence_streak = 0
+            label = "plateau"
+            style = "yellow"
+
+        self.history.append((train, val))
+        return (f"[{style}]fit {bar} {shown_efficiency * 100:>3.0f}%  ·  "
+                f"gap {gap:+.1f}%  ·  {label}[/{style}]")
+
+
+_FIT_LEGEND = ("fit = validation improvement retained from falling training loss "
+               "(rolling 3 epochs); gap = validation above training")
+
+
 def _read_meta(name: str) -> dict:
     p = resolve_checkpoint_path(CHECKPOINT_ROOT, name).with_suffix(".meta.json")
     if not p.exists():
@@ -733,9 +782,18 @@ def _train() -> None:
 
     from .az_train import resolve_device
     console.print(f"[dim]device: {resolve_device(config.device)}[/dim]")
+    console.print(f"[dim]{_FIT_LEGEND}[/dim]")
+    console.print(
+        f"[dim]adaptive stop: patience {config.early_stop_patience} · "
+        f"meaningful validation gain ≥{config.early_stop_min_delta:.2%}[/dim]"
+    )
 
+    fit_trend = _EpochFitTrend()
     def on_epoch(e):
         star = " [green]*best*[/green]" if e.is_best else ""
+        stop = (f"  [yellow]→ stop: {e.stop_reason}[/yellow]"
+                if e.will_stop else "")
+        fit = fit_trend.update(e)
         console.print(
             f"  [dim]epoch[/dim] {e.epoch:>3}/{e.epochs}  "
             f"[dim]loss[/dim] {e.train_loss:.4f}  "
@@ -743,7 +801,7 @@ def _train() -> None:
             f"[dim]v[/dim] {e.value_loss:.4f}  "
             f"[dim]val[/dim] {e.val_loss:.4f}  "
             f"[dim]lr[/dim] {e.lr:.2e}  "
-            f"[dim]{e.elapsed:.0f}s[/dim]{star}"
+            f"[dim]{e.elapsed:.0f}s[/dim]  {fit}{star}{stop}"
         )
 
     try:
@@ -758,6 +816,12 @@ def _train() -> None:
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]training interrupted — best checkpoint saved.[/dim]")
         return
+
+    if res["stopped_early"]:
+        console.print(
+            f"[yellow]adaptive stop @ epoch {res['epochs_completed']}: "
+            f"{res['stop_reason']} · keeping best epoch {res['best_epoch']}[/yellow]"
+        )
 
     console.print(Panel(
         Text.assemble(
@@ -950,23 +1014,32 @@ def _full_loop() -> None:
                 f"\n  [bold]Training[/bold] [dim]· {epochs_per_iter} epochs "
                 f"· batch {train_batch_size} · replay buffer: {len(all_s):,} positions[/dim]"
             )
+            console.print(f"    [dim]{_FIT_LEGEND}[/dim]")
 
             train_config = AZTrainConfig(
                 epochs=epochs_per_iter, batch_size=train_batch_size, lr=lr,
                 checkpoint_name=candidate_name,
             )
+            console.print(
+                f"    [dim]adaptive stop: patience {train_config.early_stop_patience} · "
+                f"meaningful validation gain ≥{train_config.early_stop_min_delta:.2%}[/dim]"
+            )
             resume = ckpt_name if resolve_checkpoint_path(
                 CHECKPOINT_ROOT, ckpt_name).exists() else ""
 
+            fit_trend = _EpochFitTrend()
             def on_epoch(e):
                 star = " [green]*best*[/green]" if e.is_best else ""
+                stop = (f"  [yellow]→ stop: {e.stop_reason}[/yellow]"
+                        if e.will_stop else "")
+                fit = fit_trend.update(e)
                 console.print(
                     f"    [dim]epoch {e.epoch:>3}/{e.epochs}  "
                     f"loss {e.train_loss:.4f}  "
                     f"π {e.policy_loss:.4f}  v {e.value_loss:.4f}  "
                     f"val {e.val_loss:.4f}  "
                     f"lr {e.lr:.2e}  "
-                    f"{e.elapsed:.0f}s[/dim]{star}"
+                    f"{e.elapsed:.0f}s[/dim]  {fit}{star}{stop}"
                 )
 
             from rich.live import Live
@@ -977,6 +1050,11 @@ def _full_loop() -> None:
                     resume_from=resume, on_epoch=on_epoch,
                     on_batch=lambda info: live.update(_batch_progress_text(info)),
                     data_meta=dataset_provenance(run_name, max_positions=max_positions))
+            if res["stopped_early"]:
+                console.print(
+                    f"  [yellow]→ adaptive stop @ epoch {res['epochs_completed']}: "
+                    f"{res['stop_reason']} · keeping best epoch {res['best_epoch']}[/yellow]"
+                )
             console.print(
                 f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
                 f"({res['elapsed']:.0f}s on {res['device']})[/dim]"

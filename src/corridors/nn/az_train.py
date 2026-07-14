@@ -15,6 +15,7 @@ Each iteration uses a replay buffer of recent games.
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Tuple
@@ -73,6 +74,10 @@ class AZTrainConfig:
     device: str = "auto"
     checkpoint_name: str = "az_latest"
     reflection_prob: float = 0.5
+    early_stopping: bool = True
+    early_stop_patience: int = 3
+    early_stop_min_epochs: int = 0  # 0 = auto (35% of configured epochs, at least 5)
+    early_stop_min_delta: float = 1e-3  # meaningful relative validation gain (0.1%)
 
 
 @dataclass
@@ -88,6 +93,8 @@ class AZEpochInfo:
     lr: float
     elapsed: float
     is_best: bool
+    will_stop: bool = False
+    stop_reason: str = ""
 
 
 @dataclass
@@ -99,6 +106,37 @@ class AZBatchInfo:
     batches: int
     elapsed: float
     loss: float
+
+
+class _ValidationEarlyStopper:
+    """Stop after validation ceases making meaningful relative progress."""
+
+    def __init__(self, patience: int, min_epochs: int,
+                 min_delta: float) -> None:
+        self.patience = max(1, int(patience))
+        self.min_epochs = max(1, int(min_epochs))
+        self.min_delta = max(0.0, float(min_delta))
+        self.best_meaningful = float("inf")
+        self.stale_epochs = 0
+
+    def update(self, epoch: int, val_loss: float) -> tuple[bool, str]:
+        threshold = (abs(self.best_meaningful) * self.min_delta
+                     if math.isfinite(self.best_meaningful) else 0.0)
+        if val_loss < self.best_meaningful - threshold:
+            self.best_meaningful = val_loss
+            self.stale_epochs = 0
+        else:
+            self.stale_epochs += 1
+        should_stop = epoch >= self.min_epochs and self.stale_epochs >= self.patience
+        reason = (f"no ≥{self.min_delta:.2%} validation improvement for "
+                  f"{self.stale_epochs} epochs") if should_stop else ""
+        return should_stop, reason
+
+
+def _resolved_early_stop_min_epochs(config: AZTrainConfig) -> int:
+    if config.early_stop_min_epochs > 0:
+        return min(config.epochs, config.early_stop_min_epochs)
+    return min(config.epochs, max(5, math.ceil(config.epochs * 0.35)))
 
 
 def resolve_device(device: str) -> str:
@@ -291,6 +329,14 @@ def train_az(
     best_val = float("inf")
     best_epoch = -1
     t0 = time.monotonic()
+    early_stopper = _ValidationEarlyStopper(
+        config.early_stop_patience,
+        _resolved_early_stop_min_epochs(config),
+        config.early_stop_min_delta,
+    )
+    epochs_completed = 0
+    stopped_early = False
+    stop_reason = ""
 
     for epoch in range(1, config.epochs + 1):
         if stop_flag and stop_flag():
@@ -376,6 +422,7 @@ def train_az(
         val_loss = v_loss / max(v_n, 1)
         val_ploss = v_ploss / max(v_n, 1)
         val_vloss = v_vloss / max(v_n, 1)
+        epochs_completed = epoch
 
         is_best = val_loss < best_val
         if is_best:
@@ -396,6 +443,9 @@ def train_az(
                 **(data_meta or {}),
             })
 
+        should_stop, reason = early_stopper.update(epoch, val_loss)
+        should_stop = bool(config.early_stopping and should_stop
+                           and epoch < config.epochs)
         if on_epoch:
             on_epoch(AZEpochInfo(
                 epoch=epoch, epochs=config.epochs,
@@ -403,12 +453,21 @@ def train_az(
                 val_loss=val_loss, val_policy_loss=val_ploss, val_value_loss=val_vloss,
                 lr=sched.get_last_lr()[0], elapsed=time.monotonic() - t0,
                 is_best=is_best,
+                will_stop=should_stop,
+                stop_reason=reason if should_stop else "",
             ))
+        if should_stop:
+            stopped_early = True
+            stop_reason = reason
+            break
 
     return {
         "checkpoint": config.checkpoint_name,
         "best_val_loss": best_val,
         "best_epoch": best_epoch,
+        "epochs_completed": epochs_completed,
+        "stopped_early": stopped_early,
+        "stop_reason": stop_reason,
         "positions": n,
         "device": device,
         "elapsed": time.monotonic() - t0,
