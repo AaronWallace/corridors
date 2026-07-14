@@ -13,7 +13,7 @@ from .tournament import AgentSpec, _AGENT_CACHE, play_pair_game
 
 def run_arena(incumbent: str, candidate: str, games: int = 20,
               max_plies: int = 150, device: str = "cpu",
-              on_game: Optional[Callable[[int, int, float], None]] = None) -> dict:
+              on_game: Optional[Callable] = None) -> dict:
     """Play color-balanced games and return the candidate's aggregate score."""
     # Both checkpoint names are overwritten across loop iterations; never reuse
     # model objects cached for a previous arena.
@@ -21,28 +21,72 @@ def run_arena(incumbent: str, candidate: str, games: int = 20,
     incumbent_spec = AgentSpec("net", incumbent, epsilon_band=0.0)
     candidate_spec = AgentSpec("net", candidate, epsilon_band=0.0)
     score = wins = draws = losses = 0.0
+    total_plies = 0
+    game_details = []
+    by_side = {
+        "P1": {"wins": 0, "draws": 0, "losses": 0},
+        "P2": {"wins": 0, "draws": 0, "losses": 0},
+    }
+    terminations = {}
     t0 = time.monotonic()
     for game in range(games):
+        game_t0 = time.monotonic()
         if game % 2 == 0:
-            result = play_pair_game(candidate_spec, incumbent_spec, game,
-                                    device=device, max_plies=max_plies)
+            raw = play_pair_game(
+                candidate_spec, incumbent_spec, game, device=device,
+                max_plies=max_plies, return_details=True)
+            side = "P1"
+            result = raw["score"] if isinstance(raw, dict) else raw
         else:
-            incumbent_score = play_pair_game(incumbent_spec, candidate_spec, game,
-                                              device=device, max_plies=max_plies)
+            raw = play_pair_game(
+                incumbent_spec, candidate_spec, game, device=device,
+                max_plies=max_plies, return_details=True)
+            side = "P2"
+            incumbent_score = raw["score"] if isinstance(raw, dict) else raw
             result = 1.0 - incumbent_score
+        details = dict(raw) if isinstance(raw, dict) else {}
+        plies = int(details.get("plies", 0))
+        elapsed = float(details.get("elapsed", time.monotonic() - game_t0))
+        termination = str(details.get("termination", "unknown"))
+        total_plies += plies
+        terminations[termination] = terminations.get(termination, 0) + 1
         score += result
         if result == 1.0:
             wins += 1
+            outcome = "win"
         elif result == 0.5:
             draws += 1
+            outcome = "draw"
         else:
             losses += 1
+            outcome = "loss"
+        by_side[side][{"win": "wins", "draw": "draws", "loss": "losses"}[outcome]] += 1
+        info = {
+            **details,
+            "candidate_score": result,
+            "candidate_side": side,
+            "plies": plies,
+            "elapsed": elapsed,
+            "termination": termination,
+            "running_wins": int(wins),
+            "running_draws": int(draws),
+            "running_losses": int(losses),
+            "running_score": score / (game + 1),
+        }
+        game_details.append(info)
         if on_game:
-            on_game(game + 1, games, result)
+            on_game(game + 1, games, result, info)
     result = {
         "games": games, "wins": int(wins), "draws": int(draws),
         "losses": int(losses), "score": score / max(games, 1),
         "elapsed": time.monotonic() - t0,
+        "total_plies": total_plies,
+        "avg_plies": total_plies / max(games, 1),
+        "min_plies": min((item["plies"] for item in game_details), default=0),
+        "max_plies_played": max((item["plies"] for item in game_details), default=0),
+        "by_side": by_side,
+        "terminations": terminations,
+        "game_details": game_details,
     }
     _AGENT_CACHE.clear()
     return result

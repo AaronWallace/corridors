@@ -110,9 +110,12 @@ def _get_mover(spec: AgentSpec, seed: int, device: str):
 
 
 def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
-                   device: str = "cpu", max_plies: int = MAX_PLIES) -> float:
+                   device: str = "cpu", max_plies: int = MAX_PLIES,
+                   return_details: bool = False):
     """Play one game; 'a' moves first as P1. Returns score for a: 1 / 0.5 / 0.
-    Threefold repetition or reaching `max_plies` half-moves scores 0.5."""
+    Threefold repetition or reaching `max_plies` half-moves scores 0.5.
+    ``return_details`` adds plies, duration, colors, and termination reason."""
+    started = time.monotonic()
     seed = hash((a.name, b.name, game_idx)) & 0x7FFFFFFF
     rng = random.Random(seed)
     p1_col = rng.randint(0, NCOLS - 1)
@@ -122,12 +125,29 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
     movers = {1: _get_mover(a, seed, device), 2: _get_mover(b, seed ^ 0x5A5A5A, device)}
     states_seen: List[State] = [state]
     plies = 0
+
+    def finish(score: float, reason: str):
+        if not return_details:
+            return score
+        return {
+            "score": score,
+            "plies": plies,
+            "elapsed": time.monotonic() - started,
+            "termination": reason,
+            "p1": a.name,
+            "p2": b.name,
+            "p1_col": p1_col,
+            "p2_col": p2_col,
+        }
+
     while True:
         w = state.winner(board)
         if w is not None:
-            return 1.0 if w == 1 else 0.0
-        if plies >= max_plies or is_threefold_repetition(states_seen):
-            return 0.5
+            return finish(1.0 if w == 1 else 0.0, "goal")
+        if plies >= max_plies:
+            return finish(0.5, "max plies")
+        if is_threefold_repetition(states_seen):
+            return finish(0.5, "threefold")
         try:
             mv = movers[state.turn](state, board)
         except RuntimeError as exc:
@@ -137,7 +157,7 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
             # action exists; verify the state before adjudicating the loss.
             if str(exc) != "no legal moves" or legal_moves(state, board):
                 raise
-            return 0.0 if state.turn == 1 else 1.0
+            return finish(0.0 if state.turn == 1 else 1.0, "no legal moves")
         state = apply_move(state, mv)
         states_seen.append(state)
         plies += 1

@@ -17,7 +17,10 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from .checkpoints import ranked_checkpoint_paths, resolve_checkpoint_path
+from .checkpoints import (
+    checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths,
+    resolve_checkpoint_path,
+)
 
 STYLE_GRID = "grey35"
 STYLE_HINT = "bold green"
@@ -265,6 +268,41 @@ def _select_checkpoint(checkpoints, prompt: str,
     if raw.isdigit() and 1 <= int(raw) <= len(checkpoints):
         return checkpoints[int(raw) - 1]
     return raw if raw in checkpoints else ""
+
+
+def _arena_matchup_table(incumbent: str, candidate: str) -> Table:
+    """Describe the exact weights entering an arena gate."""
+    ratings = load_elo_ratings(CHECKPOINT_ROOT)
+    elo_path = CHECKPOINT_ROOT / "elo.json"
+    elo_mtime = elo_path.stat().st_mtime if elo_path.exists() else 0.0
+    table = Table(box=box.SIMPLE, header_style="dim", title="Arena matchup")
+    table.add_column("role")
+    table.add_column("checkpoint", max_width=52, overflow="ellipsis", no_wrap=True)
+    table.add_column("Saved Elo", justify="right")
+    table.add_column("epoch", justify="right")
+    table.add_column("validation", justify="right")
+    table.add_column("lineage", style="dim", max_width=36,
+                     overflow="ellipsis", no_wrap=True)
+    for role, name in (("incumbent", incumbent), ("candidate", candidate)):
+        weights = resolve_checkpoint_path(CHECKPOINT_ROOT, name)
+        meta = _read_meta(name)
+        if role == "candidate":
+            elo_text = "unrated (new)"
+        else:
+            elo = checkpoint_elo(weights, ratings)
+            stale = (name in ratings and weights.exists()
+                     and weights.stat().st_mtime > elo_mtime)
+            elo_text = (f"{elo:+.0f}{' stale' if stale else ''}"
+                        if isinstance(elo, (int, float)) else "unrated")
+        lineage = (meta.get("seeded_from") or meta.get("resumed_from")
+                   or meta.get("promoted_from") or "-")
+        val = meta.get("val_loss", meta.get("val_mse"))
+        table.add_row(
+            role, name, elo_text, str(meta.get("epoch") or "-"),
+            f"{val:.4f}" if isinstance(val, (int, float)) else "-",
+            str(lineage),
+        )
+    return table
 
 
 def _select_seed_datasets(current_run: str) -> list[str]:
@@ -1191,12 +1229,30 @@ def _full_loop() -> None:
             else:
                 console.print(
                     f"\n  [bold]Arena[/bold] [dim]· {arena_games} games · candidate must score "
-                    f"{promotion_score:.0%}[/dim]"
+                    f"{promotion_score:.0%} · {max_plies} max plies · CPU inference[/dim]"
+                )
+                console.print(_arena_matchup_table(ckpt_name, candidate_name))
+                console.print(
+                    "  [dim]Candidate alternates P1/P2 each game. Saved Elo comes from "
+                    "round-robin history, not this gate.[/dim]"
                 )
 
-                def on_arena_game(done, total, result):
+                def on_arena_game(done, total, result, info):
                     symbol = "W" if result == 1.0 else "D" if result == 0.5 else "L"
-                    console.print(f"    [dim]{done:>3}/{total} {symbol}[/dim]")
+                    colour = "green" if symbol == "W" else (
+                        "yellow" if symbol == "D" else "red")
+                    points = info["running_wins"] + 0.5 * info["running_draws"]
+                    points_needed = max(0.0, promotion_score * total - points)
+                    console.print(
+                        f"    [dim]{done:>3}/{total}[/dim] "
+                        f"[{colour}]{symbol}[/{colour}] "
+                        f"[dim]candidate {info['candidate_side']} · "
+                        f"{info['plies']} ply · {info['elapsed']:.1f}s · "
+                        f"{info['termination']} · "
+                        f"W{info['running_wins']} D{info['running_draws']} "
+                        f"L{info['running_losses']} · {info['running_score']:.1%} · "
+                        f"needs {points_needed:g} more pts[/dim]"
+                    )
 
                 arena = run_arena(
                     ckpt_name, candidate_name, games=arena_games,
@@ -1207,9 +1263,24 @@ def _full_loop() -> None:
                     decision = "[green]promoted[/green]"
                 else:
                     decision = "[yellow]rejected; incumbent retained[/yellow]"
+                p1 = arena["by_side"]["P1"]
+                p2 = arena["by_side"]["P2"]
+                termination_text = ", ".join(
+                    f"{reason} {count}"
+                    for reason, count in sorted(arena["terminations"].items())
+                )
                 console.print(
                     f"  [dim]→ candidate W{arena['wins']} D{arena['draws']} "
-                    f"L{arena['losses']} · score {arena['score']:.1%} · [/dim]{decision}"
+                    f"L{arena['losses']} · score {arena['score']:.1%} · "
+                    f"avg {arena['avg_plies']:.1f} ply "
+                    f"({arena['min_plies']}-{arena['max_plies_played']}) · "
+                    f"{arena['elapsed'] / max(arena['games'], 1):.1f}s/game · [/dim]"
+                    f"{decision}"
+                )
+                console.print(
+                    f"    [dim]candidate as P1: W{p1['wins']} D{p1['draws']} L{p1['losses']} · "
+                    f"as P2: W{p2['wins']} D{p2['draws']} L{p2['losses']} · "
+                    f"endings: {termination_text or '-'}[/dim]"
                 )
 
             # Iteration summary

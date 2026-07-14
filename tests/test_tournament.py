@@ -31,3 +31,9 @@ def test_tournament_defensively_scores_legacy_no_move_state_as_loss(monkeypatch)
     b = tournament.AgentSpec("classical", "b")
 
     assert tournament.play_pair_game(a, b, 0) == 0.0
+    details = tournament.play_pair_game(a, b, 0, return_details=True)
+    assert details["score"] == 0.0
+    assert details["plies"] == 0
+    assert details["termination"] == "no legal moves"
+    assert details["p1"] == "a"
+    assert details["p2"] == "b"
