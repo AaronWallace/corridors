@@ -6,6 +6,7 @@
   <title>Corridors</title>
   <meta name="description" content="Play Corridors against classical and neural AI agents.">
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/rapid.css">
 </head>
 <body>
   <main class="shell">
@@ -22,6 +23,39 @@
         <div class="help"><kbd>R</kbd> rotate wall <span>·</span> <kbd>Esc</kbd> cancel <span>·</span> drag or click a pawn</div>
       </section>
       <aside id="p1Panel" class="player-card p1"></aside>
+      <aside id="statsPanel" class="stats-card" hidden>
+        <div class="stats-heading">
+          <div><span class="eyebrow">AUTORUN</span><h2>Statistics</h2></div>
+          <span id="runState" class="run-state">Running</span>
+        </div>
+        <div class="delay-control">
+          <label for="turnDelay">Turn delay <output id="turnDelayValue">0.5s</output></label>
+          <input id="turnDelay" type="range" min="0" max="5" step="0.1" value="0.5">
+        </div>
+        <div class="delay-control">
+          <label for="endgameDelay">Endgame delay <output id="endgameDelayValue">1.0s</output></label>
+          <input id="endgameDelay" type="range" min="0" max="10" step="0.1" value="1">
+        </div>
+        <div class="run-actions">
+          <button id="toggleAutoplay" class="ghost" type="button">Pause</button>
+          <button id="resetStats" class="ghost" type="button">Reset stats</button>
+        </div>
+        <div class="stat-grid">
+          <div><span>Games</span><strong id="statGames">0</strong></div>
+          <div><span>Current turn</span><strong id="statCurrentTurns">0</strong></div>
+          <div><span>P1 wins</span><strong id="statP1Wins">0</strong></div>
+          <div><span>P2 wins</span><strong id="statP2Wins">0</strong></div>
+          <div><span>Draws</span><strong id="statDraws">0</strong></div>
+          <div><span>Avg turns</span><strong id="statAvgTurns">—</strong></div>
+          <div><span>Shortest</span><strong id="statShortest">—</strong></div>
+          <div><span>Longest</span><strong id="statLongest">—</strong></div>
+          <div><span>Avg move</span><strong id="statAvgMove">—</strong></div>
+          <div><span>Walls/game</span><strong id="statWalls">—</strong></div>
+        </div>
+        <div class="heatmap-head"><span class="section-title">Path & wall heatmap</span><span>current autorun</span></div>
+        <canvas id="heatmap" width="270" height="330" aria-label="Common pawn paths and wall placements"></canvas>
+        <div class="heat-legend"><span class="p1-dot"></span>P1 path <span class="p2-dot"></span>P2 path <span class="wall-line"></span>walls</div>
+      </aside>
     </section>
     <section class="lower">
       <div class="history-card"><div class="section-title">Recent moves</div><ol id="history"></ol></div>
@@ -32,8 +66,10 @@
   <dialog id="setup" class="setup">
     <form method="dialog" id="setupForm">
       <span class="eyebrow">NEW MATCH</span><h2>Choose the players</h2>
-      <div class="segmented"><button type="button" data-mode="human-ai" class="active">Human vs AI</button><button type="button" data-mode="ai-ai">AI vs AI</button></div>
+      <div class="segmented"><button type="button" data-mode="human-ai" class="active">Human vs AI</button><button type="button" data-mode="ai-ai">AI vs AI</button><button type="button" data-mode="rapid">Rapid autoplay</button></div>
       <div id="humanOptions" class="field"><label>Human plays</label><select id="humanSide"><option value="1">Player 1 · Amber</option><option value="2">Player 2 · Violet</option></select></div>
+      <div id="rapidOptions" class="rapid-note" hidden>Games restart automatically with randomized starting columns. Delays remain adjustable while the autorun is active.</div>
+      <div class="field"><label for="maxPlies">Maximum turns before draw</label><input id="maxPlies" type="number" value="160" min="20" max="2000" step="10"></div>
       <div class="agent-grid">
         <fieldset id="p1Setup"><legend>Player 1</legend></fieldset>
         <fieldset id="p2Setup"><legend>Player 2</legend></fieldset>

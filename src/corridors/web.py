@@ -152,6 +152,15 @@ def _adjudicate_draw(game: WebGame) -> None:
         game.draw_reason = "maximum plies"
 
 
+def _validated_ai_move(game: WebGame, player: dict):
+    """Ask an agent for a move, then enforce the core rules at the API boundary."""
+    move, info = REGISTRY.move(player, game.state, game.board)
+    if move not in legal_moves(game.state, game.board):
+        name = player.get("checkpoint", player.get("kind", "AI"))
+        raise RuntimeError(f"{name} returned illegal move: {move}")
+    return move, info
+
+
 def _game_json(game_id: str, game: WebGame) -> dict:
     state, board = game.state, game.board
     moves = [] if _game_over(game) else legal_moves(state, board)
@@ -159,6 +168,7 @@ def _game_json(game_id: str, game: WebGame) -> dict:
         "id": game_id,
         "mode": game.mode,
         "turn": state.turn,
+        "plies": len(game.history),
         "winner": state.winner(board),
         "gameOver": _game_over(game),
         "drawReason": game.draw_reason,
@@ -274,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "ai-move":
                     if player["kind"] == "human":
                         raise ValueError("current player is human")
-                    move, game.last_info = REGISTRY.move(player, game.state, game.board)
+                    move, game.last_info = _validated_ai_move(game, player)
                 else:
                     return self._json(404, {"error": "not found"})
                 mover = game.state.turn

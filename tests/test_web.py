@@ -1,6 +1,14 @@
 """Local web-game API tests."""
 
+import re
+
 from corridors import web
+
+
+def test_rapid_autoplay_delays_allow_zero_seconds():
+    html = (web.STATIC_ROOT / "index.html").read_text(encoding="utf-8")
+    assert re.search(r'<input id="turnDelay"[^>]+min="0"', html)
+    assert re.search(r'<input id="endgameDelay"[^>]+min="0"', html)
 
 
 def test_new_human_game_exposes_legal_moves():
@@ -13,6 +21,7 @@ def test_new_human_game_exposes_legal_moves():
     try:
         assert payload["players"]["1"]["kind"] == "human"
         assert payload["players"]["2"]["kind"] == "classical"
+        assert payload["plies"] == 0
         assert {tuple(m["at"]) for m in payload["legal"] if m["kind"] == "m"} == {(9, 4)}
         assert len([m for m in payload["legal"] if m["kind"] == "w"]) == 128
     finally:
@@ -70,3 +79,27 @@ def test_agent_spec_accepts_curated_checkpoint(tmp_path, monkeypatch):
         "kind": "model",
         "checkpoint": "shared",
     }
+
+
+def test_web_rejects_an_illegal_ai_move(monkeypatch):
+    game_id, game = web._new_game({
+        "mode": "ai-ai",
+        "p1": {"kind": "classical", "depth": 1, "timeLimit": 0},
+        "p2": {"kind": "classical", "depth": 1, "timeLimit": 0},
+        "p1Col": 4,
+        "p2Col": 5,
+    })
+    try:
+        monkeypatch.setattr(
+            web.REGISTRY,
+            "move",
+            lambda *_args: (("m", (10, 4)), {"solver": "broken", "elapsed": 0}),
+        )
+        try:
+            web._validated_ai_move(game, game.players["1"])
+        except RuntimeError as exc:
+            assert "illegal move" in str(exc)
+        else:
+            raise AssertionError("web backend accepted an illegal AI move")
+    finally:
+        web.GAMES.pop(game_id, None)
