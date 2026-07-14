@@ -1052,10 +1052,10 @@ def az_menu() -> None:
         table.add_row("2", "Train network")
         table.add_row("3", "Full loop (self-play → train → repeat)")
         table.add_row("4", "Benchmark and tune self-play")
-        table.add_row("5", "Back")
+        table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]AlphaZero pipeline[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5"], default="3")
+        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "q"], default="3")
         if choice == "1":
             _selfplay()
         elif choice == "2":
@@ -1064,5 +1064,5 @@ def az_menu() -> None:
             _full_loop()
         elif choice == "4":
             _benchmark_selfplay()
-        else:
+        elif choice == "q":
             return

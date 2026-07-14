@@ -325,9 +325,11 @@ def _manage_datasets() -> None:
         return
     _print_datasets(items)
     raw = Prompt.ask(
-        "[dim]Delete dataset # (comma-separated; Enter to go back)[/dim]",
-        default="",
+        "[dim]Delete dataset # (comma-separated), or q to go back[/dim]",
+        default="q",
     ).strip()
+    if raw.lower() == "q":
+        return
     selected = _numbered_selections(items, raw)
     if not selected:
         return
@@ -387,9 +389,11 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
     console.print(t)
     if copy_only:
         raw = Prompt.ask(
-            "[dim]Checkpoint # to copy to shared best (Enter to go back)[/dim]",
-            default="",
+            "[dim]Checkpoint # to copy to shared best, or q to go back[/dim]",
+            default="q",
         ).strip()
+        if raw.lower() == "q":
+            return
         selected = _numbered_selections(items, raw)
         if not selected:
             return
@@ -402,9 +406,11 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
         return
     raw = Prompt.ask(
         "[dim]Delete # (comma-separated), r # to rename, c # to copy to best, "
-        "or Enter to go back[/dim]",
-        default="",
+        "or q to go back[/dim]",
+        default="q",
     ).strip()
+    if raw.lower() == "q":
+        return
     if raw.lower().startswith("c "):
         selected = _numbered_selections(items, raw[2:])
         if len(selected) != 1:
@@ -451,11 +457,11 @@ def nn_menu() -> None:
         table.add_row("5", "List / manage datasets")
         table.add_row("6", "List / manage checkpoints")
         table.add_row("7", "Copy checkpoint to shared best")
-        table.add_row("8", "Back")
+        table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]Neural network training[/bold]",
                             border_style=STYLE_GRID))
         choice = Prompt.ask(
-            "Choose", choices=["1", "2", "3", "4", "5", "6", "7", "8"],
+            "Choose", choices=["1", "2", "3", "4", "5", "6", "7", "q"],
             default="1",
         )
         if choice == "1":
@@ -473,5 +479,5 @@ def nn_menu() -> None:
             _manage_checkpoints()
         elif choice == "7":
             _manage_checkpoints(copy_only=True)
-        else:
+        elif choice == "q":
             return

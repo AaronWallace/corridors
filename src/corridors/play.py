@@ -1113,9 +1113,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             table.add_column()
             table.add_row("1", "Autoplay (AI vs AI)")
             table.add_row("2", "Neural network training")
-            table.add_row("3", "Quit")
+            table.add_row("q", "Quit")
             console.print(Panel(table, title="[bold]Corridors[/bold]", border_style=STYLE_GRID))
-            choice = Prompt.ask("Choose", choices=["1", "2", "3"], default="1")
+            choice = Prompt.ask("Choose", choices=["1", "2", "q"], default="1")
             if choice == "1":
                 try:
                     _run_autoplay()
@@ -1124,7 +1124,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             elif choice == "2":
                 from .nn.menu import nn_menu
                 nn_menu()
-            else:
+            elif choice == "q":
                 return 0
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]bye.[/dim]")
