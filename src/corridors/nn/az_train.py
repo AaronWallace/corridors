@@ -62,7 +62,7 @@ def balanced_policy_loss(policy_logits: torch.Tensor,
 
 @dataclass
 class AZTrainConfig:
-    epochs: int = 10
+    epochs: int = 10  # soft target; productive training may extend beyond it
     batch_size: int = 256
     lr: float = 2e-3
     lr_min: float = 1e-5
@@ -78,6 +78,8 @@ class AZTrainConfig:
     early_stop_patience: int = 3
     early_stop_min_epochs: int = 0  # 0 = auto (35% of configured epochs, at least 5)
     early_stop_min_delta: float = 1e-3  # meaningful relative validation gain (0.1%)
+    max_epochs: int = 0  # 0 = auto from epoch_extension_factor
+    epoch_extension_factor: float = 1.5
 
 
 @dataclass
@@ -95,6 +97,8 @@ class AZEpochInfo:
     is_best: bool
     will_stop: bool = False
     stop_reason: str = ""
+    extension_started: bool = False
+    target_epochs: int = 0
 
 
 @dataclass
@@ -137,6 +141,12 @@ def _resolved_early_stop_min_epochs(config: AZTrainConfig) -> int:
     if config.early_stop_min_epochs > 0:
         return min(config.epochs, config.early_stop_min_epochs)
     return min(config.epochs, max(5, math.ceil(config.epochs * 0.35)))
+
+
+def _resolved_max_epochs(config: AZTrainConfig) -> int:
+    if config.max_epochs > 0:
+        return max(config.epochs, config.max_epochs)
+    return max(config.epochs, math.ceil(config.epochs * config.epoch_extension_factor))
 
 
 def resolve_device(device: str) -> str:
@@ -210,13 +220,32 @@ def load_training_data(
     return np.concatenate(ss), np.concatenate(ps), np.concatenate(os_)
 
 
-def load_training_datasets(names, on_progress: Optional[Callable] = None
-                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load and concatenate runs, optionally reporting shard-level progress."""
+def _combined_shard_files(names, max_positions: int = 0):
+    """Chronological ``(run, shard)`` pairs with one cap across all runs.
+
+    Run order matters: callers put one-time seed runs first and the current run
+    last, ensuring the newest self-play survives a constrained replay window.
+    """
     if isinstance(names, str):
         names = [names]
-    ss, ps, os_ = [], [], []
     files = [(name, path) for name in names for path in _shard_files(name)]
+    if max_positions > 0:
+        kept, total = [], 0
+        for item in reversed(files):
+            kept.append(item)
+            total += _shard_positions(item[1])
+            if total >= max_positions:
+                break
+        files = list(reversed(kept))
+    return files
+
+
+def load_training_datasets(names, on_progress: Optional[Callable] = None,
+                           max_positions: int = 0
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load runs with one optional rolling-position cap across the combination."""
+    ss, ps, os_ = [], [], []
+    files = _combined_shard_files(names, max_positions)
     positions = 0
     total = len(files)
     if on_progress:
@@ -246,16 +275,16 @@ def dataset_provenance(names, max_positions: int = 0) -> dict:
     import hashlib
     if isinstance(names, str):
         names = [names]
-    all_runs, shard_names, total = [], [], 0
+    names = list(names)
+    shard_names = []
     h = hashlib.sha256()
-    for name in names:
-        files = _shard_files(name, max_positions)
-        for f in files:
-            st = f.stat()
-            h.update(f"{name}/{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
-            shard_names.append(f"{name}/{f.name}")
-        total += len(files)
-        all_runs.append(name)
+    files = _combined_shard_files(names, max_positions)
+    for name, f in files:
+        st = f.stat()
+        h.update(f"{name}/{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+        shard_names.append(f"{name}/{f.name}")
+    total = len(files)
+    all_runs = list(dict.fromkeys(name for name, _path in files))
     return {
         "data_run": "+".join(all_runs),
         "data_runs": all_runs,
@@ -321,10 +350,11 @@ def train_az(
     else:
         model = az_net.AZNet().to(device)
 
+    max_epochs = _resolved_max_epochs(config)
     opt = torch.optim.AdamW(model.parameters(), lr=config.lr,
                             weight_decay=config.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=config.epochs, eta_min=config.lr_min)
+        opt, T_max=max_epochs, eta_min=config.lr_min)
 
     best_val = float("inf")
     best_epoch = -1
@@ -338,7 +368,7 @@ def train_az(
     stopped_early = False
     stop_reason = ""
 
-    for epoch in range(1, config.epochs + 1):
+    for epoch in range(1, max_epochs + 1):
         if stop_flag and stop_flag():
             break
 
@@ -385,7 +415,7 @@ def train_az(
             if on_batch and (batches == 1 or batches == train_batches
                              or batches % max(1, train_batches // 20) == 0):
                 on_batch(AZBatchInfo(
-                    epoch, config.epochs, "training", batches, train_batches,
+                    epoch, max_epochs, "training", batches, train_batches,
                     time.monotonic() - phase_t0, total_loss / batches))
 
         sched.step()
@@ -416,7 +446,7 @@ def train_az(
                 if on_batch and (val_batch == 1 or val_batch == val_batches
                                  or val_batch % max(1, val_batches // 10) == 0):
                     on_batch(AZBatchInfo(
-                        epoch, config.epochs, "validation", val_batch, val_batches,
+                        epoch, max_epochs, "validation", val_batch, val_batches,
                         time.monotonic() - phase_t0, v_loss / max(v_n, 1)))
 
         val_loss = v_loss / max(v_n, 1)
@@ -430,7 +460,9 @@ def train_az(
             best_epoch = epoch
             az_net.save_checkpoint(model, config.checkpoint_name, meta={
                 "epoch": epoch,
-                "epochs": config.epochs,
+                "epochs": max_epochs,
+                "epoch_target": config.epochs,
+                "epoch_limit": max_epochs,
                 "val_loss": round(val_loss, 6),
                 "val_policy_loss": round(val_ploss, 6),
                 "val_value_loss": round(val_vloss, 6),
@@ -445,16 +477,20 @@ def train_az(
 
         should_stop, reason = early_stopper.update(epoch, val_loss)
         should_stop = bool(config.early_stopping and should_stop
-                           and epoch < config.epochs)
+                           and epoch < max_epochs)
+        extension_started = bool(
+            epoch == config.epochs and not should_stop and max_epochs > config.epochs)
         if on_epoch:
             on_epoch(AZEpochInfo(
-                epoch=epoch, epochs=config.epochs,
+                epoch=epoch, epochs=max_epochs,
                 train_loss=train_loss, policy_loss=train_ploss, value_loss=train_vloss,
                 val_loss=val_loss, val_policy_loss=val_ploss, val_value_loss=val_vloss,
                 lr=sched.get_last_lr()[0], elapsed=time.monotonic() - t0,
                 is_best=is_best,
                 will_stop=should_stop,
                 stop_reason=reason if should_stop else "",
+                extension_started=extension_started,
+                target_epochs=config.epochs,
             ))
         if should_stop:
             stopped_early = True
@@ -466,6 +502,9 @@ def train_az(
         "best_val_loss": best_val,
         "best_epoch": best_epoch,
         "epochs_completed": epochs_completed,
+        "target_epochs": config.epochs,
+        "max_epochs": max_epochs,
+        "extended": epochs_completed > config.epochs,
         "stopped_early": stopped_early,
         "stop_reason": stop_reason,
         "positions": n,

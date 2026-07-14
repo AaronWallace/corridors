@@ -11,7 +11,7 @@ from corridors.nn.az_net import AZNet
 from corridors.nn.az_menu import _EpochFitTrend
 from corridors.nn.az_train import (
     AZTrainConfig, _ValidationEarlyStopper, _resolved_early_stop_min_epochs,
-    train_az,
+    _resolved_max_epochs, train_az,
 )
 from corridors.nn.encoding import NUM_PLANES, NCOLS, NROWS
 
@@ -102,6 +102,9 @@ def test_automatic_minimum_epochs_scales_with_iteration_budget():
     assert _resolved_early_stop_min_epochs(AZTrainConfig(epochs=20)) == 7
     assert _resolved_early_stop_min_epochs(AZTrainConfig(epochs=10)) == 5
     assert _resolved_early_stop_min_epochs(AZTrainConfig(epochs=4)) == 4
+    assert _resolved_max_epochs(AZTrainConfig(epochs=20)) == 30
+    assert _resolved_max_epochs(AZTrainConfig(epochs=10)) == 15
+    assert _resolved_max_epochs(AZTrainConfig(epochs=10, max_epochs=12)) == 12
 
 
 def test_early_stopper_would_end_the_observed_plateau_at_epoch_18():
@@ -144,3 +147,28 @@ def test_train_az_actually_ends_iteration_and_keeps_stop_reason(monkeypatch):
     assert result["best_epoch"] == 1
     assert result["stop_reason"]
     assert seen[-1].will_stop is True
+
+
+def test_train_az_extends_past_soft_target_when_stopping_is_disabled(monkeypatch):
+    monkeypatch.setattr(az_net, "AZNet", lambda: AZNet(channels=4, blocks=1))
+    monkeypatch.setattr(az_net, "save_checkpoint", lambda *_args, **_kwargs: None)
+    states = np.zeros((20, NUM_PLANES, NROWS, NCOLS), dtype=np.float32)
+    policies = np.zeros((20, NUM_ACTIONS), dtype=np.float32)
+    policies[:, 0] = 1.0
+    outcomes = np.zeros((20,), dtype=np.float32)
+    seen = []
+
+    result = train_az(
+        states, policies, outcomes,
+        AZTrainConfig(
+            epochs=2, batch_size=4, lr=0, lr_min=0,
+            reflection_prob=0, device="cpu", early_stopping=False,
+        ),
+        on_epoch=seen.append,
+    )
+
+    assert result["target_epochs"] == 2
+    assert result["max_epochs"] == 3
+    assert result["epochs_completed"] == 3
+    assert result["extended"] is True
+    assert seen[1].extension_started is True

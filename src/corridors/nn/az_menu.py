@@ -260,6 +260,46 @@ def _select_checkpoint(checkpoints, prompt: str,
     return raw if raw in checkpoints else ""
 
 
+def _select_seed_datasets(current_run: str) -> list[str]:
+    """Select compatible existing AZ runs for the first loop iteration only."""
+    console = _console()
+    from . import datasets as ds_mod
+    from .menu import _numbered_selections, _print_datasets
+
+    current_name = f"alphazero/{current_run}"
+    items = [item for item in ds_mod.list_datasets()
+             if item.get("kind") == "alphazero" and item["name"] != current_name]
+    if not items:
+        return []
+    if not Confirm.ask(
+            "[dim]Seed the first training iteration with existing AZ datasets?[/dim]",
+            default=False):
+        return []
+    console.print("[dim]Only the first training iteration uses these imported datasets.[/dim]")
+    _print_datasets(items)
+    raw = Prompt.ask(
+        "[dim]Seed datasets (#, comma-separated, 'all', or q for none)[/dim]",
+        default="q",
+    ).strip()
+    if raw.lower() == "q":
+        return []
+    selected = items if raw.lower() == "all" else _numbered_selections(items, raw)
+    runs = []
+    for item in selected:
+        name = item["name"]
+        runs.append(name.split("/", 1)[1] if name.startswith("alphazero/") else name)
+    if runs:
+        games = sum(item["games"] for item in selected
+                    if isinstance(item.get("games"), int))
+        positions = sum(item["positions"] for item in selected
+                        if isinstance(item.get("positions"), int))
+        console.print(
+            f"[cyan]first iteration seed: {len(runs)} dataset(s) · "
+            f"{games:,} known games · {positions:,} positions[/cyan]"
+        )
+    return runs
+
+
 def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
                    max_plies: int, run_fn):
     """Drive `run_fn(on_game, on_status, on_heartbeat)` behind one self-refreshing
@@ -689,8 +729,10 @@ def _batch_progress_text(info) -> Text:
 
 def _train() -> None:
     console = _console()
-    from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
-                           load_training_datasets, train_az)
+    from .az_train import (
+        AZ_DATA_ROOT, AZTrainConfig, _resolved_early_stop_min_epochs,
+        _resolved_max_epochs, dataset_provenance, load_training_datasets, train_az,
+    )
 
     if not AZ_DATA_ROOT.exists():
         console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
@@ -748,7 +790,7 @@ def _train() -> None:
 
     console.print(f"[dim]{len(states):,} positions from {len(selected)} run(s)[/dim]")
 
-    epochs = _prompt_int("Epochs", 10, 1, 1000)
+    epochs = _prompt_int("Target epochs (adaptive)", 10, 1, 1000)
     batch_size = _prompt_int("Batch size", 256, 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
 
@@ -784,7 +826,9 @@ def _train() -> None:
     console.print(f"[dim]device: {resolve_device(config.device)}[/dim]")
     console.print(f"[dim]{_FIT_LEGEND}[/dim]")
     console.print(
-        f"[dim]adaptive stop: patience {config.early_stop_patience} · "
+        f"[dim]adaptive epochs: {_resolved_early_stop_min_epochs(config)}–"
+        f"{_resolved_max_epochs(config)} (target {config.epochs}) · "
+        f"stop patience {config.early_stop_patience} · "
         f"meaningful validation gain ≥{config.early_stop_min_delta:.2%}[/dim]"
     )
 
@@ -793,6 +837,8 @@ def _train() -> None:
         star = " [green]*best*[/green]" if e.is_best else ""
         stop = (f"  [yellow]→ stop: {e.stop_reason}[/yellow]"
                 if e.will_stop else "")
+        extend = (f"  [cyan]→ extending beyond target {e.target_epochs}[/cyan]"
+                  if e.extension_started else "")
         fit = fit_trend.update(e)
         console.print(
             f"  [dim]epoch[/dim] {e.epoch:>3}/{e.epochs}  "
@@ -801,7 +847,7 @@ def _train() -> None:
             f"[dim]v[/dim] {e.value_loss:.4f}  "
             f"[dim]val[/dim] {e.val_loss:.4f}  "
             f"[dim]lr[/dim] {e.lr:.2e}  "
-            f"[dim]{e.elapsed:.0f}s[/dim]  {fit}{star}{stop}"
+            f"[dim]{e.elapsed:.0f}s[/dim]  {fit}{star}{extend}{stop}"
         )
 
     try:
@@ -821,6 +867,11 @@ def _train() -> None:
         console.print(
             f"[yellow]adaptive stop @ epoch {res['epochs_completed']}: "
             f"{res['stop_reason']} · keeping best epoch {res['best_epoch']}[/yellow]"
+        )
+    elif res["extended"]:
+        console.print(
+            f"[cyan]adaptive extension: target {res['target_epochs']} → "
+            f"{res['epochs_completed']} epochs[/cyan]"
         )
 
     console.print(Panel(
@@ -868,8 +919,10 @@ def _full_loop() -> None:
     from .az_selfplay import (
         SelfPlayConfig, SelfPlayPool, save_run_config, update_run_progress,
     )
-    from .az_train import (AZ_DATA_ROOT, AZTrainConfig, dataset_provenance,
-                           load_training_data, train_az)
+    from .az_train import (
+        AZ_DATA_ROOT, AZTrainConfig, _resolved_early_stop_min_epochs,
+        _resolved_max_epochs, dataset_provenance, load_training_datasets, train_az,
+    )
     from .az_arena import promote_candidate, run_arena
 
     console.print("\n[bold]AlphaZero training loop[/bold]")
@@ -880,7 +933,7 @@ def _full_loop() -> None:
     games_per_iter = _prompt_int("Games per iteration", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    epochs_per_iter = _prompt_int("Training epochs per iteration", 10, 1, 1000)
+    epochs_per_iter = _prompt_int("Target training epochs per iteration (adaptive)", 10, 1, 1000)
     train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
     device, workers, sp_batch_size, concurrency, inference_servers = \
@@ -901,6 +954,7 @@ def _full_loop() -> None:
     ckpt_name = f"{run_name}_best"
     candidate_name = f"{run_name}_candidate"
     ckpt_path = resolve_checkpoint_path(CHECKPOINT_ROOT, ckpt_name)
+    seed_runs = _select_seed_datasets(run_name)
 
     # Optionally seed the loop from an existing checkpoint (e.g. az_latest). The
     # loop otherwise bootstraps from {run_name}_best if it exists, else random init.
@@ -940,6 +994,7 @@ def _full_loop() -> None:
         epochs_per_iteration=epochs_per_iter, training_batch=train_batch_size,
         learning_rate=lr, replay_positions=max_positions,
         arena_games=arena_games, promotion_score=promotion_score,
+        seed_datasets=seed_runs,
     )
     pool = SelfPlayPool(sp_config)
 
@@ -1008,11 +1063,44 @@ def _full_loop() -> None:
                 break
 
             # --- Train ---
-            all_s, all_p, all_o = load_training_data(
-                run_name, max_positions=max_positions)
+            training_runs = seed_runs + [run_name] if it == 1 and seed_runs else [run_name]
+            from rich.live import Live
+            with Live(Text("    preparing replay shards…", style="dim"), console=console,
+                      refresh_per_second=4, transient=True) as replay_live:
+                def on_replay_load(phase, done, total, loaded_run, shard, loaded_positions):
+                    if phase == "combining":
+                        message = f"    combining {loaded_positions:,} replay positions…"
+                    else:
+                        pct = 100 * done / max(total, 1)
+                        message = (f"    loading replay {done:,}/{total:,} ({pct:.0f}%) · "
+                                   f"{loaded_positions:,} positions"
+                                   + (f" · {loaded_run}" if loaded_run else ""))
+                    replay_live.update(Text(message, style="cyan"))
+
+                all_s, all_p, all_o = load_training_datasets(
+                    training_runs, on_progress=on_replay_load,
+                    max_positions=max_positions)
+            training_provenance = dataset_provenance(
+                training_runs, max_positions=max_positions)
+            retained_seed_runs = [
+                name for name in seed_runs
+                if name in training_provenance["data_runs"]
+            ]
+            seed_note = ""
+            if it == 1 and seed_runs:
+                seed_note = (
+                    f" · seed datasets represented: {len(retained_seed_runs)}/"
+                    f"{len(seed_runs)} (first iteration only)"
+                )
+                if len(retained_seed_runs) < len(seed_runs):
+                    console.print(
+                        "  [yellow]Replay cap excluded some selected seed data. "
+                        "Increase the cap or use 0 to retain every selected dataset.[/yellow]"
+                    )
             console.print(
-                f"\n  [bold]Training[/bold] [dim]· {epochs_per_iter} epochs "
-                f"· batch {train_batch_size} · replay buffer: {len(all_s):,} positions[/dim]"
+                f"\n  [bold]Training[/bold] [dim]· target {epochs_per_iter} epochs "
+                f"· batch {train_batch_size} · replay buffer: {len(all_s):,} positions"
+                f"{seed_note}[/dim]"
             )
             console.print(f"    [dim]{_FIT_LEGEND}[/dim]")
 
@@ -1021,7 +1109,9 @@ def _full_loop() -> None:
                 checkpoint_name=candidate_name,
             )
             console.print(
-                f"    [dim]adaptive stop: patience {train_config.early_stop_patience} · "
+                f"    [dim]adaptive epochs: {_resolved_early_stop_min_epochs(train_config)}–"
+                f"{_resolved_max_epochs(train_config)} · "
+                f"stop patience {train_config.early_stop_patience} · "
                 f"meaningful validation gain ≥{train_config.early_stop_min_delta:.2%}[/dim]"
             )
             resume = ckpt_name if resolve_checkpoint_path(
@@ -1032,6 +1122,8 @@ def _full_loop() -> None:
                 star = " [green]*best*[/green]" if e.is_best else ""
                 stop = (f"  [yellow]→ stop: {e.stop_reason}[/yellow]"
                         if e.will_stop else "")
+                extend = (f"  [cyan]→ extending beyond target {e.target_epochs}[/cyan]"
+                          if e.extension_started else "")
                 fit = fit_trend.update(e)
                 console.print(
                     f"    [dim]epoch {e.epoch:>3}/{e.epochs}  "
@@ -1039,21 +1131,29 @@ def _full_loop() -> None:
                     f"π {e.policy_loss:.4f}  v {e.value_loss:.4f}  "
                     f"val {e.val_loss:.4f}  "
                     f"lr {e.lr:.2e}  "
-                    f"{e.elapsed:.0f}s[/dim]  {fit}{star}{stop}"
+                    f"{e.elapsed:.0f}s[/dim]  {fit}{star}{extend}{stop}"
                 )
 
-            from rich.live import Live
             with Live(Text("    preparing training split…", style="dim"), console=console,
                       refresh_per_second=4, transient=True) as live:
                 res = train_az(
                     all_s, all_p, all_o, train_config,
                     resume_from=resume, on_epoch=on_epoch,
                     on_batch=lambda info: live.update(_batch_progress_text(info)),
-                    data_meta=dataset_provenance(run_name, max_positions=max_positions))
+                    data_meta={
+                        **training_provenance,
+                        "seed_data_runs": seed_runs,
+                        "retained_seed_data_runs": retained_seed_runs,
+                    })
             if res["stopped_early"]:
                 console.print(
                     f"  [yellow]→ adaptive stop @ epoch {res['epochs_completed']}: "
                     f"{res['stop_reason']} · keeping best epoch {res['best_epoch']}[/yellow]"
+                )
+            elif res["extended"]:
+                console.print(
+                    f"  [cyan]→ adaptive extension: target {res['target_epochs']} → "
+                    f"{res['epochs_completed']} epochs[/cyan]"
                 )
             console.print(
                 f"  [dim]→ best val {res['best_val_loss']:.4f} @ epoch {res['best_epoch']}  "
