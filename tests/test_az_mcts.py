@@ -2,9 +2,9 @@
 
 import numpy as np
 
-from corridors.game import State, apply_move
+from corridors.game import State, apply_move, legal_moves
 from corridors.nn.actions import NUM_ACTIONS, move_to_index
-from corridors.nn.mcts import run_mcts
+from corridors.nn.mcts import Node, run_mcts
 
 
 def _favor(move, calls):
@@ -14,6 +14,42 @@ def _favor(move, calls):
         logits[move_to_index(move)] = 0.0
         return logits, 0.75
     return evaluate
+
+
+def test_equal_logits_give_equal_aggregate_pawn_and_wall_prior():
+    board, state = State.start(4, 6)
+    node = Node(state, board)
+    node.expand(np.zeros(NUM_ACTIONS, dtype=np.float32))
+
+    pawn = np.array([move[0] == "m" for move in node.child_moves])
+    assert np.isclose(node.P[pawn].sum(), 0.5)
+    assert np.isclose(node.P[~pawn].sum(), 0.5)
+
+
+def test_dirichlet_noise_is_balanced_between_action_types():
+    board, state = State.start(4, 6)
+    node = Node(state, board)
+    node.expand(np.zeros(NUM_ACTIONS, dtype=np.float32))
+    np.random.seed(731)
+    node.add_dirichlet_noise(alpha=0.3, frac=1.0)
+
+    pawn = np.array([move[0] == "m" for move in node.child_moves])
+    assert np.isclose(node.P[pawn].sum(), 0.5)
+    assert np.isclose(node.P[~pawn].sum(), 0.5)
+
+
+def test_policy_target_marks_every_legal_action_for_balanced_training():
+    board, state = State.start(4, 6)
+    move = ("m", (9, 4))
+    calls = []
+    pi, _value, _chosen, _reuse = run_mcts(
+        state, board, _favor(move, calls), num_simulations=1,
+        temperature=0.0, add_noise=False,
+    )
+
+    legal_indices = {move_to_index(candidate) for candidate in legal_moves(state, board)}
+    assert set(np.flatnonzero(pi)) == legal_indices
+    assert np.isclose(pi.sum(), 1.0)
 
 
 def test_mcts_scores_third_position_occurrence_as_draw_without_evaluating_it():

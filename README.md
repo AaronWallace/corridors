@@ -53,6 +53,7 @@ checkpoints from `nn_checkpoints`, and supports human-vs-AI and AI-vs-AI games.
 - **Autoplay** — AI vs AI with live Rich TUI or headless mode for SSH
 - **Multiprocess parallelism** — dynamic worker count, queue-based messaging
 - **Neural network pipeline** — generate self-play data, train a value network (PyTorch + CUDA), round-robin Elo tournaments
+- **Balanced AlphaZero exploration** — equal logits give pawn and wall action types equal aggregate prior/noise, avoiding branching-count bias
 - **Alpha-beta solver** — PVS + aspiration windows + iterative deepening + transposition table (in-memory + SQLite) + Zobrist hashing + move ordering + selective extensions
 
 ## Layout

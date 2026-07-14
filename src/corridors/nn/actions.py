@@ -18,7 +18,9 @@ from ..game import (
     legal_moves,
 )
 
-NUM_ACTIONS = 99 + 128  # 227
+PAWN_ACTIONS = 99
+WALL_ACTIONS = 128
+NUM_ACTIONS = PAWN_ACTIONS + WALL_ACTIONS  # 227
 
 # --- index ↔ move -----------------------------------------------------------
 

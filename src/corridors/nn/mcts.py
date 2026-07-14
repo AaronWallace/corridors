@@ -14,16 +14,36 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ..game import Board, Move, State, apply_move, legal_moves
-from .actions import NUM_ACTIONS, legal_move_mask, move_to_index
+from .actions import NUM_ACTIONS, legal_move_mask
 
 C_PUCT = 1.5
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_FRAC = 0.25
+LEGAL_TARGET_EPSILON = 1e-8
+
+
+def _action_type_groups(moves: Sequence[Move]) -> Tuple[np.ndarray, ...]:
+    """Indices grouped as pawn moves and wall moves, omitting empty groups."""
+    pawn = np.fromiter((i for i, move in enumerate(moves) if move[0] == "m"),
+                       dtype=np.intp)
+    wall = np.fromiter((i for i, move in enumerate(moves) if move[0] == "w"),
+                       dtype=np.intp)
+    return tuple(group for group in (pawn, wall) if len(group))
+
+
+def _balanced_priors(logits: np.ndarray, moves: Sequence[Move]) -> np.ndarray:
+    """Softmax with equal aggregate mass per action type for equal logits."""
+    adjusted = np.asarray(logits, dtype=np.float32).copy()
+    for group in _action_type_groups(moves):
+        adjusted[group] -= math.log(len(group))
+    adjusted -= adjusted.max()
+    exp = np.exp(adjusted)
+    return exp / exp.sum()
 
 
 class Node:
@@ -64,10 +84,7 @@ class Node:
             self.terminal_value = -1.0  # no moves = loss
             return
 
-        logits = policy_logits[indices]
-        logits -= logits.max()
-        exp = np.exp(logits)
-        priors = exp / exp.sum()
+        priors = _balanced_priors(policy_logits[indices], moves)
 
         self.child_moves = moves
         self.child_indices = indices
@@ -80,7 +97,14 @@ class Node:
                             frac: float = DIRICHLET_FRAC) -> None:
         if self.P is None:
             return
-        noise = np.random.dirichlet([alpha] * len(self.P)).astype(np.float32)
+        groups = _action_type_groups(self.child_moves)
+        noise = np.zeros_like(self.P)
+        type_mass = 1.0 / len(groups)
+        for group in groups:
+            noise[group] = (
+                np.random.dirichlet([alpha] * len(group)).astype(np.float32)
+                * type_mass
+            )
         self.P = (1 - frac) * self.P + frac * noise
 
     def select_child(self, c_puct: float = C_PUCT) -> int:
@@ -210,7 +234,10 @@ def run_mcts(
     # Build policy target from root visit counts
     pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
     for i, idx in enumerate(root.child_indices):
-        pi[idx] = root.N[i]
+        # A negligible positive floor records the exact legal-action mask in
+        # the policy target. Training uses it to apply the same action-type
+        # normalization without storing a separate 227-element mask.
+        pi[idx] = max(float(root.N[i]), LEGAL_TARGET_EPSILON)
 
     # Select move
     if temperature < 0.01:

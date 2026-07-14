@@ -36,6 +36,9 @@ def test_full_generation_settings_are_saved_beside_shards(tmp_path, monkeypatch)
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["selfplay"]["simulations"] == 500
     assert saved["selfplay"]["batch_size"] == 64
+    assert saved["selfplay"]["temperature_moves"] == 10
+    assert saved["policy_balance"] == "pawn_wall_action_type_v1"
+    assert saved["legal_policy_support"] == "positive_epsilon_v1"
     assert saved["promotion_score"] == 0.51
 
 

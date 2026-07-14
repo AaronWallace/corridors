@@ -148,7 +148,7 @@ def _prompt_search_params() -> dict:
         "c_puct": _prompt_float("PUCT exploration constant", 1.5, 0.01, 20.0),
         "dirichlet_alpha": _prompt_float("Root Dirichlet alpha", 0.3, 0.001, 10.0),
         "dirichlet_frac": _prompt_float("Root noise fraction", 0.25, 0.0, 1.0),
-        "temperature_moves": _prompt_int("High-temperature opening plies", 20, 0, 1000),
+        "temperature_moves": _prompt_int("High-temperature opening plies", 10, 0, 1000),
         "temp_high": _prompt_float("Opening temperature", 1.0, 0.001, 10.0),
         "temp_low": _prompt_float("Later temperature", 0.1, 0.001, 10.0),
     }

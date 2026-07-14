@@ -48,7 +48,13 @@ def save_run_config(name: str, config: "SelfPlayConfig", **extra) -> Path:
     directory = AZ_DATA_ROOT / name
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / "run.json"
-    payload = {"name": name, "selfplay": asdict(config), **extra}
+    payload = {
+        "name": name,
+        "selfplay": asdict(config),
+        "policy_balance": "pawn_wall_action_type_v1",
+        "legal_policy_support": "positive_epsilon_v1",
+        **extra,
+    }
     tmp = path.with_name(".run.json.tmp")
     tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     tmp.replace(path)
@@ -186,7 +192,7 @@ class SelfPlayConfig:
     concurrent_games: int = 0  # GPU mode: games in flight per worker (0 = auto)
     batch_size: int = 64       # max batch for GPU inference
     inference_servers: int = 1  # GPU mode: parallel inference servers (workers sharded across)
-    temperature_moves: int = 20  # use temp=1 for first N moves, then temp→0.1
+    temperature_moves: int = 10  # use temp=1 for first N moves, then temp→0.1
     temp_high: float = 1.0
     temp_low: float = 0.1
     max_plies: int = 150

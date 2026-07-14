@@ -25,9 +25,38 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, TensorDataset
 
 from . import az_net
+from .actions import PAWN_ACTIONS
 from .az_selfplay import AZ_DATA_ROOT  # single source of truth (torch-free module)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+def balanced_policy_log_probs(policy_logits: torch.Tensor,
+                              policy_targets: torch.Tensor) -> torch.Tensor:
+    """Legal-action log probabilities with action-type count normalization.
+
+    New self-play targets contain a negligible positive floor on every legal
+    action, allowing the target itself to carry its legal mask. Subtracting the
+    log legal count from each action means equal logits give pawn moves and wall
+    moves equal aggregate probability rather than weighting types by branching
+    factor. Legacy targets use their nonzero visit support as a safe fallback.
+    """
+    legal = policy_targets > 0
+    pawn_count = legal[:, :PAWN_ACTIONS].sum(dim=1).clamp_min(1)
+    wall_count = legal[:, PAWN_ACTIONS:].sum(dim=1).clamp_min(1)
+
+    adjusted = policy_logits.clone()
+    adjusted[:, :PAWN_ACTIONS] -= pawn_count.log().unsqueeze(1)
+    adjusted[:, PAWN_ACTIONS:] -= wall_count.log().unsqueeze(1)
+    adjusted = adjusted.masked_fill(~legal, -torch.inf)
+    return F.log_softmax(adjusted, dim=1)
+
+
+def balanced_policy_loss(policy_logits: torch.Tensor,
+                         policy_targets: torch.Tensor) -> torch.Tensor:
+    log_probs = balanced_policy_log_probs(policy_logits, policy_targets)
+    terms = torch.where(policy_targets > 0, policy_targets * log_probs, 0.0)
+    return -terms.sum(dim=1).mean()
 
 
 @dataclass
@@ -290,9 +319,9 @@ def train_az(
 
             policy_logits, value = model(xb)
 
-            # Policy loss: cross-entropy with soft targets (MCTS distribution)
-            log_probs = F.log_softmax(policy_logits, dim=1)
-            policy_loss = -(pb * log_probs).sum(dim=1).mean()
+            # Policy loss: action-type-balanced cross-entropy with the MCTS
+            # distribution. Legal support is encoded by tiny positive targets.
+            policy_loss = balanced_policy_loss(policy_logits, pb)
 
             # Value loss: MSE
             value_loss = F.mse_loss(value, ob)
@@ -332,8 +361,7 @@ def train_az(
                 pb = pb.to(device, non_blocking=pin)
                 ob = ob.to(device, non_blocking=pin)
                 policy_logits, value = model(xb)
-                log_probs = F.log_softmax(policy_logits, dim=1)
-                pl = -(pb * log_probs).sum(dim=1).mean()
+                pl = balanced_policy_loss(policy_logits, pb)
                 vl = F.mse_loss(value, ob)
                 v_ploss += pl.item() * len(xb)
                 v_vloss += vl.item() * len(xb)
