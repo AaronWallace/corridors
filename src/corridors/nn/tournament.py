@@ -27,7 +27,10 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import solver
-from ..game import NCOLS, State, WALLS_PER_PLAYER, apply_move, is_threefold_repetition
+from ..game import (
+    NCOLS, State, WALLS_PER_PLAYER, apply_move, is_threefold_repetition,
+    legal_moves,
+)
 from .az_selfplay import (_THREAD_ENV_VARS, _limit_blas_threads, auto_workers,
                           resolve_device)
 
@@ -125,7 +128,16 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
             return 1.0 if w == 1 else 0.0
         if plies >= max_plies or is_threefold_repetition(states_seen):
             return 0.5
-        mv = movers[state.turn](state, board)
+        try:
+            mv = movers[state.turn](state, board)
+        except RuntimeError as exc:
+            # Defensive fallback for malformed/legacy states. Legal play now
+            # preserves pawn mobility, but one bad game must never abort a full
+            # tournament. Both built-in agents use this exact exception when no
+            # action exists; verify the state before adjudicating the loss.
+            if str(exc) != "no legal moves" or legal_moves(state, board):
+                raise
+            return 0.0 if state.turn == 1 else 1.0
         state = apply_move(state, mv)
         states_seen.append(state)
         plies += 1
@@ -268,8 +280,10 @@ def run_tournament(
     total = len(tasks)
     done = 0
     try:
-        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
-                                 initializer=_worker_init) as pool:
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                   initializer=_worker_init)
+        futures = []
+        try:
             futures = [pool.submit(_pair_game_task, a, b, g, swap, dev, max_plies)
                        for a, b, g, swap in tasks]
             for fut in as_completed(futures):
@@ -278,6 +292,13 @@ def run_tournament(
                 done += 1
                 if on_progress is not None:
                     on_progress(done, total, res)
+        except BaseException:
+            for fut in futures:
+                fut.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
     finally:
         for v, val in saved_env.items():
             if val is None:

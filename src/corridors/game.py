@@ -297,11 +297,11 @@ def _mover(state: State) -> Tuple[Pos, Pos, int]:
     return state.p2, state.p1, state.p2_walls_left
 
 
-def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
-    if state.winner(board) is not None:
-        return []
+def _pawn_moves_unchecked(state: State, board: Board,
+                          blocked_mask: Optional[int] = None) -> List[Pos]:
+    """Physical pawn moves, before checking whether they immobilize the opponent."""
     me, opp, _ = _mover(state)
-    m = blocked_mask_for(state.walls)
+    m = blocked_mask_for(state.walls) if blocked_mask is None else blocked_mask
     # A player's own end-zone row is a one-way starting area: the initial pawn
     # move enters the board, and the pawn may never return to that row. End-zone
     # cells are already disconnected laterally by the adjacency graph.
@@ -317,6 +317,37 @@ def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
             continue
         seen.add(t)
         out.append(t)
+    return out
+
+
+def _has_pawn_move(state: State, board: Board, blocked_mask: int) -> bool:
+    return bool(_pawn_moves_unchecked(state, board, blocked_mask))
+
+
+def _pawn_mobility_edge_mask(state: State) -> int:
+    """Blockable edges whose closure could change this turn's pawn moves."""
+    me, opp, _ = _mover(state)
+    cells = (me, opp) if opp in _ADJ[me] else (me,)
+    mask = 0
+    for cell in cells:
+        for neighbor in _ADJ[cell]:
+            edge = _EDGE_BIT.get(_edge_key(cell, neighbor))
+            if edge is not None:
+                mask |= 1 << edge
+    return mask
+
+
+def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
+    if state.winner(board) is not None:
+        return []
+    blocked = blocked_mask_for(state.walls)
+    out = []
+    for target in _pawn_moves_unchecked(state, board, blocked):
+        child = apply_move(state, ("m", target))
+        # Winning ends the game. Otherwise a pawn may not occupy the opponent's
+        # last usable exit and leave them without any physical pawn move.
+        if child.winner(board) is not None or _has_pawn_move(child, board, blocked):
+            out.append(target)
     return out
 
 
@@ -368,11 +399,29 @@ def legal_wall_moves(state: State, board: Board) -> List[Wall]:
     opp_goal = board.p2_goal if state.turn == 1 else board.p1_goal
     my_path_edges = _shortest_path_edges(me, my_goal, m)
     opp_path_edges = _shortest_path_edges(opp, opp_goal, m)
+    p1_view = replace(state, turn=1)
+    p2_view = replace(state, turn=2)
+    # Adding a wall can only remove moves. A legacy/malformed position that is
+    # already immobilized cannot be repaired by placing another wall.
+    if not _has_pawn_move(p1_view, board, m) or not _has_pawn_move(p2_view, board, m):
+        return []
+    p1_mobility_edges = _pawn_mobility_edge_mask(p1_view)
+    p2_mobility_edges = _pawn_mobility_edge_mask(p2_view)
     out: List[Wall] = []
     for w in ALL_WALLS:
         if w in state.walls or w in conflicting:
             continue
         m2 = m | _WALL_BITMASK[w]
+        # Walls may not immobilize either pawn. Checking both sides also stops
+        # a player from walling in their own pawn and creating a forced no-move
+        # state on the following turn.
+        wall_mask = _WALL_BITMASK[w]
+        if (wall_mask & p1_mobility_edges
+                and not _has_pawn_move(p1_view, board, m2)):
+            continue
+        if (wall_mask & p2_mobility_edges
+                and not _has_pawn_move(p2_view, board, m2)):
+            continue
         if _wall_touches_shortest_path(w, my_path_edges):
             if not has_path(me, my_goal, m2):
                 continue

@@ -44,6 +44,7 @@ checkpoints from `nn_checkpoints`, and supports human-vs-AI and AI-vs-AI games.
 - End-zone rows have no lateral movement. A pawn's first move is straight onto the board, it cannot return to its own end zone, and it may enter the opponent's end zone only at the exact goal cell.
 - Pawns move one step in the 4 compass directions. An adjacent opponent may be jumped only straight ahead when the landing cell is open; side-jumps are not allowed.
 - Each player has 9 walls. Walls span two cells, cannot overlap or cross, and cannot fully cut off either player's path.
+- A move or wall placement may not immobilize a pawn; every player must retain an available pawn move.
 - Reach the opponent's starting cell to win.
 - The third occurrence of an identical position is a draw. Automated games also retain a configurable maximum-ply draw as a safety limit.
 

@@ -54,6 +54,10 @@ def _reference_legal_walls(state, board):
         if wall in state.walls or wall in conflicting:
             continue
         candidate_mask = blocked | game._WALL_BITMASK[wall]
+        if not game._pawn_moves_unchecked(replace(state, turn=1), board, candidate_mask):
+            continue
+        if not game._pawn_moves_unchecked(replace(state, turn=2), board, candidate_mask):
+            continue
         if not _reference_has_path(state.p1, board.p1_goal, candidate_mask):
             continue
         if not _reference_has_path(state.p2, board.p2_goal, candidate_mask):
@@ -265,6 +269,45 @@ def test_side_jump_is_not_allowed_when_straight_jump_is_blocked():
     assert (3, 4) not in moves
     assert (4, 3) not in moves
     assert (4, 5) not in moves
+
+
+def test_pawn_can_retreat_when_the_edge_is_open():
+    board, start = State.start(4, 6)
+    state = replace(start, p1=(5, 4), p2=(2, 8), turn=1)
+    assert (6, 4) in legal_pawn_moves(state, board)
+
+
+def test_pawn_cannot_move_into_opponents_last_exit():
+    board, _ = State.start(4, 4)
+    walls = frozenset({
+        (5, 3, "H"),  # below P1
+        (4, 3, "V"),  # left of P1
+        (5, 4, "V"),  # right of P1
+        (3, 3, "H"),  # blocks a straight jump over P2 after it moves
+    })
+    state = State(
+        p1=(5, 4), p2=(4, 5),
+        p1_walls_left=0, p2_walls_left=0,
+        walls=walls, turn=2,
+    )
+    target = (4, 4)
+    assert target in game._pawn_moves_unchecked(state, board)
+    assert target not in legal_pawn_moves(state, board)
+
+
+def test_wall_cannot_close_opponents_last_pawn_exit():
+    board, _ = State.start(4, 4)
+    final_wall = (5, 3, "H")
+    state = State(
+        p1=(5, 4), p2=(4, 4),
+        p1_walls_left=0, p2_walls_left=1,
+        walls=frozenset({(4, 3, "V"), (5, 4, "V"), (3, 3, "H")}),
+        turn=2,
+    )
+    candidate_mask = blocked_mask_for(state.walls) | game._WALL_BITMASK[final_wall]
+    assert has_path(state.p1, board.p1_goal, candidate_mask)
+    assert has_path(state.p2, board.p2_goal, candidate_mask)
+    assert final_wall not in legal_wall_moves(state, board)
 
 
 def test_bfs_finds_path_on_empty_board():
