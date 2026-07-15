@@ -197,3 +197,35 @@ def test_active_and_archived_lists_are_newest_first(data_root):
     assert ds.archive_dataset("new") is True
     assert ds.archive_dataset("old") is True
     assert [item["name"] for item in ds.list_archived_datasets()] == ["new", "old"]
+
+
+def test_share_moves_nested_dataset_and_keeps_it_trainable(data_root):
+    original = data_root / "alphazero" / "valuable"
+    _write_shard(original)
+    (original / "run.json").write_text(
+        json.dumps({"games": 1, "positions": 1, "selfplay": {"simulations": 200}}),
+        encoding="utf-8",
+    )
+    ds.list_datasets()  # create the machine-local metadata index first
+
+    shared_name = ds.share_dataset("alphazero/valuable")
+
+    assert shared_name == "shared/alphazero/valuable"
+    assert not original.exists()
+    shared = data_root / "shared" / "alphazero" / "valuable"
+    assert (shared / "shard_0000.npz").exists()
+    assert (shared / ds.INDEX_FILENAME).exists()
+    [item] = ds.list_datasets()
+    assert item["name"] == shared_name
+    assert item["kind"] == "alphazero"
+
+
+def test_share_refuses_shared_archive_and_duplicate_destinations(data_root):
+    _write_shard(data_root / "active")
+    _write_shard(data_root / "shared" / "active")
+    _write_shard(data_root / "shared" / "already")
+
+    assert ds.share_dataset("active") is None
+    assert ds.share_dataset("shared/already") is None
+    assert ds.share_dataset("archive/nope") is None
+    assert (data_root / "active").exists()

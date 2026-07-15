@@ -52,3 +52,15 @@ def test_combined_replay_provenance_matches_selected_shards(tmp_path, monkeypatc
     assert provenance["data_shard_names"] == [
         "current/shard_0000.npz", "current/shard_0001.npz",
     ]
+
+
+def test_shared_alphazero_dataset_loads_from_shared_tree(tmp_path, monkeypatch):
+    az_root = tmp_path / "alphazero"
+    monkeypatch.setattr(az_train, "AZ_DATA_ROOT", az_root)
+    _shard(tmp_path, "shared/alphazero/curated", 0, 3, 42)
+
+    states, policies, outcomes = az_train.load_training_data(
+        "shared/alphazero/curated")
+
+    assert len(states) == len(policies) == len(outcomes) == 3
+    assert list(states[:, 0, 0, 0]) == [42, 42, 42]

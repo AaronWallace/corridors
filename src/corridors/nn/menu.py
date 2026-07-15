@@ -405,7 +405,8 @@ def _manage_datasets() -> None:
         return
     _print_datasets(items)
     raw = Prompt.ask(
-        f"[dim]a # to archive, d # to delete, v to view archive ({len(archived)}), "
+        f"[dim]s # to share in Git, a # to archive, d # to delete, "
+        f"v to view archive ({len(archived)}), "
         "or q to go back[/dim]",
         default="q",
     ).strip()
@@ -431,6 +432,15 @@ def _manage_datasets() -> None:
                 console.print(f"[dim]archived {name}[/dim]")
             else:
                 console.print(f"[yellow]could not archive {name}; archived name may exist[/yellow]")
+        return
+    if action.lower() == "s":
+        for item in selected:
+            name = item["name"]
+            shared_name = ds_mod.share_dataset(name)
+            if shared_name:
+                console.print(f"[dim]moved {name} to {shared_name} (Git-shared)[/dim]")
+            else:
+                console.print(f"[yellow]could not share {name}; it may already be shared[/yellow]")
 
 
 def _manage_checkpoints(copy_only: bool = False) -> None:

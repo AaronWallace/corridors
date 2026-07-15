@@ -190,7 +190,9 @@ def _shard_files(name: str, max_positions: int = 0):
     """The shard files that would be loaded for `name`. If max_positions > 0, keep
     the most recent shards whose combined positions reach that many (a rolling
     replay window over the freshest self-play, measured in positions/samples)."""
-    d = AZ_DATA_ROOT / name
+    parts = Path(name).parts
+    d = (AZ_DATA_ROOT.parent / Path(name)
+         if parts[:1] == ("shared",) else AZ_DATA_ROOT / name)
     files = sorted(f for f in d.glob("*.npz") if not f.name.startswith("."))
     if not files:
         raise FileNotFoundError(f"no training data in {d}")

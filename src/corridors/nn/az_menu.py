@@ -775,21 +775,19 @@ def _batch_progress_text(info) -> Text:
 def _train() -> None:
     console = _console()
     from .az_train import (
-        AZ_DATA_ROOT, AZTrainConfig, _resolved_early_stop_min_epochs,
+        AZTrainConfig, _resolved_early_stop_min_epochs,
         _resolved_max_epochs, dataset_provenance, load_training_datasets, train_az,
     )
 
-    if not AZ_DATA_ROOT.exists():
-        console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
-        return
-
     from .menu import _print_datasets
-    run_items = [
-        {**item, "name": item["name"].split("/", 1)[1]}
-        for item in ds_mod.list_datasets()
-        if item.get("kind") == "alphazero"
-        and item["name"].startswith("alphazero/")
-    ]
+    run_items = []
+    for item in ds_mod.list_datasets():
+        if item.get("kind") != "alphazero":
+            continue
+        logical_name = item["name"]
+        load_name = (logical_name.split("/", 1)[1]
+                     if logical_name.startswith("alphazero/") else logical_name)
+        run_items.append({**item, "name": load_name})
     if not run_items:
         console.print("[yellow]no AZ training data — run self-play first.[/yellow]")
         return

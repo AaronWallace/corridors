@@ -30,9 +30,17 @@ corridors_tt.sqlite3-journal
 corridors_tt.sqlite3-wal
 corridors_tt.sqlite3-shm
 
-# NN artifacts. Checkpoints are machine-local except for manually curated models
-# copied into nn_checkpoints/best/ from the checkpoint-management menu.
-nn_data/
+# NN artifacts. Datasets are machine-local except for datasets explicitly moved
+# into nn_data/shared/ from Dataset Manager.
+nn_data/*
+!nn_data/shared/
+!nn_data/shared/**
+nn_data/shared/**/.dataset-index.json
+nn_data/shared/**/*.tmp
+nn_data/shared/**/*.bak
+
+# Checkpoints are machine-local except for manually curated models copied into
+# nn_checkpoints/best/ from the checkpoint-management menu.
 nn_checkpoints/*
 !nn_checkpoints/best/
 !nn_checkpoints/best/**

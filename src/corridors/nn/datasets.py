@@ -28,6 +28,7 @@ import numpy as np
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 DATA_ROOT = _PROJECT_ROOT / "nn_data"
 ARCHIVE_DIRNAME = "archive"
+SHARED_DIRNAME = "shared"
 INDEX_FILENAME = ".dataset-index.json"
 INDEX_VERSION = 1
 
@@ -47,6 +48,10 @@ def dataset_dir(name: str) -> Path:
 
 def archive_root() -> Path:
     return DATA_ROOT / ARCHIVE_DIRNAME
+
+
+def shared_root() -> Path:
+    return DATA_ROOT / SHARED_DIRNAME
 
 
 def _index_path(d: Path) -> Path:
@@ -442,16 +447,11 @@ def list_datasets() -> List[Dict]:
     out: List[Dict] = []
     if not DATA_ROOT.exists():
         return out
-    for d in sorted(DATA_ROOT.iterdir()):
-        if not d.is_dir() or d.name == ARCHIVE_DIRNAME:
+    for d in DATA_ROOT.rglob("*"):
+        if not d.is_dir() or archive_root() == d or archive_root() in d.parents:
             continue
         if is_dataset_dir(d):
-            out.append(_dataset_entry(d, d.name))
-            continue
-        # Container: surface its nested runs individually.
-        for sub in sorted(d.iterdir()):
-            if is_dataset_dir(sub):
-                out.append(_dataset_entry(sub, f"{d.name}/{sub.name}"))
+            out.append(_dataset_entry(d, d.relative_to(DATA_ROOT).as_posix()))
     out.sort(key=lambda item: (-item["modified"], item["name"]))
     return out
 
@@ -501,6 +501,22 @@ def archive_dataset(name: str) -> bool:
     shutil.move(str(source), str(target))
     _remove_empty_parents(source, DATA_ROOT)
     return True
+
+
+def share_dataset(name: str) -> Optional[str]:
+    """Move an active dataset into the Git-visible shared tree."""
+    parts = Path(name).parts
+    if not parts or parts[0] in (ARCHIVE_DIRNAME, SHARED_DIRNAME):
+        return None
+    source = _safe_named_path(DATA_ROOT, name)
+    shared_name = f"{SHARED_DIRNAME}/{Path(name).as_posix()}"
+    target = _safe_named_path(DATA_ROOT, shared_name)
+    if source is None or target is None or not is_dataset_dir(source) or target.exists():
+        return None
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(target))
+    _remove_empty_parents(source, DATA_ROOT)
+    return shared_name
 
 
 def restore_dataset(name: str) -> bool:

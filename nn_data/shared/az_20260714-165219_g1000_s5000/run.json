@@ -1,0 +1,28 @@
+{
+  "name": "az_20260714-165219_g1000_s5000",
+  "games": 124,
+  "positions": 6511,
+  "selfplay": {
+    "num_games": 1000,
+    "simulations": 5000,
+    "min_mcts": 0,
+    "max_mcts": 0,
+    "mcts_bias": 3.0,
+    "workers": 14,
+    "concurrent_games": 10,
+    "batch_size": 8,
+    "inference_servers": 1,
+    "temperature_moves": 10,
+    "temp_high": 1.0,
+    "temp_low": 0.1,
+    "max_plies": 150,
+    "checkpoint": "aaron_fresh_001_best",
+    "device": "cuda",
+    "dirichlet_alpha": 0.3,
+    "dirichlet_frac": 0.25,
+    "c_puct": 1.5
+  },
+  "policy_balance": "pawn_wall_action_type_v1",
+  "legal_policy_support": "positive_epsilon_v1",
+  "mode": "standalone"
+}
