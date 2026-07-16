@@ -28,7 +28,7 @@ from ..game import (
     NCOLS, WALLS_PER_PLAYER, State, apply_move, is_threefold_repetition,
 )
 from .actions import NUM_ACTIONS, move_to_index
-from .encoding import NROWS, NUM_PLANES, encode_state
+from .encoding import NROWS, NUM_PLANES, encode_state, pack_state, unpack_states_batch
 
 # Sentinel values for the inference queue
 _SHUTDOWN = None
@@ -303,10 +303,12 @@ def _inference_server(
     use_fp16: bool = False,
     batch_timeout: float = _BATCH_TIMEOUT,
 ) -> None:
-    """Batched inference process. Reads (worker_id, tensor) from request_queue,
-    runs forward pass, sends grouped [(req_id, policy, value), ...] lists back
-    via per-worker response queues (one put per worker per batch — per-item
-    puts cost ~15us each and stall the drain loop)."""
+    """Batched inference process. Reads (worker_id, req_id, packed_state) from
+    request_queue — packed via pack_state, 23 bytes vs 3.6 KB for the encoded
+    tensor, since request unpickling is the per-position bottleneck — runs a
+    forward pass, sends grouped [(req_id, policy, value), ...] lists back via
+    per-worker response queues (one put per worker per batch — per-item puts
+    cost ~15us each and stall the drain loop)."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -322,12 +324,12 @@ def _inference_server(
         model = model.half()
 
     workers_done = 0
-    pending: List[Tuple[int, int, np.ndarray]] = []  # (worker_id, req_id, tensor)
+    pending: List[Tuple[int, int, bytes]] = []  # (worker_id, req_id, packed state)
 
     def _flush_batch():
         if not pending:
             return
-        batch_np = np.stack([t for _, _, t in pending])
+        batch_np = unpack_states_batch([t for _, _, t in pending])
         with torch.no_grad():
             x = torch.from_numpy(batch_np).to(device)
             if use_fp16:
@@ -522,13 +524,12 @@ def _game_worker(
                     slot[0].set()
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
-        tensor = encode_state(state, board)
         rid = next(req_ids)
         ev = threading.Event()
         slot = [ev, None]
         with slots_lock:
             slots[rid] = slot
-        request_queue.put((worker_id, rid, tensor))
+        request_queue.put((worker_id, rid, pack_state(state, board)))
         ev.wait()
         with slots_lock:
             del slots[rid]
@@ -1131,7 +1132,7 @@ def _inference_server_persistent(
     from .az_net import AZNet, load_checkpoint as load_az
 
     model = None
-    pending: List[Tuple[int, int, np.ndarray]] = []
+    pending: List[Tuple[int, int, bytes]] = []  # (worker_id, req_id, packed state)
     pending_since = 0.0
     metrics = {}
 
@@ -1161,7 +1162,7 @@ def _inference_server_persistent(
             metrics["full_batches"] += 1
         elif reason == "timeout":
             metrics["timeout_batches"] += 1
-        batch_np = np.stack([t for _, _, t in pending])
+        batch_np = unpack_states_batch([t for _, _, t in pending])
         infer_t0 = time.monotonic()
         with torch.inference_mode():
             x = torch.from_numpy(batch_np).to(device)
@@ -1271,14 +1272,13 @@ def _game_worker_persistent(
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
         nonlocal eval_requests, inference_wait_s
-        tensor = encode_state(state, board)
         rid = next(req_ids)
         ev = threading.Event()
         slot = [ev, None]
         with slots_lock:
             slots[rid] = slot
         wait_t0 = time.monotonic()
-        request_queue.put((worker_id, rid, tensor))
+        request_queue.put((worker_id, rid, pack_state(state, board)))
         ev.wait()
         waited = time.monotonic() - wait_t0
         with metric_lock:
