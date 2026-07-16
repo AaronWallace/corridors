@@ -22,9 +22,21 @@ from .az_selfplay import (
 
 
 def gpu_configurations(batch_size: int, workers: int) -> List[Tuple[int, int]]:
-    """Portable comparison around the detected VRAM-based batch recommendation."""
+    """Portable comparison around the detected VRAM-based batch recommendation.
+
+    Sweeps batch size at auto concurrency, plus higher-concurrency variants at
+    the recommended batch: on wide GPUs throughput is usually bound by games
+    in flight (workers x concurrency), not batch size, and the auto value is
+    conservatively capped.
+    """
     batches = sorted({max(8, batch_size // 2), batch_size, batch_size * 2})
-    return [(batch, _auto_concurrency(batch, workers)) for batch in batches]
+    auto = _auto_concurrency(batch_size, workers)
+    configs = [(batch, _auto_concurrency(batch, workers)) for batch in batches]
+    for scale in (2, 3):
+        candidate = (batch_size, min(64, auto * scale))
+        if candidate not in configs:
+            configs.append(candidate)
+    return configs
 
 
 def cpu_configurations(workers: int) -> List[int]:
