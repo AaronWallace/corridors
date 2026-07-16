@@ -229,6 +229,10 @@ class SelfPlayConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_frac: float = 0.25
     c_puct: float = 1.5
+    # GPU inference in half precision (~1.6x server throughput on consumer
+    # cards). Off by default: logits shift at noise level (~1e-1 on raw
+    # logits), which is harmless but no longer bit-reproducible vs fp32.
+    inference_fp16: bool = False
 
 
 def mcts_budget_bounds(config: SelfPlayConfig) -> Tuple[int, int]:
@@ -284,9 +288,12 @@ def _inference_server(
     device: str,
     batch_size: int,
     num_workers: int,
+    use_fp16: bool = False,
 ) -> None:
     """Batched inference process. Reads (worker_id, tensor) from request_queue,
-    runs forward pass, sends (policy, value) back via per-worker response queues."""
+    runs forward pass, sends grouped [(req_id, policy, value), ...] lists back
+    via per-worker response queues (one put per worker per batch — per-item
+    puts cost ~15us each and stall the drain loop)."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -298,6 +305,8 @@ def _inference_server(
     else:
         model = AZNet().to(device)
         model.eval()
+    if use_fp16:
+        model = model.half()
 
     workers_done = 0
     pending: List[Tuple[int, int, np.ndarray]] = []  # (worker_id, req_id, tensor)
@@ -308,11 +317,17 @@ def _inference_server(
         batch_np = np.stack([t for _, _, t in pending])
         with torch.no_grad():
             x = torch.from_numpy(batch_np).to(device)
+            if use_fp16:
+                x = x.half()
             policy_logits, values = model(x)
-            policy_np = policy_logits.cpu().numpy()
-            values_np = values.cpu().numpy()
+            policy_np = policy_logits.float().cpu().numpy()
+            values_np = values.float().cpu().numpy()
+        by_worker: Dict[int, list] = {}
         for i, (wid, rid, _) in enumerate(pending):
-            response_queues[wid].put((rid, policy_np[i], float(values_np[i])))
+            by_worker.setdefault(wid, []).append(
+                (rid, policy_np[i], float(values_np[i])))
+        for wid, items in by_worker.items():
+            response_queues[wid].put(items)
         pending.clear()
 
     while workers_done < num_workers:
@@ -322,13 +337,20 @@ def _inference_server(
             _flush_batch()
             continue
 
-        if item is _SHUTDOWN:
-            workers_done += 1
-            continue
-
-        pending.append(item)
-        if len(pending) >= batch_size:
-            _flush_batch()
+        # Drain whatever is already queued before considering a flush — a
+        # timed get costs far more than get_nowait, and requests arrive in
+        # bursts from `concurrency` blocked game threads per worker.
+        while True:
+            if item is _SHUTDOWN:
+                workers_done += 1
+            else:
+                pending.append(item)
+                if len(pending) >= batch_size:
+                    _flush_batch()
+            try:
+                item = request_queue.get_nowait()
+            except Exception:
+                break
 
     _flush_batch()
 
@@ -476,14 +498,15 @@ def _game_worker(
     def _reader() -> None:
         while not stop_reader.is_set():
             try:
-                rid, policy, value = response_queue.get(timeout=0.2)
+                items = response_queue.get(timeout=0.2)
             except Exception:
                 continue
-            with slots_lock:
-                slot = slots.get(rid)
-            if slot is not None:
-                slot[1] = (policy, value)
-                slot[0].set()
+            for rid, policy, value in items:
+                with slots_lock:
+                    slot = slots.get(rid)
+                if slot is not None:
+                    slot[1] = (policy, value)
+                    slot[0].set()
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
         tensor = encode_state(state, board)
@@ -879,7 +902,7 @@ def run_selfplay(
             server = ctx.Process(
                 target=_inference_server,
                 args=(request_queue, response_queues, config.checkpoint, device,
-                      config.batch_size, num_workers),
+                      config.batch_size, num_workers, config.inference_fp16),
                 daemon=True,
             )
             server.start()
@@ -1080,10 +1103,12 @@ def _inference_server_persistent(
     ack_queue: mp.Queue,
     device: str,
     batch_size: int,
+    use_fp16: bool = False,
 ) -> None:
     """Long-lived batched inference server. Services eval requests and, between
     rounds, handles control messages: ("__cmd__","reload",ckpt) reloads the model
-    and acks; ("__cmd__","stop",_) exits. Blocks (no busy-spin) while idle."""
+    and acks; ("__cmd__","stop",_) exits. Blocks (no busy-spin) while idle.
+    Responses are grouped per worker: [(req_id, policy, value), ...]."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
@@ -1125,16 +1150,23 @@ def _inference_server_persistent(
         infer_t0 = time.monotonic()
         with torch.inference_mode():
             x = torch.from_numpy(batch_np).to(device)
+            if use_fp16:
+                x = x.half()
             policy_logits, values = model(x)
-            policy_np = policy_logits.cpu().numpy()
-            values_np = values.cpu().numpy()
+            policy_np = policy_logits.float().cpu().numpy()
+            values_np = values.float().cpu().numpy()
         metrics["inference_s"] += time.monotonic() - infer_t0
+        by_worker: Dict[int, list] = {}
         for i, (wid, rid, _) in enumerate(pending):
-            response_queues[wid].put((rid, policy_np[i], float(values_np[i])))
+            by_worker.setdefault(wid, []).append(
+                (rid, policy_np[i], float(values_np[i])))
+        for wid, items in by_worker.items():
+            response_queues[wid].put(items)
         pending.clear()
         pending_since = 0.0
 
-    while True:
+    stop = False
+    while not stop:
         # Use a short timeout only when a partial batch is waiting to be flushed;
         # otherwise block so an idle server (e.g. during training) doesn't spin.
         if pending:
@@ -1146,35 +1178,42 @@ def _inference_server_persistent(
         else:
             item = request_queue.get()
 
-        if item[0] == _CMD_TAG:
-            _flush_batch()
-            _, sub, arg = item
-            if sub == "reload":
-                if arg:
-                    model = load_az(arg, device=device)
-                else:
-                    model = AZNet().to(device)
-                    model.eval()
-                _reset_metrics()
-                ack_queue.put("ready")
-                continue
-            if sub == "stats":
-                result = dict(metrics)
-                result["avg_batch"] = (
-                    result["positions"] / result["batches"]
-                    if result["batches"] else 0.0
-                )
-                ack_queue.put(result)
-                continue
-            if sub == "stop":
+        # Drain everything already queued before going back to a (much more
+        # expensive) timed get — requests arrive in bursts.
+        while True:
+            if item[0] == _CMD_TAG:
+                _flush_batch()
+                _, sub, arg = item
+                if sub == "reload":
+                    if arg:
+                        model = load_az(arg, device=device)
+                    else:
+                        model = AZNet().to(device)
+                        model.eval()
+                    if use_fp16:
+                        model = model.half()
+                    _reset_metrics()
+                    ack_queue.put("ready")
+                elif sub == "stats":
+                    result = dict(metrics)
+                    result["avg_batch"] = (
+                        result["positions"] / result["batches"]
+                        if result["batches"] else 0.0
+                    )
+                    ack_queue.put(result)
+                elif sub == "stop":
+                    stop = True
+                    break
+            else:
+                if not pending:
+                    pending_since = time.monotonic()
+                pending.append(item)
+                if len(pending) >= batch_size:
+                    _flush_batch("full")
+            try:
+                item = request_queue.get_nowait()
+            except Exception:
                 break
-            continue
-
-        if not pending:
-            pending_since = time.monotonic()
-        pending.append(item)
-        if len(pending) >= batch_size:
-            _flush_batch("full")
 
 
 def _game_worker_persistent(
@@ -1205,14 +1244,15 @@ def _game_worker_persistent(
     def _reader() -> None:
         while not stop_reader.is_set():
             try:
-                rid, policy, value = response_queue.get(timeout=0.2)
+                items = response_queue.get(timeout=0.2)
             except Exception:
                 continue
-            with slots_lock:
-                slot = slots.get(rid)
-            if slot is not None:
-                slot[1] = (policy, value)
-                slot[0].set()
+            for rid, policy, value in items:
+                with slots_lock:
+                    slot = slots.get(rid)
+                if slot is not None:
+                    slot[1] = (policy, value)
+                    slot[0].set()
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
         nonlocal eval_requests, inference_wait_s
@@ -1383,7 +1423,8 @@ class SelfPlayPool:
                     srv = ctx.Process(
                         target=_inference_server_persistent,
                         args=(self.request_queues[s], self.response_queues,
-                              self.ack_queue, self.device, config.batch_size),
+                              self.ack_queue, self.device, config.batch_size,
+                              config.inference_fp16),
                         daemon=True,
                     )
                     srv.start()
