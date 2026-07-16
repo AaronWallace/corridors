@@ -17,6 +17,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
+from . import datasets as ds_mod
 from .checkpoints import (
     checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths,
     resolve_checkpoint_path,
@@ -308,7 +309,6 @@ def _arena_matchup_table(incumbent: str, candidate: str) -> Table:
 def _select_seed_datasets(current_run: str) -> list[str]:
     """Select compatible existing AZ runs for the first loop iteration only."""
     console = _console()
-    from . import datasets as ds_mod
     from .menu import _numbered_selections, _print_datasets
 
     current_name = f"alphazero/{current_run}"
