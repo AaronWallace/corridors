@@ -299,6 +299,27 @@ class GameRecord:
 # Inference server — runs on GPU
 # ---------------------------------------------------------------------------
 
+def _emergency_respond(take, response_queues, exc: BaseException) -> None:
+    """Last-resort reply after an inference failure: uniform logits and a
+    neutral value. Game threads block forever on unanswered requests, so a
+    degraded answer (logged loudly) beats a silently hung pipeline."""
+    import sys
+    import traceback
+    print(f"inference server: batch of {len(take)} failed with "
+          f"{type(exc).__name__}: {exc}; answering with uniform priors",
+          file=sys.stderr, flush=True)
+    traceback.print_exc()
+    zeros = np.zeros(NUM_ACTIONS, dtype=np.float32)
+    by_worker: Dict[int, list] = {}
+    for wid, rid, _ in take:
+        by_worker.setdefault(wid, []).append((rid, zeros, 0.0))
+    for wid, items in by_worker.items():
+        try:
+            response_queues[wid].put(items)
+        except Exception:
+            pass
+
+
 def _try_compile(model):
     """torch.compile with CUDA-graph capture, or the eager model unchanged
     where the compile stack (Triton) is unavailable."""
@@ -413,7 +434,12 @@ def _inference_server(
                 take = buf[:batch_size]
                 del buf[:batch_size]
             if take:
-                _respond(take)
+                try:
+                    _respond(take)
+                except Exception as exc:
+                    # This thread dying would strand every in-flight request
+                    # (workers block on per-request Events) — never let it.
+                    _emergency_respond(take, response_queues, exc)
 
     infer = threading.Thread(target=_infer_loop, daemon=True)
     infer.start()
@@ -1389,7 +1415,13 @@ def _inference_server_persistent(
                 if _handle_cmd(cmd):
                     return
             elif take:
-                _respond(take, waited, reason)
+                try:
+                    _respond(take, waited, reason)
+                except Exception as exc:
+                    # This thread dying would strand every in-flight request
+                    # (workers block on per-request Events) — never let it.
+                    metrics["eval_errors"] = metrics.get("eval_errors", 0) + 1
+                    _emergency_respond(take, response_queues, exc)
 
     infer = threading.Thread(target=_infer_loop, daemon=True)
     infer.start()
