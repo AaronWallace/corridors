@@ -14,26 +14,34 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from ..game import Board, Move, State, apply_move, legal_moves
+from ..game import Board, Move, State, apply_move
 from .actions import NUM_ACTIONS, legal_move_mask
 
 C_PUCT = 1.5
 DIRICHLET_ALPHA = 0.3
 DIRICHLET_FRAC = 0.25
 LEGAL_TARGET_EPSILON = 1e-8
+# Cap for the optional per-game expansion cache (legal moves + priors per
+# state). Entries share interned Move tuples, so ~3 KB each worst case.
+EXPANSION_CACHE_MAX = 20_000
+
+# state -> (moves, action-index array, prior array). See run_mcts's
+# expansion_cache parameter.
+ExpansionCache = Dict[State, Tuple[List[Move], np.ndarray, np.ndarray]]
 
 
 def _action_type_groups(moves: Sequence[Move]) -> Tuple[np.ndarray, ...]:
     """Indices grouped as pawn moves and wall moves, omitting empty groups."""
-    pawn = np.fromiter((i for i, move in enumerate(moves) if move[0] == "m"),
-                       dtype=np.intp)
-    wall = np.fromiter((i for i, move in enumerate(moves) if move[0] == "w"),
-                       dtype=np.intp)
-    return tuple(group for group in (pawn, wall) if len(group))
+    pawn: List[int] = []
+    wall: List[int] = []
+    for i, move in enumerate(moves):
+        (pawn if move[0] == "m" else wall).append(i)
+    return tuple(np.asarray(group, dtype=np.intp)
+                 for group in (pawn, wall) if group)
 
 
 def _balanced_priors(logits: np.ndarray, moves: Sequence[Move]) -> np.ndarray:
@@ -61,7 +69,7 @@ class Node:
         self.terminal_value = 0.0
         self.children: Optional[List[Optional[Node]]] = None
         self.child_moves: Optional[List[Move]] = None
-        self.child_indices: Optional[List[int]] = None
+        self.child_indices: Optional[np.ndarray] = None  # action indices (intp)
         self.N: Optional[np.ndarray] = None  # visit counts per child
         self.W: Optional[np.ndarray] = None  # total value per child
         self.P: Optional[np.ndarray] = None  # prior probability per child
@@ -76,22 +84,37 @@ class Node:
     def expanded(self) -> bool:
         return self.children is not None
 
-    def expand(self, policy_logits: np.ndarray) -> None:
-        """Expand this node using the network's policy output."""
-        moves, indices = legal_move_mask(self.state, self.board)
-        if not moves:
-            self.is_terminal = True
-            self.terminal_value = -1.0  # no moves = loss
-            return
+    def expand(self, policy_logits: np.ndarray,
+               cache: Optional[ExpansionCache] = None) -> None:
+        """Expand this node using the network's policy output.
 
-        priors = _balanced_priors(policy_logits[indices], moves)
+        cache: optional per-game state -> (moves, indices, priors) memo.
+        Legal-move generation is the most expensive part of a simulation, and
+        transpositions re-reach the same state often, so hits skip it (and the
+        prior computation) entirely. Only valid when evaluate_fn is
+        deterministic per state within the game, which self-play guarantees.
+        """
+        cached = cache.get(self.state) if cache is not None else None
+        if cached is not None:
+            moves, indices, priors = cached
+        else:
+            moves, index_list = legal_move_mask(self.state, self.board)
+            if not moves:
+                self.is_terminal = True
+                self.terminal_value = -1.0  # no moves = loss
+                return
+            indices = np.asarray(index_list, dtype=np.intp)
+            priors = _balanced_priors(policy_logits[indices], moves)
+            if cache is not None and len(cache) < EXPANSION_CACHE_MAX:
+                cache[self.state] = (moves, indices, priors)
 
         self.child_moves = moves
         self.child_indices = indices
         self.children = [None] * len(moves)
         self.N = np.zeros(len(moves), dtype=np.float32)
         self.W = np.zeros(len(moves), dtype=np.float32)
-        self.P = priors.astype(np.float32)
+        # Copy: Dirichlet noise and cache entries must never share storage.
+        self.P = priors.astype(np.float32, copy=True)
 
     def add_dirichlet_noise(self, alpha: float = DIRICHLET_ALPHA,
                             frac: float = DIRICHLET_FRAC) -> None:
@@ -109,10 +132,12 @@ class Node:
 
     def select_child(self, c_puct: float = C_PUCT) -> int:
         """PUCT selection — returns child index."""
+        n = self.N
         sqrt_total = math.sqrt(self.n_total + 1)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            q = np.where(self.N > 0, self.W / self.N, 0.0)
-        u = c_puct * self.P * sqrt_total / (1 + self.N)
+        # W is 0 wherever N is 0, so dividing by max(N, 1) gives exactly the
+        # old where(N > 0, W/N, 0) without the (slow) errstate guard.
+        q = self.W / np.maximum(n, 1.0)
+        u = c_puct * self.P * sqrt_total / (1 + n)
         return int(np.argmax(q + u))
 
     def backup(self, child_idx: int, value: float) -> None:
@@ -135,6 +160,7 @@ def run_mcts(
     dirichlet_frac: float = DIRICHLET_FRAC,
     state_history: Optional[Sequence[State]] = None,
     remaining_plies: Optional[int] = None,
+    expansion_cache: Optional[ExpansionCache] = None,
 ) -> Tuple[np.ndarray, float, Optional[Move], Optional["Node"]]:
     """Run MCTS from root_state.
     Returns (policy_target, root_value, selected_move, selected_child).
@@ -155,6 +181,11 @@ def run_mcts(
     remaining_plies: optional number of moves before the game's maximum-ply
         draw. Simulations reaching that horizon are scored as draws, except
         when the final move wins the game.
+
+    expansion_cache: optional per-game dict memoizing legal moves and priors
+        by state (see Node.expand). Share one dict across all run_mcts calls
+        of a game; do not share across games (goals differ) or across
+        nondeterministic evaluate_fn implementations.
 
     policy_target: normalized visit counts over the 227-action space (training target).
     root_value: average value at root after all simulations.
@@ -178,7 +209,7 @@ def run_mcts(
 
     if not root.expanded:
         policy, value = evaluate_fn(root_state, board)
-        root.expand(policy)
+        root.expand(policy, expansion_cache)
         if root.is_terminal:  # no legal moves
             pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
             return pi, root.terminal_value, None, None
@@ -187,10 +218,11 @@ def run_mcts(
         root.add_dirichlet_noise(dirichlet_alpha, dirichlet_frac)
 
     # Top up to num_simulations total visits — reused visits already count.
+    history_get = history_counts.get
     while root.n_total < num_simulations:
         node = root
         path: List[Tuple[Node, int]] = []
-        path_counts: Counter[State] = Counter()
+        path_counts: Dict[State, int] = {}
         adjudicated_draw = False
 
         # Selection — descend to a leaf
@@ -205,15 +237,16 @@ def run_mcts(
                 node.children[ci] = child
             node = child
 
-            path_counts[node.state] += 1
-            occurrences = history_counts[node.state] + path_counts[node.state]
-            if not node.is_terminal and occurrences >= 3:
-                adjudicated_draw = True
-                break
-            if (not node.is_terminal and remaining_plies is not None
-                    and len(path) >= remaining_plies):
-                adjudicated_draw = True
-                break
+            if not node.is_terminal:
+                s = node.state
+                occurrences = path_counts.get(s, 0) + 1
+                path_counts[s] = occurrences
+                if history_get(s, 0) + occurrences >= 3:
+                    adjudicated_draw = True
+                    break
+                if remaining_plies is not None and len(path) >= remaining_plies:
+                    adjudicated_draw = True
+                    break
 
         # Evaluation
         if adjudicated_draw:
@@ -222,7 +255,7 @@ def run_mcts(
             leaf_value = node.terminal_value
         else:
             p, v = evaluate_fn(node.state, node.board)
-            node.expand(p)
+            node.expand(p, expansion_cache)
             leaf_value = float(v)
 
         # Backup — alternate sign as we go up (each level is the opponent)
@@ -231,13 +264,12 @@ def run_mcts(
             parent.backup(ci, value)
             value = -value
 
-    # Build policy target from root visit counts
+    # Build policy target from root visit counts. A negligible positive floor
+    # records the exact legal-action mask in the policy target. Training uses
+    # it to apply the same action-type normalization without storing a
+    # separate 227-element mask.
     pi = np.zeros(NUM_ACTIONS, dtype=np.float32)
-    for i, idx in enumerate(root.child_indices):
-        # A negligible positive floor records the exact legal-action mask in
-        # the policy target. Training uses it to apply the same action-type
-        # normalization without storing a separate 227-element mask.
-        pi[idx] = max(float(root.N[i]), LEGAL_TARGET_EPSILON)
+    pi[root.child_indices] = np.maximum(root.N, LEGAL_TARGET_EPSILON)
 
     # Select move
     if temperature < 0.01:
@@ -248,6 +280,12 @@ def run_mcts(
         counts = root.N.copy()
         if temperature != 1.0:
             counts = counts ** (1.0 / temperature)
+            if not np.all(np.isfinite(counts)):
+                # Large budgets at low temperature can overflow float32
+                # (e.g. 10000^10). Renormalizing by the max first is exact
+                # for the sampling distribution and cannot overflow.
+                counts = (root.N.astype(np.float64) / root.N.max())
+                counts **= (1.0 / temperature)
         s = counts.sum()
         if s <= 0:
             best = int(np.argmax(root.N))

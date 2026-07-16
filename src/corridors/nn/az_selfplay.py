@@ -362,6 +362,8 @@ def _play_one_game(
     # position rarely recurs across games, and a cross-process cache would just
     # reintroduce IPC contention.
     eval_cache = {}
+    # Companion memo for legal moves + priors (also per-game, keyed by state).
+    expansion_cache = {}
 
     def cached_eval(st: State, bd) -> Tuple[np.ndarray, float]:
         hit = eval_cache.get(st)
@@ -401,6 +403,7 @@ def _play_one_game(
             dirichlet_frac=config.dirichlet_frac,
             state_history=state_history,
             remaining_plies=config.max_plies - ply,
+            expansion_cache=expansion_cache,
         )
         if move is None:
             record.winner = 2 if state.turn == 1 else 1
@@ -995,6 +998,7 @@ def run_selfplay_single(
             state_history = [state]
             reuse = None
             eval_cache = {}
+            expansion_cache = {}
 
             def cached_eval(st, bd, _c=eval_cache):
                 hit = _c.get(st)
@@ -1022,7 +1026,8 @@ def run_selfplay_single(
                                               dirichlet_alpha=config.dirichlet_alpha,
                                               dirichlet_frac=config.dirichlet_frac,
                                               state_history=state_history,
-                                              remaining_plies=config.max_plies - ply)
+                                              remaining_plies=config.max_plies - ply,
+                                              expansion_cache=expansion_cache)
                 if move is None:
                     winner = 2 if state.turn == 1 else 1
                     break

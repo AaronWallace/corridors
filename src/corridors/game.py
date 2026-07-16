@@ -14,7 +14,7 @@ orientation, each blocking two edges. Walls never sit on the goal-entry edges.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Tuple
 
@@ -47,7 +47,6 @@ def _edge_key(a: Pos, b: Pos) -> Tuple[Pos, Pos]:
 
 _EDGE_BIT: Dict[Tuple[Pos, Pos], int] = {}
 _ADJ: Dict[Pos, Tuple[Pos, ...]] = {}
-_CELL_NEIGHBORS: Tuple[Tuple[Tuple[int, int], ...], ...] = ()
 
 
 def _init_edges() -> None:
@@ -85,26 +84,28 @@ _init_edges()
 NUM_EDGE_BITS = len(_EDGE_BIT)
 
 
-def _init_cell_neighbors() -> Tuple[Tuple[Tuple[int, int], ...], ...]:
-    """Precompute compact adjacency for bitset reachability searches.
+_DIRS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
-    Each entry is ``(neighbor_cell_bit, blocking_edge_bit)``. End-zone entry
-    edges cannot be blocked and therefore use a zero blocking mask.
-    """
-    out = []
-    for r in range(NROWS):
-        for c in range(NCOLS):
-            cell = (r, c)
-            neighbors = []
-            for nb in _ADJ[cell]:
-                edge_idx = _EDGE_BIT.get(_edge_key(cell, nb))
-                edge_mask = 0 if edge_idx is None else 1 << edge_idx
-                neighbors.append((1 << (nb[0] * NCOLS + nb[1]), edge_mask))
-            out.append(tuple(neighbors))
-    return tuple(out)
+# (a, b) -> bitmask of the blockable edge between adjacent cells a and b
+# (0 for end-zone entry edges, which walls can never block). Both orderings
+# are present, so a single dict get replaces valid() + _edge_open().
+_EDGE_MASK: Dict[Tuple[Pos, Pos], int] = {}
+# cell -> OR of the blockable-edge masks of all edges touching that cell.
+_CELL_EDGE_MASK: Dict[Pos, int] = {}
 
 
-_CELL_NEIGHBORS = _init_cell_neighbors()
+def _init_edge_masks() -> None:
+    for a, neighbors in _ADJ.items():
+        cell_mask = 0
+        for b in neighbors:
+            bit = _EDGE_BIT.get(_edge_key(a, b))
+            mask = 0 if bit is None else 1 << bit
+            _EDGE_MASK[(a, b)] = mask
+            cell_mask |= mask
+        _CELL_EDGE_MASK[a] = cell_mask
+
+
+_init_edge_masks()
 
 
 def _wall_edges(w: Wall) -> Tuple[Tuple[Pos, Pos], Tuple[Pos, Pos]]:
@@ -146,6 +147,10 @@ def _init_walls() -> None:
 
 _init_walls()
 ALL_WALLS: Tuple[Wall, ...] = tuple(_ALL_WALLS)
+# (wall, edge-bitmask) pairs in ALL_WALLS order — avoids a dict lookup per
+# candidate in the legal_wall_moves hot loop.
+_WALL_MASK_ITEMS: Tuple[Tuple[Wall, int], ...] = tuple(
+    (w, _WALL_BITMASK[w]) for w in ALL_WALLS)
 
 
 def blocked_mask_for(walls) -> int:
@@ -175,29 +180,55 @@ def _dist_table_from(goal: Pos, blocked_mask: int) -> Dict[Pos, int]:
     return dist
 
 
+# goal -> per-cell neighbor tuples (nb_idx, nb_bit, edge_mask), ordered
+# farthest-from-goal first so a LIFO stack pops the most goal-ward neighbor
+# first. Built lazily per goal cell (at most 99 goals, tiny tables).
+_GOAL_ORDERED_NEIGHBORS: Dict[Pos, Tuple[Tuple[Tuple[int, int, int], ...], ...]] = {}
+
+
+def _neighbors_ordered_for(goal: Pos) -> Tuple[Tuple[Tuple[int, int, int], ...], ...]:
+    dist = _dist_table_from(goal, 0)
+    far = max(dist.values()) + 1
+    table = []
+    for r in range(NROWS):
+        for c in range(NCOLS):
+            cell = (r, c)
+            entries = []
+            for nb in _ADJ[cell]:
+                nb_idx = nb[0] * NCOLS + nb[1]
+                entries.append((dist.get(nb, far), nb_idx, 1 << nb_idx,
+                                _EDGE_MASK[(cell, nb)]))
+            entries.sort(key=lambda e: -e[0])
+            table.append(tuple(e[1:] for e in entries))
+    result = tuple(table)
+    _GOAL_ORDERED_NEIGHBORS[goal] = result
+    return result
+
+
 def has_path(start: Pos, goal: Pos, blocked_mask: int) -> bool:
-    """Return whether start can reach goal using an allocation-light bitset BFS."""
+    """Return whether start can reach goal.
+
+    Uses a goal-directed depth-first search: neighbors are pre-ordered by
+    unwalled distance to the goal, so when a path exists (the common case for
+    wall-legality checks) it is found in roughly path-length steps instead of
+    a full breadth-first flood. Exact — falls back to exhausting the whole
+    reachable component before answering False.
+    """
     if start == goal:
         return True
-    start_bit = 1 << (start[0] * NCOLS + start[1])
-    goal_bit = 1 << (goal[0] * NCOLS + goal[1])
-    seen = start_bit
-    frontier = start_bit
-    while frontier:
-        nxt = 0
-        cells = frontier
-        while cells:
-            cell_bit = cells & -cells
-            cells ^= cell_bit
-            cell_idx = cell_bit.bit_length() - 1
-            for neighbor_bit, edge_mask in _CELL_NEIGHBORS[cell_idx]:
-                if seen & neighbor_bit or edge_mask & blocked_mask:
-                    continue
-                if neighbor_bit == goal_bit:
-                    return True
-                seen |= neighbor_bit
-                nxt |= neighbor_bit
-        frontier = nxt
+    neighbors = (_GOAL_ORDERED_NEIGHBORS.get(goal)
+                 or _neighbors_ordered_for(goal))
+    goal_idx = goal[0] * NCOLS + goal[1]
+    seen = 1 << (start[0] * NCOLS + start[1])
+    stack = [start[0] * NCOLS + start[1]]
+    while stack:
+        for nb_idx, nb_bit, edge_mask in neighbors[stack.pop()]:
+            if nb_bit & seen or edge_mask & blocked_mask:
+                continue
+            if nb_idx == goal_idx:
+                return True
+            seen |= nb_bit
+            stack.append(nb_idx)
     return False
 
 
@@ -264,21 +295,15 @@ def is_threefold_repetition(states: Sequence[State]) -> bool:
     return sum(state == latest for state in states) >= REPETITIONS_FOR_DRAW
 
 
-def _edge_open(a: Pos, b: Pos, blocked_mask: int) -> bool:
-    """True iff (a,b) is an adjacency edge on the board and no wall blocks it."""
-    if b not in _ADJ[a]:
-        return False
-    bit = _EDGE_BIT.get(_edge_key(a, b))
-    if bit is None:
-        return True  # end-zone entry edges are never blocked
-    return not ((blocked_mask >> bit) & 1)
-
-
 def _pawn_targets(me: Pos, opp: Pos, blocked_mask: int) -> Iterator[Pos]:
     r, c = me
-    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+    edge_mask = _EDGE_MASK.get
+    for dr, dc in _DIRS:
         step = (r + dr, c + dc)
-        if not valid(*step) or not _edge_open(me, step, blocked_mask):
+        mask = edge_mask((me, step))
+        # mask is None when (me, step) is not a board edge; a set bit under
+        # blocked_mask means a wall closed it.
+        if mask is None or mask & blocked_mask:
             continue
         if step != opp:
             yield step
@@ -287,7 +312,8 @@ def _pawn_targets(me: Pos, opp: Pos, blocked_mask: int) -> Iterator[Pos]:
         # behind them is blocked or outside the board, this direction has no
         # legal pawn move; this variant does not allow side-jumps.
         straight = (step[0] + dr, step[1] + dc)
-        if valid(*straight) and _edge_open(step, straight, blocked_mask):
+        mask = edge_mask((step, straight))
+        if mask is not None and not (mask & blocked_mask):
             yield straight
 
 
@@ -308,32 +334,62 @@ def _pawn_moves_unchecked(state: State, board: Board,
     own_start_row = P1_END_ROW if state.turn == 1 else P2_END_ROW
     opponent_end_row = P2_END_ROW if state.turn == 1 else P1_END_ROW
     goal = board.p1_goal if state.turn == 1 else board.p2_goal
-    seen = set()
     out = []
     for t in _pawn_targets(me, opp, m):
-        if t == me or t in seen or t[0] == own_start_row:
+        if t[0] == own_start_row:
             continue
         if t[0] == opponent_end_row and t != goal:
             continue
-        seen.add(t)
         out.append(t)
     return out
 
 
+def _side_has_pawn_move(me: Pos, opp: Pos, own_start_row: int,
+                        opp_end_row: int, goal: Pos, blocked_mask: int) -> bool:
+    """Whether the pawn at `me` has any physical move; early-exits on the first.
+
+    Same rules as _pawn_moves_unchecked but takes positions directly, so hot
+    callers (wall legality) never construct a State just to ask this.
+    """
+    r, c = me
+    edge_mask = _EDGE_MASK.get
+    for dr, dc in _DIRS:
+        step = (r + dr, c + dc)
+        mask = edge_mask((me, step))
+        if mask is None or mask & blocked_mask:
+            continue
+        if step == opp:
+            straight = (step[0] + dr, step[1] + dc)
+            mask = edge_mask((step, straight))
+            if mask is None or mask & blocked_mask:
+                continue
+            step = straight
+        if step[0] == own_start_row:
+            continue
+        if step[0] == opp_end_row and step != goal:
+            continue
+        return True
+    return False
+
+
+def _mover_rows_goal(turn: int, board: Board) -> Tuple[int, int, Pos]:
+    """(own_start_row, opponent_end_row, goal) for the given side."""
+    if turn == 1:
+        return P1_END_ROW, P2_END_ROW, board.p1_goal
+    return P2_END_ROW, P1_END_ROW, board.p2_goal
+
+
 def _has_pawn_move(state: State, board: Board, blocked_mask: int) -> bool:
-    return bool(_pawn_moves_unchecked(state, board, blocked_mask))
-
-
-def _pawn_mobility_edge_mask(state: State) -> int:
-    """Blockable edges whose closure could change this turn's pawn moves."""
     me, opp, _ = _mover(state)
-    cells = (me, opp) if opp in _ADJ[me] else (me,)
-    mask = 0
-    for cell in cells:
-        for neighbor in _ADJ[cell]:
-            edge = _EDGE_BIT.get(_edge_key(cell, neighbor))
-            if edge is not None:
-                mask |= 1 << edge
+    own_row, opp_row, goal = _mover_rows_goal(state.turn, board)
+    return _side_has_pawn_move(me, opp, own_row, opp_row, goal, blocked_mask)
+
+
+def _pawn_mobility_edge_mask(me: Pos, opp: Pos) -> int:
+    """Blockable edges whose closure could change this side's pawn moves."""
+    mask = _CELL_EDGE_MASK[me]
+    if (me, opp) in _EDGE_MASK:  # adjacent: jumps over opp are also in play
+        mask |= _CELL_EDGE_MASK[opp]
     return mask
 
 
@@ -341,12 +397,18 @@ def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
     if state.winner(board) is not None:
         return []
     blocked = blocked_mask_for(state.walls)
+    if state.turn == 1:
+        opp, my_goal = state.p2, board.p1_goal
+        opp_own_row, opp_end_row, opp_goal = P2_END_ROW, P1_END_ROW, board.p2_goal
+    else:
+        opp, my_goal = state.p1, board.p2_goal
+        opp_own_row, opp_end_row, opp_goal = P1_END_ROW, P2_END_ROW, board.p1_goal
     out = []
     for target in _pawn_moves_unchecked(state, board, blocked):
-        child = apply_move(state, ("m", target))
         # Winning ends the game. Otherwise a pawn may not occupy the opponent's
         # last usable exit and leave them without any physical pawn move.
-        if child.winner(board) is not None or _has_pawn_move(child, board, blocked):
+        if target == my_goal or _side_has_pawn_move(
+                opp, target, opp_own_row, opp_end_row, opp_goal, blocked):
             out.append(target)
     return out
 
@@ -380,75 +442,137 @@ def _shortest_path_edges(pos: Pos, goal: Pos, blocked_mask: int) -> FrozenSet[Tu
     return frozenset(edges)
 
 
+def _shortest_path_mask(pos: Pos, goal: Pos, blocked_mask: int) -> int:
+    """Blockable-edge bitmask of ONE shortest path from pos to goal.
+
+    Same path walk as _shortest_path_edges, but returns the edges as a bitmask
+    so wall-touch tests reduce to a single integer AND against _WALL_BITMASK.
+    End-zone entry edges have no bit and contribute nothing — walls can never
+    touch them anyway.
+    """
+    dist = _dist_table_from(goal, blocked_mask)
+    if pos not in dist:
+        return 0
+    mask = 0
+    cur = pos
+    while cur != goal:
+        d = dist[cur]
+        for nb in _ADJ[cur]:
+            if nb not in dist:
+                continue
+            em = _EDGE_MASK[(cur, nb)]
+            if em & blocked_mask:
+                continue
+            if dist[nb] == d - 1:
+                mask |= em
+                cur = nb
+                break
+        else:
+            break
+    return mask
+
+
 def legal_wall_moves(state: State, board: Board) -> List[Wall]:
     if state.winner(board) is not None:
         return []
     _, _, walls_left = _mover(state)
     if walls_left <= 0:
         return []
-    m = blocked_mask_for(state.walls)
+    placed = state.walls
+    m = blocked_mask_for(placed)
     conflicting = set()
-    for w in state.walls:
+    for w in placed:
         conflicting.update(_WALL_CONFLICTS[w])
     # A wall cannot invalidate a path whose edges it does not touch. Keep one
-    # existing path for each player and only run reachability when the candidate
-    # intersects that path. This is an exact shortcut, not a legality heuristic.
-    me = state.p1 if state.turn == 1 else state.p2
-    my_goal = board.p1_goal if state.turn == 1 else board.p2_goal
-    opp = state.p2 if state.turn == 1 else state.p1
-    opp_goal = board.p2_goal if state.turn == 1 else board.p1_goal
-    my_path_edges = _shortest_path_edges(me, my_goal, m)
-    opp_path_edges = _shortest_path_edges(opp, opp_goal, m)
-    p1_view = replace(state, turn=1)
-    p2_view = replace(state, turn=2)
+    # existing path for each player (as an edge bitmask) and only run
+    # reachability when the candidate intersects that path. This is an exact
+    # shortcut, not a legality heuristic.
+    p1, p2 = state.p1, state.p2
+    p1_goal, p2_goal = board.p1_goal, board.p2_goal
+    if state.turn == 1:
+        me, my_goal, opp, opp_goal = p1, p1_goal, p2, p2_goal
+    else:
+        me, my_goal, opp, opp_goal = p2, p2_goal, p1, p1_goal
     # Adding a wall can only remove moves. A legacy/malformed position that is
     # already immobilized cannot be repaired by placing another wall.
-    if not _has_pawn_move(p1_view, board, m) or not _has_pawn_move(p2_view, board, m):
+    if not _side_has_pawn_move(p1, p2, P1_END_ROW, P2_END_ROW, p1_goal, m):
         return []
-    p1_mobility_edges = _pawn_mobility_edge_mask(p1_view)
-    p2_mobility_edges = _pawn_mobility_edge_mask(p2_view)
+    if not _side_has_pawn_move(p2, p1, P2_END_ROW, P1_END_ROW, p2_goal, m):
+        return []
+    my_path_mask = _shortest_path_mask(me, my_goal, m)
+    opp_path_mask = _shortest_path_mask(opp, opp_goal, m)
+    p1_mobility_edges = _pawn_mobility_edge_mask(p1, p2)
+    p2_mobility_edges = _pawn_mobility_edge_mask(p2, p1)
+    # Second path per player, avoiding the primary path's edges (computed
+    # lazily; 0 when no such detour exists). A candidate that leaves either
+    # path of the pair untouched provably keeps that player connected, so the
+    # reachability search only runs for candidates crossing both paths. Exact.
+    my_alt_mask: Optional[int] = None
+    opp_alt_mask: Optional[int] = None
     out: List[Wall] = []
-    for w in ALL_WALLS:
-        if w in state.walls or w in conflicting:
+    for w, wall_mask in _WALL_MASK_ITEMS:
+        if w in placed or w in conflicting:
             continue
-        m2 = m | _WALL_BITMASK[w]
         # Walls may not immobilize either pawn. Checking both sides also stops
         # a player from walling in their own pawn and creating a forced no-move
         # state on the following turn.
-        wall_mask = _WALL_BITMASK[w]
         if (wall_mask & p1_mobility_edges
-                and not _has_pawn_move(p1_view, board, m2)):
+                and not _side_has_pawn_move(p1, p2, P1_END_ROW, P2_END_ROW,
+                                            p1_goal, m | wall_mask)):
             continue
         if (wall_mask & p2_mobility_edges
-                and not _has_pawn_move(p2_view, board, m2)):
+                and not _side_has_pawn_move(p2, p1, P2_END_ROW, P1_END_ROW,
+                                            p2_goal, m | wall_mask)):
             continue
-        if _wall_touches_shortest_path(w, my_path_edges):
-            if not has_path(me, my_goal, m2):
+        if wall_mask & my_path_mask:
+            if my_alt_mask is None:
+                my_alt_mask = _shortest_path_mask(me, my_goal, m | my_path_mask)
+            if ((not my_alt_mask or wall_mask & my_alt_mask)
+                    and not has_path(me, my_goal, m | wall_mask)):
                 continue
-        if _wall_touches_shortest_path(w, opp_path_edges):
-            if not has_path(opp, opp_goal, m2):
+        if wall_mask & opp_path_mask:
+            if opp_alt_mask is None:
+                opp_alt_mask = _shortest_path_mask(opp, opp_goal,
+                                                   m | opp_path_mask)
+            if ((not opp_alt_mask or wall_mask & opp_alt_mask)
+                    and not has_path(opp, opp_goal, m | wall_mask)):
                 continue
         out.append(w)
     return out
 
 
+# Interned Move tuples so legal_moves returns shared objects: hot MCTS paths
+# hold thousands of these lists at once, and shared tuples keep caches small.
+_PAWN_MOVE: Dict[Pos, Move] = {
+    (r, c): ("m", (r, c)) for r in range(NROWS) for c in range(NCOLS)
+}
+_WALL_MOVE: Dict[Wall, Move] = {w: ("w", w) for w in ALL_WALLS}
+
+
 def legal_moves(state: State, board: Board) -> List[Move]:
     if state.winner(board) is not None:
         return []
-    moves: List[Move] = [("m", p) for p in legal_pawn_moves(state, board)]
-    moves.extend(("w", w) for w in legal_wall_moves(state, board))
+    moves: List[Move] = list(map(_PAWN_MOVE.__getitem__,
+                                 legal_pawn_moves(state, board)))
+    moves.extend(map(_WALL_MOVE.__getitem__, legal_wall_moves(state, board)))
     return moves
 
 
 def apply_move(state: State, move: Move) -> State:
+    # Constructs State directly: dataclasses.replace() costs roughly twice as
+    # much and this is one of the hottest calls in tree search.
     kind, arg = move
     if kind == "m":
         if state.turn == 1:
-            return replace(state, p1=arg, turn=2)
-        return replace(state, p2=arg, turn=1)
+            return State(arg, state.p2, state.p1_walls_left,
+                         state.p2_walls_left, state.walls, 2)
+        return State(state.p1, arg, state.p1_walls_left,
+                     state.p2_walls_left, state.walls, 1)
     if kind == "w":
         new_walls = state.walls | {arg}
         if state.turn == 1:
-            return replace(state, walls=new_walls, p1_walls_left=state.p1_walls_left - 1, turn=2)
-        return replace(state, walls=new_walls, p2_walls_left=state.p2_walls_left - 1, turn=1)
+            return State(state.p1, state.p2, state.p1_walls_left - 1,
+                         state.p2_walls_left, new_walls, 2)
+        return State(state.p1, state.p2, state.p1_walls_left,
+                     state.p2_walls_left - 1, new_walls, 1)
     raise ValueError(f"bad move: {move}")

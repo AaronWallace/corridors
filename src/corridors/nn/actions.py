@@ -70,8 +70,19 @@ def reflect_policy(policy):
 
 # --- legal move mask --------------------------------------------------------
 
+# Every constructible move, precomputed — a dict get is ~3x cheaper than the
+# move_to_index arithmetic in the per-expansion hot path.
+_MOVE_INDEX: Dict[Move, int] = {}
+for _r in range(NROWS):
+    for _c in range(NCOLS):
+        _mv: Move = ("m", (_r, _c))
+        _MOVE_INDEX[_mv] = move_to_index(_mv)
+for _w in ALL_WALLS:
+    _mv = ("w", _w)
+    _MOVE_INDEX[_mv] = move_to_index(_mv)
+
+
 def legal_move_mask(state: State, board: Board) -> Tuple[List[Move], List[int]]:
     """Returns (moves, indices) for all legal moves in this position."""
     moves = legal_moves(state, board)
-    indices = [move_to_index(m) for m in moves]
-    return moves, indices
+    return moves, list(map(_MOVE_INDEX.__getitem__, moves))

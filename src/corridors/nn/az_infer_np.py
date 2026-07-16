@@ -41,25 +41,13 @@ def _fuse_conv_bn(w: np.ndarray, gamma: np.ndarray, beta: np.ndarray,
     return np.ascontiguousarray(w_f), np.ascontiguousarray(b_f)
 
 
-def _conv(x: np.ndarray, w: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Single-sample conv, stride 1, 'same' padding. x (Cin,H,W), w (Cout,Cin,kh,kw)."""
-    Cin, H, W = x.shape
-    Cout, _, kh, kw = w.shape
-    if kh == 1 and kw == 1:
-        out = w.reshape(Cout, Cin) @ x.reshape(Cin, H * W)
-        return (out + b[:, None]).reshape(Cout, H, W)
-    pad = kh // 2
-    xp = np.pad(x, ((0, 0), (pad, pad), (pad, pad)))
-    # im2col: rows ordered (di, dj, cin) to match w.transpose(0,2,3,1).reshape below.
-    cols = np.empty((kh * kw * Cin, H * W), dtype=np.float32)
-    r = 0
-    for di in range(kh):
-        for dj in range(kw):
-            cols[r:r + Cin] = xp[:, di:di + H, dj:dj + W].reshape(Cin, H * W)
-            r += Cin
-    wm = w.transpose(0, 2, 3, 1).reshape(Cout, kh * kw * Cin)
-    out = wm @ cols
-    return (out + b[:, None]).reshape(Cout, H, W)
+def _prep_layer(w: np.ndarray, b: np.ndarray) -> Tuple[np.ndarray, np.ndarray,
+                                                       int, int, int]:
+    """Flatten a fused conv weight to the 2-D GEMM matrix once, at load time."""
+    Cout, Cin, kh, kw = w.shape
+    wm = np.ascontiguousarray(
+        w.transpose(0, 2, 3, 1).reshape(Cout, kh * kw * Cin))
+    return wm, b, Cin, kh, kw
 
 
 def _relu(x: np.ndarray) -> np.ndarray:
@@ -67,46 +55,95 @@ def _relu(x: np.ndarray) -> np.ndarray:
 
 
 class NumpyAZNet:
-    """AZNet forward pass in NumPy. Construct from a weights dict (numpy arrays)."""
+    """AZNet forward pass in NumPy. Construct from a weights dict (numpy arrays).
+
+    Instances hold reusable pad/im2col scratch buffers, so a single instance
+    is NOT safe to call from multiple threads — use one per thread/process
+    (self-play workers already do).
+    """
 
     def __init__(self, weights: Dict[str, np.ndarray], channels: int = CHANNELS,
                  blocks: int = BLOCKS) -> None:
         def g(k: str) -> np.ndarray:
             return np.asarray(weights[k], dtype=np.float32)
 
-        self.stem = _fuse_conv_bn(g("stem.0.weight"), g("stem.1.weight"),
-                                  g("stem.1.bias"), g("stem.1.running_mean"),
-                                  g("stem.1.running_var"))
+        self.stem = _prep_layer(*_fuse_conv_bn(
+            g("stem.0.weight"), g("stem.1.weight"),
+            g("stem.1.bias"), g("stem.1.running_mean"),
+            g("stem.1.running_var")))
         self.blocks = []
         for i in range(blocks):
             p = f"trunk.{i}."
-            w1 = _fuse_conv_bn(g(p + "conv1.weight"), g(p + "bn1.weight"),
-                               g(p + "bn1.bias"), g(p + "bn1.running_mean"),
-                               g(p + "bn1.running_var"))
-            w2 = _fuse_conv_bn(g(p + "conv2.weight"), g(p + "bn2.weight"),
-                               g(p + "bn2.bias"), g(p + "bn2.running_mean"),
-                               g(p + "bn2.running_var"))
+            w1 = _prep_layer(*_fuse_conv_bn(
+                g(p + "conv1.weight"), g(p + "bn1.weight"),
+                g(p + "bn1.bias"), g(p + "bn1.running_mean"),
+                g(p + "bn1.running_var")))
+            w2 = _prep_layer(*_fuse_conv_bn(
+                g(p + "conv2.weight"), g(p + "bn2.weight"),
+                g(p + "bn2.bias"), g(p + "bn2.running_mean"),
+                g(p + "bn2.running_var")))
             self.blocks.append((w1, w2))
-        self.policy_conv = _fuse_conv_bn(g("policy_conv.weight"), g("policy_bn.weight"),
-                                         g("policy_bn.bias"), g("policy_bn.running_mean"),
-                                         g("policy_bn.running_var"))
+        self.policy_conv = _prep_layer(*_fuse_conv_bn(
+            g("policy_conv.weight"), g("policy_bn.weight"),
+            g("policy_bn.bias"), g("policy_bn.running_mean"),
+            g("policy_bn.running_var")))
         self.policy_fc = (g("policy_fc.weight"), g("policy_fc.bias"))
-        self.value_conv = _fuse_conv_bn(g("value_conv.weight"), g("value_bn.weight"),
-                                        g("value_bn.bias"), g("value_bn.running_mean"),
-                                        g("value_bn.running_var"))
+        self.value_conv = _prep_layer(*_fuse_conv_bn(
+            g("value_conv.weight"), g("value_bn.weight"),
+            g("value_bn.bias"), g("value_bn.running_mean"),
+            g("value_bn.running_var")))
         self.value_fc1 = (g("value_fc1.weight"), g("value_fc1.bias"))
         self.value_fc2 = (g("value_fc2.weight"), g("value_fc2.bias"))
+        # Scratch buffers, keyed by shape: zero-padded input (border written
+        # once — only the interior changes between calls) and im2col output.
+        self._pad_buf: Dict[Tuple[int, int, int], np.ndarray] = {}
+        self._col_buf: Dict[Tuple[int, int], np.ndarray] = {}
+
+    def _conv(self, x: np.ndarray,
+              layer: Tuple[np.ndarray, np.ndarray, int, int, int]) -> np.ndarray:
+        """Single-sample conv, stride 1, 'same' padding. x (Cin,H,W)."""
+        wm, b, Cin, kh, kw = layer
+        _, H, W = x.shape
+        if kh == 1 and kw == 1:
+            out = wm @ x.reshape(Cin, H * W)
+            out += b[:, None]
+            return out.reshape(-1, H, W)
+        pad_h, pad_w = kh // 2, kw // 2
+        pkey = (Cin, H, W)
+        xp = self._pad_buf.get(pkey)
+        if xp is None:
+            xp = np.zeros((Cin, H + 2 * pad_h, W + 2 * pad_w), dtype=np.float32)
+            self._pad_buf[pkey] = xp
+        xp[:, pad_h:pad_h + H, pad_w:pad_w + W] = x
+        ckey = (kh * kw * Cin, H * W)
+        cols = self._col_buf.get(ckey)
+        if cols is None:
+            cols = np.empty(ckey, dtype=np.float32)
+            self._col_buf[ckey] = cols
+        # im2col: rows ordered (di, dj, cin) to match _prep_layer's flattening.
+        # Assigning through a 4-D view of the destination copies each strided
+        # window exactly once (a .reshape on the source slice would copy twice).
+        cols4 = cols.reshape(kh * kw, Cin, H, W)
+        k = 0
+        for di in range(kh):
+            for dj in range(kw):
+                cols4[k] = xp[:, di:di + H, dj:dj + W]
+                k += 1
+        out = wm @ cols
+        out += b[:, None]
+        return out.reshape(-1, H, W)
 
     def forward(self, x: np.ndarray) -> Tuple[np.ndarray, float]:
         """x (NUM_PLANES, NROWS, NCOLS) → (policy_logits [NUM_ACTIONS], value scalar)."""
-        h = _relu(_conv(np.ascontiguousarray(x, dtype=np.float32), *self.stem))
+        h = _relu(self._conv(np.ascontiguousarray(x, dtype=np.float32), self.stem))
         for (w1, w2) in self.blocks:
-            y = _relu(_conv(h, *w1))
-            y = _conv(y, *w2)
-            h = _relu(h + y)
-        p = _relu(_conv(h, *self.policy_conv)).reshape(-1)
+            y = _relu(self._conv(h, w1))
+            y = self._conv(y, w2)
+            y += h
+            h = _relu(y)
+        p = _relu(self._conv(h, self.policy_conv)).reshape(-1)
         p = self.policy_fc[0] @ p + self.policy_fc[1]
-        v = _relu(_conv(h, *self.value_conv)).reshape(-1)
+        v = _relu(self._conv(h, self.value_conv)).reshape(-1)
         v = _relu(self.value_fc1[0] @ v + self.value_fc1[1])
         v = np.tanh(self.value_fc2[0] @ v + self.value_fc2[1])
         return p.astype(np.float32), float(v[0])
