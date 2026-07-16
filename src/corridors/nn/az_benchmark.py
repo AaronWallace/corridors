@@ -43,6 +43,7 @@ def benchmark_configuration(
     checkpoint: str = "",
     inference_servers: int = 1,
     fp16: bool = False,
+    batch_timeout_ms: float = 0.0,
     on_game: Optional[Callable] = None,
     on_heartbeat: Optional[Callable] = None,
 ) -> Dict[str, object]:
@@ -57,6 +58,7 @@ def benchmark_configuration(
         checkpoint=checkpoint,
         inference_servers=inference_servers,
         inference_fp16=fp16,
+        batch_timeout_ms=batch_timeout_ms,
     )
     with SelfPlayPool(config) as pool:
         pool.run(games, checkpoint=checkpoint, save_dir=None,
@@ -106,6 +108,8 @@ def main() -> None:
     parser.add_argument("--fp16", action="store_true",
                         help="also run every GPU configuration with "
                              "inference_fp16 enabled, for comparison")
+    parser.add_argument("--batch-timeout-ms", type=float, default=0.0,
+                        help="partial-batch flush wait (0 = 5ms default)")
     args = parser.parse_args()
     device = hw["device"] if args.device == "auto" else args.device
     workers = args.workers or (hw.get("cpu_workers", hw["workers"])
@@ -136,6 +140,7 @@ def main() -> None:
                         batch_size=batch, concurrency=concurrency,
                         checkpoint=args.checkpoint,
                         inference_servers=servers, fp16=fp16,
+                        batch_timeout_ms=args.batch_timeout_ms,
                     )
                     results.append(m)
                     inf = m["inference"]

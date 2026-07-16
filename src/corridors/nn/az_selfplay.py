@@ -233,6 +233,18 @@ class SelfPlayConfig:
     # cards). Off by default: logits shift at noise level (~1e-1 on raw
     # logits), which is harmless but no longer bit-reproducible vs fp32.
     inference_fp16: bool = False
+    # How long a partial batch waits for stragglers before flushing. When the
+    # pipeline convoys (all game threads blocked at once), this wait is paid
+    # on every batch cycle, so on fast GPUs a smaller value can beat a fuller
+    # batch. 0 keeps the 5ms default.
+    batch_timeout_ms: float = 0.0
+
+
+def resolve_batch_timeout(config: SelfPlayConfig) -> float:
+    """Batch-fill wait in seconds; 0/negative config keeps the default."""
+    if config.batch_timeout_ms > 0:
+        return config.batch_timeout_ms / 1000.0
+    return _BATCH_TIMEOUT
 
 
 def mcts_budget_bounds(config: SelfPlayConfig) -> Tuple[int, int]:
@@ -289,6 +301,7 @@ def _inference_server(
     batch_size: int,
     num_workers: int,
     use_fp16: bool = False,
+    batch_timeout: float = _BATCH_TIMEOUT,
 ) -> None:
     """Batched inference process. Reads (worker_id, tensor) from request_queue,
     runs forward pass, sends grouped [(req_id, policy, value), ...] lists back
@@ -332,7 +345,7 @@ def _inference_server(
 
     while workers_done < num_workers:
         try:
-            item = request_queue.get(timeout=_BATCH_TIMEOUT)
+            item = request_queue.get(timeout=batch_timeout)
         except Exception:
             _flush_batch()
             continue
@@ -902,7 +915,8 @@ def run_selfplay(
             server = ctx.Process(
                 target=_inference_server,
                 args=(request_queue, response_queues, config.checkpoint, device,
-                      config.batch_size, num_workers, config.inference_fp16),
+                      config.batch_size, num_workers, config.inference_fp16,
+                      resolve_batch_timeout(config)),
                 daemon=True,
             )
             server.start()
@@ -1104,6 +1118,7 @@ def _inference_server_persistent(
     device: str,
     batch_size: int,
     use_fp16: bool = False,
+    batch_timeout: float = _BATCH_TIMEOUT,
 ) -> None:
     """Long-lived batched inference server. Services eval requests and, between
     rounds, handles control messages: ("__cmd__","reload",ckpt) reloads the model
@@ -1171,7 +1186,7 @@ def _inference_server_persistent(
         # otherwise block so an idle server (e.g. during training) doesn't spin.
         if pending:
             try:
-                item = request_queue.get(timeout=_BATCH_TIMEOUT)
+                item = request_queue.get(timeout=batch_timeout)
             except Exception:
                 _flush_batch("timeout")
                 continue
@@ -1424,7 +1439,8 @@ class SelfPlayPool:
                         target=_inference_server_persistent,
                         args=(self.request_queues[s], self.response_queues,
                               self.ack_queue, self.device, config.batch_size,
-                              config.inference_fp16),
+                              config.inference_fp16,
+                              resolve_batch_timeout(config)),
                         daemon=True,
                     )
                     srv.start()
