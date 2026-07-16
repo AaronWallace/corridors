@@ -47,10 +47,11 @@ class NetworkAgent:
         if not moves:
             raise RuntimeError("no legal moves")
 
-        # Short-circuit immediate wins
+        # Short-circuit immediate wins. Only a pawn move onto the mover's own
+        # goal can win — wall moves never end the game, so don't apply them.
+        goal = board.p1_goal if state.turn == 1 else board.p2_goal
         for mv in moves:
-            child = apply_move(state, mv)
-            if child.winner(board) is not None:
+            if mv[0] == "m" and mv[1] == goal:
                 return mv
 
         if self.arch == "az":
