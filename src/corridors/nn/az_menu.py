@@ -665,6 +665,7 @@ def _benchmark_selfplay() -> None:
 
     server_counts = [1]
     fp16_modes = [False]
+    use_compile = False
     batch_timeout_ms = 0.0
     checkpoint = ""
     if device == "cuda":
@@ -676,6 +677,10 @@ def _benchmark_selfplay() -> None:
         if Confirm.ask("[dim]Also compare fp16 inference? "
                        "(recorded only — never auto-applied)[/dim]", default=False):
             fp16_modes = [False, True]
+        use_compile = Confirm.ask(
+            "[dim]torch.compile the inference model? (needs Triton/Linux, "
+            "falls back to eager; recorded only — never auto-applied)[/dim]",
+            default=False)
         batch_timeout_ms = _prompt_float("Partial-batch flush timeout ms (0=default)",
                                          hw.get("batch_timeout_ms", 0.0), 0.0, 1000.0)
     else:
@@ -732,7 +737,8 @@ def _benchmark_selfplay() -> None:
             for index, (servers, fp16, batch, concurrency) in enumerate(combos, 1):
                 label = (f"[{index}/{len(combos)}] batch {batch}, "
                          f"concurrency {concurrency}, servers {servers}"
-                         + (", fp16" if fp16 else ""))
+                         + (", fp16" if fp16 else "")
+                         + (", compiled" if use_compile else ""))
                 results.append(run_with_progress(
                     label,
                     device=device, games=games, simulations=simulations,
@@ -740,6 +746,7 @@ def _benchmark_selfplay() -> None:
                     batch_size=batch, concurrency=concurrency,
                     checkpoint=checkpoint, inference_servers=servers,
                     fp16=fp16, batch_timeout_ms=batch_timeout_ms,
+                    compile_inference=use_compile,
                 ))
         else:
             for index, worker_count in enumerate(configs, 1):
@@ -801,6 +808,10 @@ def _benchmark_selfplay() -> None:
         console.print("[yellow]fp16 was fastest[/yellow] [dim]— never applied "
                       "automatically (it changes network outputs); enable it "
                       "explicitly when configuring a run.[/dim]")
+    if record.get("compile_recommended"):
+        console.print("[yellow]torch.compile was fastest[/yellow] [dim]— never "
+                      "applied automatically (it changes network outputs); "
+                      "enable it explicitly when configuring a run.[/dim]")
     console.print("[green]Saved as the default for matching hardware.[/green]")
     console.print("[dim]Recorded to benchmark history (menu: View benchmark history).[/dim]")
     console.print("[dim]No training data or checkpoints were written.[/dim]")

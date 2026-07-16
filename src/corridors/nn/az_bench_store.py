@@ -79,13 +79,17 @@ def latest_record(hardware_key: str) -> Optional[dict]:
 
 
 def select_best(rows: List[dict]) -> Tuple[dict, bool]:
-    """(best fp32 row for the tuning profile, whether an fp16 row beat it).
+    """(best numerics-neutral row for the tuning profile, whether an fp16 row
+    beat it).
 
-    fp16 changes network outputs, so it never wins the auto-applied profile —
-    it is recorded and surfaced as a recommendation only.
+    fp16 and torch.compile change network outputs, so they never win the
+    auto-applied profile — they are recorded and surfaced as recommendations
+    only. (The profile schema carries no fp16/compile keys either way, so
+    neither can leak into a loop config implicitly.)
     """
-    fp32 = [row for row in rows if not row.get("fp16")]
-    pool = fp32 or rows
+    neutral = [row for row in rows
+               if not row.get("fp16") and not row.get("compile")]
+    pool = neutral or rows
     best = max(pool, key=lambda row: row.get("positions_per_s", 0.0))
     fp16_recommended = any(
         row.get("fp16")

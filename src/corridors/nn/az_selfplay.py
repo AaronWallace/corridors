@@ -238,6 +238,12 @@ class SelfPlayConfig:
     # on every batch cycle, so on fast GPUs a smaller value can beat a fuller
     # batch. 0 keeps the 5ms default.
     batch_timeout_ms: float = 0.0
+    # torch.compile the inference model (CUDA-graph capture kills the
+    # several-ms eager dispatch cost per forward). Requires Triton (Linux);
+    # falls back to eager where unavailable. Off by default: compiled kernels
+    # round differently at the ulp level, so like fp16 it is opt-in and
+    # recorded, never auto-applied.
+    inference_compile: bool = False
 
 
 def resolve_batch_timeout(config: SelfPlayConfig) -> float:
@@ -293,6 +299,36 @@ class GameRecord:
 # Inference server — runs on GPU
 # ---------------------------------------------------------------------------
 
+def _try_compile(model):
+    """torch.compile with CUDA-graph capture, or the eager model unchanged
+    where the compile stack (Triton) is unavailable."""
+    try:
+        import torch
+        return torch.compile(model, mode="reduce-overhead", dynamic=False)
+    except Exception:
+        return model
+
+
+def _bucket_size(n: int) -> int:
+    """Next power of two >= n (min 16). Compiled forwards specialize per input
+    shape, so batches are padded into a handful of buckets instead of
+    recompiling for every distinct partial-batch size."""
+    b = 16
+    while b < n:
+        b <<= 1
+    return b
+
+
+def _pad_to_bucket(batch_np: np.ndarray) -> np.ndarray:
+    n = len(batch_np)
+    bucket = _bucket_size(n)
+    if bucket == n:
+        return batch_np
+    pad = np.zeros((bucket - n, *batch_np.shape[1:]), dtype=batch_np.dtype)
+    # Zero rows are exact no-ops for the real rows: eval-mode BatchNorm uses
+    # running stats, so rows are independent; padded outputs are sliced off.
+    return np.concatenate([batch_np, pad])
+
 def _inference_server(
     request_queue: mp.Queue,
     response_queues: Dict[int, mp.Queue],
@@ -302,6 +338,7 @@ def _inference_server(
     num_workers: int,
     use_fp16: bool = False,
     batch_timeout: float = _BATCH_TIMEOUT,
+    use_compile: bool = False,
 ) -> None:
     """Batched inference process. Reads (worker_id, req_id, packed_state) from
     request_queue — packed via pack_state, 23 bytes vs 3.6 KB for the encoded
@@ -329,20 +366,33 @@ def _inference_server(
         model.eval()
     if use_fp16:
         model = model.half()
+    eager_model = model
+    if use_compile:
+        model = _try_compile(model)
 
     buf: List[Tuple[int, int, bytes]] = []  # (worker_id, req_id, packed state)
     cond = threading.Condition()
     done = False
 
     def _respond(take: List[Tuple[int, int, bytes]]) -> None:
+        nonlocal model
+        n = len(take)
         batch_np = unpack_states_batch([t for _, _, t in take])
+        if model is not eager_model:
+            batch_np = _pad_to_bucket(batch_np)
         with torch.no_grad():
             x = torch.from_numpy(batch_np).to(device)
             if use_fp16:
                 x = x.half()
-            policy_logits, values = model(x)
-            policy_np = policy_logits.float().cpu().numpy()
-            values_np = values.float().cpu().numpy()
+            try:
+                policy_logits, values = model(x)
+            except Exception:
+                if model is eager_model:
+                    raise
+                model = eager_model  # compile backend failed — stay eager
+                policy_logits, values = model(x)
+            policy_np = policy_logits.float().cpu().numpy()[:n]
+            values_np = values.float().cpu().numpy()[:n]
         by_worker: Dict[int, list] = {}
         for i, (wid, rid, _) in enumerate(take):
             by_worker.setdefault(wid, []).append(
@@ -984,7 +1034,7 @@ def run_selfplay(
                 target=_inference_server,
                 args=(request_queue, response_queues, config.checkpoint, device,
                       config.batch_size, num_workers, config.inference_fp16,
-                      resolve_batch_timeout(config)),
+                      resolve_batch_timeout(config), config.inference_compile),
                 daemon=True,
             )
             server.start()
@@ -1187,6 +1237,7 @@ def _inference_server_persistent(
     batch_size: int,
     use_fp16: bool = False,
     batch_timeout: float = _BATCH_TIMEOUT,
+    use_compile: bool = False,
 ) -> None:
     """Long-lived batched inference server. Services eval requests and, between
     rounds, handles control messages: ("__cmd__","reload",ckpt) reloads the model
@@ -1205,6 +1256,7 @@ def _inference_server_persistent(
     from .az_net import AZNet, load_checkpoint as load_az
 
     model = None
+    eager_model = None
     buf: list = []          # eval items and _CMD_TAG items, arrival order
     cond = threading.Condition()
     buf_since = 0.0         # monotonic time the buffer went non-empty
@@ -1221,6 +1273,7 @@ def _inference_server_persistent(
     _reset_metrics()
 
     def _respond(take: list, waited_s: float, reason: str) -> None:
+        nonlocal model
         if model is None:
             return
         count = len(take)
@@ -1233,14 +1286,22 @@ def _inference_server_persistent(
         elif reason == "timeout":
             metrics["timeout_batches"] += 1
         batch_np = unpack_states_batch([t for _, _, t in take])
+        if model is not eager_model:
+            batch_np = _pad_to_bucket(batch_np)
         infer_t0 = time.monotonic()
         with torch.inference_mode():
             x = torch.from_numpy(batch_np).to(device)
             if use_fp16:
                 x = x.half()
-            policy_logits, values = model(x)
-            policy_np = policy_logits.float().cpu().numpy()
-            values_np = values.float().cpu().numpy()
+            try:
+                policy_logits, values = model(x)
+            except Exception:
+                if model is eager_model:
+                    raise
+                model = eager_model  # compile backend failed — stay eager
+                policy_logits, values = model(x)
+            policy_np = policy_logits.float().cpu().numpy()[:count]
+            values_np = values.float().cpu().numpy()[:count]
         metrics["inference_s"] += time.monotonic() - infer_t0
         by_worker: Dict[int, list] = {}
         for i, (wid, rid, _) in enumerate(take):
@@ -1252,7 +1313,7 @@ def _inference_server_persistent(
     def _handle_cmd(item) -> bool:
         """Returns True on stop. Eval items queued before this cmd have
         already been flushed (the infer loop takes them first)."""
-        nonlocal model
+        nonlocal model, eager_model
         _, sub, arg = item
         if sub == "reload":
             if arg:
@@ -1262,6 +1323,9 @@ def _inference_server_persistent(
                 model.eval()
             if use_fp16:
                 model = model.half()
+            eager_model = model
+            if use_compile:
+                model = _try_compile(model)
             _reset_metrics()
             ack_queue.put("ready")
         elif sub == "stats":
@@ -1540,7 +1604,8 @@ class SelfPlayPool:
                         args=(self.request_queues[s], self.response_queues,
                               self.ack_queue, self.device, config.batch_size,
                               config.inference_fp16,
-                              resolve_batch_timeout(config)),
+                              resolve_batch_timeout(config),
+                              config.inference_compile),
                         daemon=True,
                     )
                     srv.start()

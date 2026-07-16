@@ -57,6 +57,7 @@ def benchmark_configuration(
     inference_servers: int = 1,
     fp16: bool = False,
     batch_timeout_ms: float = 0.0,
+    compile_inference: bool = False,
     on_game: Optional[Callable] = None,
     on_heartbeat: Optional[Callable] = None,
 ) -> Dict[str, object]:
@@ -72,6 +73,7 @@ def benchmark_configuration(
         inference_servers=inference_servers,
         inference_fp16=fp16,
         batch_timeout_ms=batch_timeout_ms,
+        inference_compile=compile_inference,
     )
     with SelfPlayPool(config) as pool:
         pool.run(games, checkpoint=checkpoint, save_dir=None,
@@ -85,6 +87,7 @@ def benchmark_configuration(
         "inference_servers": inference_servers,
         "fp16": fp16,
         "batch_timeout_ms": batch_timeout_ms,
+        "compile": compile_inference,
     })
     elapsed = max(float(metrics["elapsed_s"]), 1e-9)
     metrics["games_per_s"] = metrics["games"] / elapsed
@@ -105,6 +108,7 @@ def row_from_metrics(m: Dict[str, object]) -> Dict[str, object]:
         "concurrency": int(m["concurrency"]),
         "servers": int(m.get("inference_servers", 1)),
         "fp16": bool(m.get("fp16", False)),
+        "compile": bool(m.get("compile", False)),
         "batch_timeout_ms": float(m.get("batch_timeout_ms", 0.0)),
         "evals_per_s": float(m["evals_per_s"]),
         "positions_per_s": float(m["positions_per_s"]),
@@ -160,6 +164,10 @@ def record_benchmark(hw: dict, *, device: str, simulations: int, max_plies: int,
         "rows": rows,
         "best": profile,
         "fp16_recommended": fp16_recommended,
+        "compile_recommended": any(
+            row.get("compile")
+            and row.get("positions_per_s", 0.0) > best.get("positions_per_s", 0.0)
+            for row in rows),
     }
     append_record(key, record)
     return record
@@ -196,6 +204,9 @@ def main() -> None:
                              "inference_fp16 enabled, for comparison")
     parser.add_argument("--batch-timeout-ms", type=float, default=0.0,
                         help="partial-batch flush wait (0 = 5ms default)")
+    parser.add_argument("--compile", action="store_true", dest="compile_inference",
+                        help="torch.compile the inference model in every GPU "
+                             "configuration (needs Triton; falls back to eager)")
     args = parser.parse_args()
     device = hw["device"] if args.device == "auto" else args.device
     workers = args.workers or (hw.get("cpu_workers", hw["workers"])
@@ -213,7 +224,10 @@ def main() -> None:
         print(f"games={games} simulations={args.simulations} "
               f"max_plies={args.max_plies} workers={workers} "
               f"checkpoint={args.checkpoint or '(random)'}")
-        print("batch conc srv fp16 elapsed games/s pos/s eval/s avg_batch "
+        if args.compile_inference:
+            print("torch.compile enabled for all rows (first batches per "
+                  "shape bucket compile — expect a slow warmup)")
+        print("batch conc srv fp16 cmpl elapsed games/s pos/s eval/s avg_batch "
               "fill% request_ms gpu_busy%")
         results = []
         for servers in server_counts:
@@ -227,6 +241,7 @@ def main() -> None:
                         checkpoint=args.checkpoint,
                         inference_servers=servers, fp16=fp16,
                         batch_timeout_ms=args.batch_timeout_ms,
+                        compile_inference=args.compile_inference,
                     )
                     results.append(m)
                     inf = m["inference"]
@@ -239,7 +254,9 @@ def main() -> None:
                         m["elapsed_s"] * nsrv)
                     print(
                         f"{batch:>5} {concurrency:>4} {nsrv:>3} "
-                        f"{'y' if fp16 else 'n':>4} {m['elapsed_s']:>7.2f} "
+                        f"{'y' if fp16 else 'n':>4} "
+                        f"{'y' if args.compile_inference else 'n':>4} "
+                        f"{m['elapsed_s']:>7.2f} "
                         f"{m['games_per_s']:>7.2f} {m['positions_per_s']:>7.1f} "
                         f"{m['evals_per_s']:>7.1f} {inf.get('avg_batch', 0):>9.1f} "
                         f"{(100 * full / batches if batches else 0):>5.1f} "
@@ -261,6 +278,10 @@ def main() -> None:
             print("note: an fp16 configuration was fastest — fp16 is never "
                   "auto-applied (it changes network outputs); enable "
                   "inference_fp16 explicitly to use it")
+        if record["compile_recommended"]:
+            print("note: a torch.compile configuration was fastest — compile "
+                  "is never auto-applied (it changes network outputs); enable "
+                  "inference_compile explicitly to use it")
     else:
         configs = cpu_configurations(workers)
         games = args.games or max(32, max(configs) * 2)
