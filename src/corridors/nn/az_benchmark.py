@@ -40,6 +40,9 @@ def benchmark_configuration(
     workers: int,
     batch_size: int = 1,
     concurrency: int = 1,
+    checkpoint: str = "",
+    inference_servers: int = 1,
+    fp16: bool = False,
     on_game: Optional[Callable] = None,
     on_heartbeat: Optional[Callable] = None,
 ) -> Dict[str, object]:
@@ -51,9 +54,12 @@ def benchmark_configuration(
         concurrent_games=concurrency,
         batch_size=batch_size,
         device=device,
+        checkpoint=checkpoint,
+        inference_servers=inference_servers,
+        inference_fp16=fp16,
     )
     with SelfPlayPool(config) as pool:
-        pool.run(games, checkpoint="", save_dir=None,
+        pool.run(games, checkpoint=checkpoint, save_dir=None,
                  on_game=on_game, on_heartbeat=on_heartbeat)
         metrics = dict(pool.last_metrics)
     metrics.update({
@@ -61,6 +67,8 @@ def benchmark_configuration(
         "workers": workers,
         "batch_size": batch_size,
         "concurrency": concurrency,
+        "inference_servers": inference_servers,
+        "fp16": fp16,
     })
     elapsed = max(float(metrics["elapsed_s"]), 1e-9)
     metrics["games_per_s"] = metrics["games"] / elapsed
@@ -89,6 +97,15 @@ def main() -> None:
         "--configs", default="",
         help="optional comma-separated GPU batch:games-per-worker pairs",
     )
+    parser.add_argument("--checkpoint", default="",
+                        help="checkpoint name for realistic tree shapes "
+                             "(empty = random init)")
+    parser.add_argument("--servers", default="",
+                        help="comma-separated inference-server counts to sweep "
+                             "on GPU (default: the detected recommendation)")
+    parser.add_argument("--fp16", action="store_true",
+                        help="also run every GPU configuration with "
+                             "inference_fp16 enabled, for comparison")
     args = parser.parse_args()
     device = hw["device"] if args.device == "auto" else args.device
     workers = args.workers or (hw.get("cpu_workers", hw["workers"])
@@ -97,29 +114,48 @@ def main() -> None:
     if device == "cuda":
         configs = (list(_parse_gpu_configs(args.configs)) if args.configs else
                    gpu_configurations(hw["inference_batch"], workers))
+        server_counts = ([int(s) for s in args.servers.split(",")]
+                         if args.servers else [hw.get("inference_servers", 1)])
+        fp16_modes = [False, True] if args.fp16 else [False]
         games = args.games or max(32, max(workers * c for _, c in configs))
-        print(f"device=cuda games={games} simulations={args.simulations} "
-              f"max_plies={args.max_plies} workers={workers}")
-        print("batch conc elapsed games/s pos/s eval/s avg_batch fill% request_ms infer%")
+        print(f"device=cuda gpu={hw['gpu_name']} vram={hw['vram_gb']:.1f}GB "
+              f"ncpu={hw['ncpu']}")
+        print(f"games={games} simulations={args.simulations} "
+              f"max_plies={args.max_plies} workers={workers} "
+              f"checkpoint={args.checkpoint or '(random)'}")
+        print("batch conc srv fp16 elapsed games/s pos/s eval/s avg_batch "
+              "fill% request_ms gpu_busy%")
         results = []
-        for batch, concurrency in configs:
-            m = benchmark_configuration(
-                device=device, games=games, simulations=args.simulations,
-                max_plies=args.max_plies, workers=workers,
-                batch_size=batch, concurrency=concurrency,
-            )
-            results.append(m)
-            inf = m["inference"]
-            batches = int(inf.get("batches", 0))
-            full = int(inf.get("full_batches", 0))
-            print(
-                f"{batch:>5} {concurrency:>4} {m['elapsed_s']:>7.2f} "
-                f"{m['games_per_s']:>7.2f} {m['positions_per_s']:>7.1f} "
-                f"{m['evals_per_s']:>7.1f} {inf.get('avg_batch', 0):>9.1f} "
-                f"{(100 * full / batches if batches else 0):>5.1f} "
-                f"{m['avg_request_wait_ms']:>10.2f} "
-                f"{100 * inf.get('inference_s', 0) / m['elapsed_s']:>6.1f}"
-            )
+        for servers in server_counts:
+            for fp16 in fp16_modes:
+                for batch, concurrency in configs:
+                    m = benchmark_configuration(
+                        device=device, games=games,
+                        simulations=args.simulations,
+                        max_plies=args.max_plies, workers=workers,
+                        batch_size=batch, concurrency=concurrency,
+                        checkpoint=args.checkpoint,
+                        inference_servers=servers, fp16=fp16,
+                    )
+                    results.append(m)
+                    inf = m["inference"]
+                    batches = int(inf.get("batches", 0))
+                    full = int(inf.get("full_batches", 0))
+                    nsrv = max(1, int(inf.get("num_servers", 1)))
+                    # inference_s sums wall-time across parallel servers, so
+                    # busy fraction is per-server-average.
+                    busy = 100 * inf.get("inference_s", 0) / (
+                        m["elapsed_s"] * nsrv)
+                    print(
+                        f"{batch:>5} {concurrency:>4} {nsrv:>3} "
+                        f"{'y' if fp16 else 'n':>4} {m['elapsed_s']:>7.2f} "
+                        f"{m['games_per_s']:>7.2f} {m['positions_per_s']:>7.1f} "
+                        f"{m['evals_per_s']:>7.1f} {inf.get('avg_batch', 0):>9.1f} "
+                        f"{(100 * full / batches if batches else 0):>5.1f} "
+                        f"{m['avg_request_wait_ms']:>10.2f} "
+                        f"{busy:>8.1f}",
+                        flush=True,
+                    )
         best = max(results, key=lambda result: result["positions_per_s"])
         key = hardware_tuning_key(
             "cuda", hw["ncpu"], hw["gpu_name"], hw["vram_gb"], hw["gpu_count"])
