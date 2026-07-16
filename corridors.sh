@@ -3,9 +3,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-# Find Python 3.10+
+# Find Python 3.10+ (project venv first, like corridors-web.sh)
 _find_python() {
-    for c in "${PYTHON:-}" python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
+    for c in "${PYTHON:-}" "$ROOT/.venv/bin/python" python3.14 python3.13 python3.12 python3.11 python3.10 python3; do
         [ -z "$c" ] && continue
         if command -v "$c" &>/dev/null; then
             local v
