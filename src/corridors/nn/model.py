@@ -171,14 +171,19 @@ def list_checkpoints() -> list:
 
 
 def delete_checkpoint(name: str) -> bool:
-    p = checkpoint_path(name)
-    if not p.exists():
-        return False
-    p.unlink()
-    mp = meta_path(name)
-    if mp.exists():
-        mp.unlink()
-    return True
+    """Delete a checkpoint everywhere it lives: the machine-local file and
+    any curated copy in best/, plus both metadata sidecars."""
+    deleted = False
+    for p in (checkpoint_path(name),
+              curated_checkpoint_path(CHECKPOINT_ROOT, name)):
+        if p.exists():
+            p.unlink()
+            deleted = True
+        mp = p.with_suffix(".meta.json")
+        if mp.exists():
+            mp.unlink()
+            deleted = True
+    return deleted
 
 
 def rename_checkpoint(name: str, new_name: str) -> bool:

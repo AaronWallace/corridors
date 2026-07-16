@@ -533,7 +533,9 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
     for item in _numbered_selections(items, raw):
         name = item["name"]
         if model_mod.delete_checkpoint(name):
-            console.print(f"[dim]deleted {name}[/dim]")
+            note = (" (including its best/ copy — commit to remove it from Git)"
+                    if item.get("in_best") else "")
+            console.print(f"[dim]deleted {name}{note}[/dim]")
 
 
 # ---------------------------------------------------------------------------
