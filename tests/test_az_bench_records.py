@@ -70,6 +70,22 @@ def test_legacy_profile_without_ram_segment_still_loads(tmp_path, monkeypatch):
     assert az_selfplay._load_tuning_profile(keyed) == {"workers": 9}
 
 
+def test_profile_falls_back_to_committed_benchmark_history(tmp_path, monkeypatch):
+    """A fresh machine with no local settings inherits the recorded winner
+    for its fingerprint from the (repo-committed) benchmark store."""
+    _use_tmp_settings(tmp_path, monkeypatch)
+    key = az_selfplay.hardware_tuning_key("cuda", 16, "Example GPU", 8.0, 1,
+                                          ram_gb=32)
+    best = {"workers": 52, "inference_batch": 256, "concurrency": 32,
+            "inference_servers": 8, "batch_timeout_ms": 2.0}
+    append_record(key, {"rows": [], "best": best})
+
+    assert az_selfplay._load_tuning_profile(key) == best
+    # Local settings, once present, still take precedence over history.
+    az_selfplay.save_tuning_profile(key, {"workers": 9})
+    assert az_selfplay._load_tuning_profile(key) == {"workers": 9}
+
+
 def test_records_append_retrieve_and_cap(tmp_path, monkeypatch):
     _use_tmp_settings(tmp_path, monkeypatch)
     key = az_selfplay.hardware_tuning_key("cuda", 16, "Example GPU", 8.0, 1,

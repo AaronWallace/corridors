@@ -834,11 +834,22 @@ def _load_tuning_profile(hardware_key: str) -> dict:
     from .. import settings
     profiles = settings.load().get("az_tuning_profiles", {})
     if not isinstance(profiles, dict):
-        return {}
+        profiles = {}
     profile = profiles.get(hardware_key, {})
     if not profile and "|ram=" in hardware_key:
         # Profiles saved before total RAM joined the fingerprint stay usable.
         profile = profiles.get(hardware_key.split("|ram=", 1)[0], {})
+    if not profile:
+        # az_benchmarks.json is committed to the repo, so a fresh pod of a
+        # known hardware class inherits the recorded winner without local
+        # settings and without re-benchmarking.
+        try:
+            from .az_bench_store import latest_record
+            record = latest_record(hardware_key)
+            if record and isinstance(record.get("best"), dict):
+                profile = record["best"]
+        except Exception:
+            profile = {}
     return profile if isinstance(profile, dict) else {}
 
 
