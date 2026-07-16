@@ -308,9 +308,16 @@ def _inference_server(
     tensor, since request unpickling is the per-position bottleneck — runs a
     forward pass, sends grouped [(req_id, policy, value), ...] lists back via
     per-worker response queues (one put per worker per batch — per-item puts
-    cost ~15us each and stall the drain loop)."""
+    cost ~15us each and stall the drain loop).
+
+    Pipelined: the main thread only drains the request queue into a shared
+    buffer while an inference thread runs decode+forward+respond, so queue
+    draining overlaps GPU work instead of serializing with it — the forward
+    pass carries a several-ms fixed dispatch cost that otherwise caps each
+    server's cycle rate."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import threading
 
     import torch
     from .az_net import AZNet, load_checkpoint as load_az
@@ -323,13 +330,12 @@ def _inference_server(
     if use_fp16:
         model = model.half()
 
-    workers_done = 0
-    pending: List[Tuple[int, int, bytes]] = []  # (worker_id, req_id, packed state)
+    buf: List[Tuple[int, int, bytes]] = []  # (worker_id, req_id, packed state)
+    cond = threading.Condition()
+    done = False
 
-    def _flush_batch():
-        if not pending:
-            return
-        batch_np = unpack_states_batch([t for _, _, t in pending])
+    def _respond(take: List[Tuple[int, int, bytes]]) -> None:
+        batch_np = unpack_states_batch([t for _, _, t in take])
         with torch.no_grad():
             x = torch.from_numpy(batch_np).to(device)
             if use_fp16:
@@ -338,36 +344,43 @@ def _inference_server(
             policy_np = policy_logits.float().cpu().numpy()
             values_np = values.float().cpu().numpy()
         by_worker: Dict[int, list] = {}
-        for i, (wid, rid, _) in enumerate(pending):
+        for i, (wid, rid, _) in enumerate(take):
             by_worker.setdefault(wid, []).append(
                 (rid, policy_np[i], float(values_np[i])))
         for wid, items in by_worker.items():
             response_queues[wid].put(items)
-        pending.clear()
 
-    while workers_done < num_workers:
-        try:
-            item = request_queue.get(timeout=batch_timeout)
-        except Exception:
-            _flush_batch()
-            continue
-
-        # Drain whatever is already queued before considering a flush — a
-        # timed get costs far more than get_nowait, and requests arrive in
-        # bursts from `concurrency` blocked game threads per worker.
+    def _infer_loop() -> None:
         while True:
-            if item is _SHUTDOWN:
-                workers_done += 1
-            else:
-                pending.append(item)
-                if len(pending) >= batch_size:
-                    _flush_batch()
-            try:
-                item = request_queue.get_nowait()
-            except Exception:
-                break
+            with cond:
+                while not buf and not done:
+                    cond.wait()
+                if not buf and done:
+                    return
+                # Partial batch: give stragglers one bounded chance to join.
+                if len(buf) < batch_size and not done:
+                    cond.wait(batch_timeout)
+                take = buf[:batch_size]
+                del buf[:batch_size]
+            if take:
+                _respond(take)
 
-    _flush_batch()
+    infer = threading.Thread(target=_infer_loop, daemon=True)
+    infer.start()
+
+    workers_done = 0
+    while workers_done < num_workers:
+        item = request_queue.get()
+        if item is _SHUTDOWN:
+            workers_done += 1
+            continue
+        with cond:
+            buf.append(item)
+            cond.notify()
+    with cond:
+        done = True
+        cond.notify()
+    infer.join()
 
 
 # ---------------------------------------------------------------------------
@@ -1124,16 +1137,23 @@ def _inference_server_persistent(
     """Long-lived batched inference server. Services eval requests and, between
     rounds, handles control messages: ("__cmd__","reload",ckpt) reloads the model
     and acks; ("__cmd__","stop",_) exits. Blocks (no busy-spin) while idle.
-    Responses are grouped per worker: [(req_id, policy, value), ...]."""
+    Responses are grouped per worker: [(req_id, policy, value), ...].
+
+    Pipelined: the main thread only drains the request queue into a shared
+    buffer while an inference thread runs decode+forward+respond, so queue
+    draining overlaps GPU work instead of serializing with it. Control
+    messages ride the same buffer to keep flush-before-reload ordering."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import threading
 
     import torch
     from .az_net import AZNet, load_checkpoint as load_az
 
     model = None
-    pending: List[Tuple[int, int, bytes]] = []  # (worker_id, req_id, packed state)
-    pending_since = 0.0
+    buf: list = []          # eval items and _CMD_TAG items, arrival order
+    cond = threading.Condition()
+    buf_since = 0.0         # monotonic time the buffer went non-empty
     metrics = {}
 
     def _reset_metrics() -> None:
@@ -1146,23 +1166,19 @@ def _inference_server_persistent(
 
     _reset_metrics()
 
-    def _flush_batch(reason: str = "control"):
-        nonlocal pending_since
-        if not pending or model is None:
-            pending.clear()
-            pending_since = 0.0
+    def _respond(take: list, waited_s: float, reason: str) -> None:
+        if model is None:
             return
-        now = time.monotonic()
-        count = len(pending)
+        count = len(take)
         metrics["batches"] += 1
         metrics["positions"] += count
         metrics["max_batch"] = max(metrics["max_batch"], count)
-        metrics["batch_wait_s"] += now - pending_since
+        metrics["batch_wait_s"] += waited_s
         if reason == "full":
             metrics["full_batches"] += 1
         elif reason == "timeout":
             metrics["timeout_batches"] += 1
-        batch_np = unpack_states_batch([t for _, _, t in pending])
+        batch_np = unpack_states_batch([t for _, _, t in take])
         infer_t0 = time.monotonic()
         with torch.inference_mode():
             x = torch.from_numpy(batch_np).to(device)
@@ -1173,63 +1189,93 @@ def _inference_server_persistent(
             values_np = values.float().cpu().numpy()
         metrics["inference_s"] += time.monotonic() - infer_t0
         by_worker: Dict[int, list] = {}
-        for i, (wid, rid, _) in enumerate(pending):
+        for i, (wid, rid, _) in enumerate(take):
             by_worker.setdefault(wid, []).append(
                 (rid, policy_np[i], float(values_np[i])))
         for wid, items in by_worker.items():
             response_queues[wid].put(items)
-        pending.clear()
-        pending_since = 0.0
 
-    stop = False
-    while not stop:
-        # Use a short timeout only when a partial batch is waiting to be flushed;
-        # otherwise block so an idle server (e.g. during training) doesn't spin.
-        if pending:
-            try:
-                item = request_queue.get(timeout=batch_timeout)
-            except Exception:
-                _flush_batch("timeout")
-                continue
-        else:
-            item = request_queue.get()
-
-        # Drain everything already queued before going back to a (much more
-        # expensive) timed get — requests arrive in bursts.
-        while True:
-            if item[0] == _CMD_TAG:
-                _flush_batch()
-                _, sub, arg = item
-                if sub == "reload":
-                    if arg:
-                        model = load_az(arg, device=device)
-                    else:
-                        model = AZNet().to(device)
-                        model.eval()
-                    if use_fp16:
-                        model = model.half()
-                    _reset_metrics()
-                    ack_queue.put("ready")
-                elif sub == "stats":
-                    result = dict(metrics)
-                    result["avg_batch"] = (
-                        result["positions"] / result["batches"]
-                        if result["batches"] else 0.0
-                    )
-                    ack_queue.put(result)
-                elif sub == "stop":
-                    stop = True
-                    break
+    def _handle_cmd(item) -> bool:
+        """Returns True on stop. Eval items queued before this cmd have
+        already been flushed (the infer loop takes them first)."""
+        nonlocal model
+        _, sub, arg = item
+        if sub == "reload":
+            if arg:
+                model = load_az(arg, device=device)
             else:
-                if not pending:
-                    pending_since = time.monotonic()
-                pending.append(item)
-                if len(pending) >= batch_size:
-                    _flush_batch("full")
-            try:
-                item = request_queue.get_nowait()
-            except Exception:
-                break
+                model = AZNet().to(device)
+                model.eval()
+            if use_fp16:
+                model = model.half()
+            _reset_metrics()
+            ack_queue.put("ready")
+        elif sub == "stats":
+            result = dict(metrics)
+            result["avg_batch"] = (
+                result["positions"] / result["batches"]
+                if result["batches"] else 0.0
+            )
+            ack_queue.put(result)
+        elif sub == "stop":
+            return True
+        return False
+
+    def _infer_loop() -> None:
+        nonlocal buf_since
+        while True:
+            with cond:
+                while not buf:
+                    cond.wait()
+                # A command boundary flushes whatever evals precede it, so
+                # take evals only up to the first command (or batch_size).
+                n = 0
+                for it in buf:
+                    if n >= batch_size or it[0] == _CMD_TAG:
+                        break
+                    n += 1
+                if n == 0:
+                    cmd = buf.pop(0)
+                    take, reason, waited = None, "", 0.0
+                else:
+                    if n < batch_size and n == len(buf):
+                        # Partial batch, no command queued: give stragglers
+                        # one bounded chance to join.
+                        cond.wait(batch_timeout)
+                        n = 0
+                        for it in buf:
+                            if n >= batch_size or it[0] == _CMD_TAG:
+                                break
+                            n += 1
+                    cmd = None
+                    take = buf[:n]
+                    del buf[:n]
+                    reason = "full" if n >= batch_size else "timeout"
+                    now = time.monotonic()
+                    waited = now - buf_since
+                    # Remaining items become the next batch's wait baseline
+                    # (the buffer may never empty under continuous load).
+                    buf_since = now
+            if cmd is not None:
+                if _handle_cmd(cmd):
+                    return
+            elif take:
+                _respond(take, waited, reason)
+
+    infer = threading.Thread(target=_infer_loop, daemon=True)
+    infer.start()
+
+    while True:
+        item = request_queue.get()
+        is_cmd = item[0] == _CMD_TAG
+        with cond:
+            if not buf:
+                buf_since = time.monotonic()
+            buf.append(item)
+            cond.notify()
+        if is_cmd and item[1] == "stop":
+            break
+    infer.join()
 
 
 def _game_worker_persistent(
