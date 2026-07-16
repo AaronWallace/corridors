@@ -8,6 +8,7 @@ worker counts.
 from __future__ import annotations
 
 import argparse
+import time
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .az_selfplay import (
@@ -71,12 +72,85 @@ def benchmark_configuration(
         "concurrency": concurrency,
         "inference_servers": inference_servers,
         "fp16": fp16,
+        "batch_timeout_ms": batch_timeout_ms,
     })
     elapsed = max(float(metrics["elapsed_s"]), 1e-9)
     metrics["games_per_s"] = metrics["games"] / elapsed
     metrics["positions_per_s"] = metrics["positions"] / elapsed
     metrics["evals_per_s"] = metrics["eval_requests"] / elapsed
     return metrics
+
+
+def row_from_metrics(m: Dict[str, object]) -> Dict[str, object]:
+    """Normalize one benchmark_configuration result into a stored history row."""
+    inf = m.get("inference") or {}
+    batches = int(inf.get("batches", 0))
+    nsrv = max(1, int(inf.get("num_servers", m.get("inference_servers", 1))))
+    elapsed = max(float(m["elapsed_s"]), 1e-9)
+    return {
+        "workers": int(m["workers"]),
+        "batch": int(m["batch_size"]),
+        "concurrency": int(m["concurrency"]),
+        "servers": int(m.get("inference_servers", 1)),
+        "fp16": bool(m.get("fp16", False)),
+        "batch_timeout_ms": float(m.get("batch_timeout_ms", 0.0)),
+        "evals_per_s": float(m["evals_per_s"]),
+        "positions_per_s": float(m["positions_per_s"]),
+        "games_per_s": float(m["games_per_s"]),
+        "avg_batch": float(inf.get("avg_batch", 0.0)),
+        "fill_pct": (100.0 * int(inf.get("full_batches", 0)) / batches
+                     if batches else 0.0),
+        "request_wait_ms": float(m.get("avg_request_wait_ms", 0.0)),
+        # inference_s sums wall-time across parallel servers, so busy fraction
+        # is per-server-average.
+        "gpu_busy_pct": 100.0 * float(inf.get("inference_s", 0.0)) / (elapsed * nsrv),
+    }
+
+
+def record_benchmark(hw: dict, *, device: str, simulations: int, max_plies: int,
+                     games: int, checkpoint: str,
+                     results: List[Dict[str, object]]) -> Dict[str, object]:
+    """Append a history record and persist the winner as the tuned default.
+
+    The saved profile is always the fastest fp32 row: fp16 changes network
+    outputs, so it is recorded (and flagged via "fp16_recommended") but never
+    auto-applied. Returns the stored record.
+    """
+    from .az_bench_store import append_record, hardware_fingerprint, select_best
+
+    ram_gb = int(hw.get("ram_gb", 0))
+    rows = [row_from_metrics(m) for m in results]
+    best, fp16_recommended = select_best(rows)
+    if device == "cuda":
+        key = hardware_tuning_key(
+            "cuda", hw["ncpu"], hw["gpu_name"], hw["vram_gb"], hw["gpu_count"],
+            ram_gb=ram_gb)
+        fingerprint = hardware_fingerprint({**hw, "device": "cuda"})
+        profile = {
+            "workers": best["workers"],
+            "inference_batch": best["batch"],
+            "concurrency": best["concurrency"],
+            "inference_servers": best["servers"],
+            "batch_timeout_ms": best["batch_timeout_ms"],
+        }
+    else:
+        key = hardware_tuning_key("cpu", hw["ncpu"], ram_gb=ram_gb)
+        # CPU-local self-play has no inference server; only workers matter.
+        fingerprint = hardware_fingerprint({
+            "device": "cpu", "ncpu": hw["ncpu"], "ram_gb": ram_gb})
+        profile = {"workers": best["workers"]}
+    save_tuning_profile(key, profile)
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "fingerprint": fingerprint,
+        "params": {"simulations": simulations, "max_plies": max_plies,
+                   "games": games, "checkpoint": checkpoint},
+        "rows": rows,
+        "best": profile,
+        "fp16_recommended": fp16_recommended,
+    }
+    append_record(key, record)
+    return record
 
 
 def _parse_gpu_configs(value: str) -> Iterable[Tuple[int, int]]:
@@ -161,16 +235,20 @@ def main() -> None:
                         f"{busy:>8.1f}",
                         flush=True,
                     )
-        best = max(results, key=lambda result: result["positions_per_s"])
-        key = hardware_tuning_key(
-            "cuda", hw["ncpu"], hw["gpu_name"], hw["vram_gb"], hw["gpu_count"])
-        save_tuning_profile(key, {
-            "workers": int(best["workers"]),
-            "inference_batch": int(best["batch_size"]),
-            "concurrency": int(best["concurrency"]),
-        })
+        record = record_benchmark(
+            hw, device="cuda", simulations=args.simulations,
+            max_plies=args.max_plies, games=games, checkpoint=args.checkpoint,
+            results=results)
+        best = record["best"]
         print(f"saved recommendation: workers={best['workers']} "
-              f"batch={best['batch_size']} concurrency={best['concurrency']}")
+              f"batch={best['inference_batch']} "
+              f"concurrency={best['concurrency']} "
+              f"servers={best['inference_servers']} "
+              f"batch_timeout_ms={best['batch_timeout_ms']:g}")
+        if record["fp16_recommended"]:
+            print("note: an fp16 configuration was fastest — fp16 is never "
+                  "auto-applied (it changes network outputs); enable "
+                  "inference_fp16 explicitly to use it")
     else:
         configs = cpu_configurations(workers)
         games = args.games or max(32, max(configs) * 2)
@@ -182,15 +260,16 @@ def main() -> None:
             m = benchmark_configuration(
                 device="cpu", games=games, simulations=args.simulations,
                 max_plies=args.max_plies, workers=workers,
+                checkpoint=args.checkpoint,
             )
             results.append(m)
             print(f"{workers:>7} {m['elapsed_s']:>7.2f} "
                   f"{m['games_per_s']:>7.2f} {m['positions_per_s']:>7.1f}")
-        best = max(results, key=lambda result: result["positions_per_s"])
-        save_tuning_profile(hardware_tuning_key("cpu", hw["ncpu"]), {
-            "workers": int(best["workers"]),
-        })
-        print(f"saved recommendation: workers={best['workers']}")
+        record = record_benchmark(
+            hw, device="cpu", simulations=args.simulations,
+            max_plies=args.max_plies, games=games, checkpoint=args.checkpoint,
+            results=results)
+        print(f"saved recommendation: workers={record['best']['workers']}")
 
 
 if __name__ == "__main__":
