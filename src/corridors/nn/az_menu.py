@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
+from rich.tree import Tree
 
 from . import datasets as ds_mod
 from .checkpoints import (
@@ -304,6 +306,112 @@ def _arena_matchup_table(incumbent: str, candidate: str) -> Table:
             str(lineage),
         )
     return table
+
+
+_ANCESTRY_LINKS = (
+    ("promoted_from", "promoted from"),
+    ("resumed_from", "resumed from"),
+    ("seeded_from", "seeded from"),
+)
+
+
+def _checkpoint_date(name: str, weights: Path, meta: dict) -> str:
+    """Best available human-readable date, including for missing checkpoints."""
+    if weights.exists():
+        try:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(weights.stat().st_mtime))
+            return f"modified {stamp}"
+        except OSError:
+            pass
+    for key in ("promoted_at", "saved_at", "created_at"):
+        if meta.get(key):
+            return f"date {meta[key]}"
+    match = re.search(r"(?<!\d)(20\d{6})[-_](\d{6})(?!\d)", name)
+    if match:
+        day, clock = match.groups()
+        return (f"date ~{day[:4]}-{day[4:6]}-{day[6:]} "
+                f"{clock[:2]}:{clock[2:4]}")
+    return "date -"
+
+
+def _ancestry_node_label(name: str, relation: str, ratings: dict[str, float]) -> Text:
+    """Describe one checkpoint without requiring its weights to still exist."""
+    weights = resolve_checkpoint_path(CHECKPOINT_ROOT, name)
+    exists = weights.exists()
+    meta = _read_meta(name)
+    elo = checkpoint_elo(weights, ratings)
+
+    label = Text()
+    if relation:
+        label.append(f"{relation}  ", style="dim")
+    label.append(name, style="bold" if exists else "bold red")
+    if not exists:
+        label.append("  [deleted]", style="red")
+    label.append("  ·  ", style="dim")
+    label.append(f"Elo {elo:+.0f}" if isinstance(elo, (int, float)) else "Elo -")
+    label.append("  ·  ", style="dim")
+    label.append(_checkpoint_date(name, weights, meta))
+    epoch = meta.get("epoch")
+    if epoch is not None:
+        label.append("  ·  ", style="dim")
+        label.append(f"epoch {epoch}")
+    dataset = meta.get("data_run") or meta.get("dataset")
+    if dataset:
+        label.append("  ·  ", style="dim")
+        label.append(f"data {dataset}", style="dim")
+    return label
+
+
+def _add_checkpoint_ancestors(branch: Tree, name: str, ratings: dict[str, float],
+                              seen: frozenset[str]) -> bool:
+    """Add every recorded ancestry relation, guarding malformed cyclic metadata."""
+    meta = _read_meta(name)
+    added = False
+    linked_names: set[str] = set()
+    for key, relation in _ANCESTRY_LINKS:
+        ancestor = meta.get(key)
+        if not isinstance(ancestor, str) or not ancestor or ancestor == name:
+            continue
+        if ancestor in linked_names:
+            continue
+        linked_names.add(ancestor)
+        added = True
+        child = branch.add(_ancestry_node_label(ancestor, relation, ratings))
+        if ancestor in seen:
+            child.add(Text("cycle in recorded ancestry", style="yellow"))
+            continue
+        _add_checkpoint_ancestors(child, ancestor, ratings, seen | {ancestor})
+    return added
+
+
+def _checkpoint_ancestry_tree() -> Tree:
+    """Build a forest of available AZ checkpoints and their recorded ancestors."""
+    ratings = load_elo_ratings(CHECKPOINT_ROOT)
+    names = [
+        path.stem
+        for path in ranked_checkpoint_paths(CHECKPOINT_ROOT)
+        if _is_az_checkpoint(path.stem)
+    ]
+    tree = Tree(Text("AlphaZero checkpoint ancestry", style="bold"))
+    if not names:
+        tree.add(Text("no AlphaZero checkpoints", style="yellow"))
+        return tree
+    for name in names:
+        branch = tree.add(_ancestry_node_label(name, "", ratings))
+        if not _add_checkpoint_ancestors(branch, name, ratings, frozenset({name})):
+            branch.add(Text("no recorded ancestry", style="dim"))
+    return tree
+
+
+def _show_checkpoint_ancestry() -> None:
+    console = _console()
+    console.print(Panel(
+        _checkpoint_ancestry_tree(),
+        title="[bold]Checkpoint ancestry[/bold]",
+        subtitle=("[dim]branches point to ancestors · red = deleted · "
+                  "~ date inferred from name[/dim]"),
+        border_style=STYLE_GRID,
+    ))
 
 
 def _select_seed_datasets(current_run: str) -> list[str]:
@@ -1330,10 +1438,11 @@ def az_menu() -> None:
         table.add_row("2", "Train network")
         table.add_row("3", "Full loop (self-play → train → repeat)")
         table.add_row("4", "Benchmark and tune self-play")
+        table.add_row("5", "View checkpoint ancestry")
         table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]AlphaZero pipeline[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "q"], default="3")
+        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "q"], default="3")
         if choice == "1":
             _selfplay()
         elif choice == "2":
@@ -1342,5 +1451,7 @@ def az_menu() -> None:
             _full_loop()
         elif choice == "4":
             _benchmark_selfplay()
+        elif choice == "5":
+            _show_checkpoint_ancestry()
         elif choice == "q":
             return
