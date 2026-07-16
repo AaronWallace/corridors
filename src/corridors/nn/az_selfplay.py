@@ -840,9 +840,9 @@ def _load_tuning_profile(hardware_key: str) -> dict:
         # Profiles saved before total RAM joined the fingerprint stay usable.
         profile = profiles.get(hardware_key.split("|ram=", 1)[0], {})
     if not profile:
-        # az_benchmarks.json is committed to the repo, so a fresh pod of a
-        # known hardware class inherits the recorded winner without local
-        # settings and without re-benchmarking.
+        # The az_benchmarks/ store is committed to the repo, so a fresh pod
+        # of a known hardware class inherits the recorded winner without
+        # local settings and without re-benchmarking.
         try:
             from .az_bench_store import latest_record
             record = latest_record(hardware_key)

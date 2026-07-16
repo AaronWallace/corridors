@@ -23,11 +23,13 @@ htmlcov/
 .vscode/
 .DS_Store
 
-# Corridors runtime state. az_benchmarks.json is intentionally tracked:
-# benchmark history is keyed by stable hardware fingerprints, so committed
-# records give a fresh pod of a known hardware class its tuned self-play
-# defaults without re-benchmarking.
+# Corridors runtime state. The az_benchmarks/ directory is intentionally
+# tracked: benchmark history is keyed by stable hardware fingerprints (one
+# file per fingerprint, so pods never merge-conflict), giving a fresh pod of
+# a known hardware class its tuned self-play defaults without
+# re-benchmarking. az_benchmarks.json is the legacy machine-local monolith.
 corridors.json
+az_benchmarks.json
 corridors_tt.sqlite3
 corridors_tt.sqlite3-journal
 corridors_tt.sqlite3-wal

@@ -1,15 +1,21 @@
 """Persistent AlphaZero benchmark history.
 
-Full run history is appended per hardware fingerprint to az_benchmarks.json
-(a sidecar next to corridors.json — the history is too bulky and append-only
-for the settings whitelist), capped per fingerprint. The latest winner is
-mirrored into the "az_tuning_profiles" settings entry by the benchmark code,
-so detect_hardware() keeps working from settings alone.
+Full run history is appended per hardware fingerprint, one file per
+fingerprint under az_benchmarks/ (next to corridors.json). The directory is
+committed to the repo — records carry no machine-transient identity, so pods
+of a known hardware class inherit tuned defaults without re-benchmarking —
+and per-fingerprint files mean two hardware classes never touch the same
+file, so concurrent pods cannot merge-conflict. A pre-directory monolithic
+az_benchmarks.json is still read as a (machine-local) legacy fallback. The
+latest winner is mirrored into the "az_tuning_profiles" settings entry by the
+benchmark code, so detect_hardware() keeps working from settings alone.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -22,9 +28,22 @@ FINGERPRINT_FIELDS = ("device", "gpu_name", "vram_gb", "gpu_count", "ncpu",
                       "ram_gb")
 
 
-def _store_path() -> Path:
+def _store_dir() -> Path:
+    from .. import settings
+    return settings.path().with_name("az_benchmarks")
+
+
+def _legacy_path() -> Path:
     from .. import settings
     return settings.path().with_name("az_benchmarks.json")
+
+
+def _file_for(hardware_key: str) -> Path:
+    """Per-fingerprint file: readable slug plus a short hash for uniqueness
+    (keys contain '|', spaces, and '=' which are not filesystem-safe)."""
+    slug = re.sub(r"[^a-z0-9.]+", "-", hardware_key.lower()).strip("-")[:80]
+    digest = hashlib.sha1(hardware_key.encode("utf-8")).hexdigest()[:8]
+    return _store_dir() / f"{slug}-{digest}.json"
 
 
 def hardware_fingerprint(hw: dict) -> dict:
@@ -40,32 +59,46 @@ def hardware_fingerprint(hw: dict) -> dict:
 
 def load_store() -> Dict[str, List[dict]]:
     """All recorded benchmark history, keyed by hardware fingerprint key."""
-    path = _store_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    records = data.get("records") if isinstance(data, dict) else None
-    return records if isinstance(records, dict) else {}
+    records: Dict[str, List[dict]] = {}
+    legacy = _legacy_path()
+    if legacy.exists():
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+            old = data.get("records") if isinstance(data, dict) else None
+            if isinstance(old, dict):
+                records.update(old)
+        except (OSError, ValueError):
+            pass
+    store_dir = _store_dir()
+    if store_dir.is_dir():
+        for path in sorted(store_dir.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            key = data.get("hardware_key") if isinstance(data, dict) else None
+            history = data.get("records") if isinstance(data, dict) else None
+            if isinstance(key, str) and isinstance(history, list):
+                # Per-fingerprint files supersede any legacy monolith copy.
+                records[key] = history
+    return records
 
 
-def _save_store(records: Dict[str, List[dict]]) -> None:
+def _save_key(hardware_key: str, history: List[dict]) -> None:
     try:
-        _store_path().write_text(
-            json.dumps({"version": 1, "records": records}, indent=2),
+        _store_dir().mkdir(parents=True, exist_ok=True)
+        _file_for(hardware_key).write_text(
+            json.dumps({"version": 1, "hardware_key": hardware_key,
+                        "records": history}, indent=2),
             encoding="utf-8")
     except OSError:
         pass
 
 
 def append_record(hardware_key: str, record: dict) -> None:
-    records = load_store()
-    history = list(records.get(hardware_key, []))
+    history = list(load_store().get(hardware_key, []))
     history.append(record)
-    records[hardware_key] = history[-MAX_RECORDS_PER_FINGERPRINT:]
-    _save_store(records)
+    _save_key(hardware_key, history[-MAX_RECORDS_PER_FINGERPRINT:])
 
 
 def records_for(hardware_key: str) -> List[dict]:

@@ -100,10 +100,33 @@ def test_records_append_retrieve_and_cap(tmp_path, monkeypatch):
     assert len(history) == MAX_RECORDS_PER_FINGERPRINT
     assert history[0]["marker"] == total - MAX_RECORDS_PER_FINGERPRINT
     assert latest_record(key)["marker"] == total - 1
-    # Other fingerprints and the sidecar location are unaffected.
+    # Other fingerprints are unaffected and live in their own files, so
+    # concurrent pods of different hardware classes never merge-conflict.
     assert records_for(other) == [{"marker": "other"}]
-    assert (tmp_path / "az_benchmarks.json").exists()
+    store_files = list((tmp_path / "az_benchmarks").glob("*.json"))
+    assert len(store_files) == 2
     assert set(load_store()) == {key, other}
+
+
+def test_legacy_monolith_is_read_and_superseded_per_key(tmp_path, monkeypatch):
+    import json
+    _use_tmp_settings(tmp_path, monkeypatch)
+    key = az_selfplay.hardware_tuning_key("cuda", 16, "Example GPU", 8.0, 1,
+                                          ram_gb=32)
+    other = az_selfplay.hardware_tuning_key("cpu", 64, ram_gb=256)
+    (tmp_path / "az_benchmarks.json").write_text(json.dumps({
+        "version": 1,
+        "records": {key: [{"marker": "legacy"}], other: [{"marker": "keep"}]},
+    }), encoding="utf-8")
+
+    # Legacy records are visible before any new-format write.
+    assert records_for(key) == [{"marker": "legacy"}]
+    # Appending migrates that key's history (legacy + new) into its own file;
+    # untouched keys keep serving from the legacy monolith.
+    append_record(key, {"marker": "new"})
+    assert records_for(key) == [{"marker": "legacy"}, {"marker": "new"}]
+    assert records_for(other) == [{"marker": "keep"}]
+    assert len(list((tmp_path / "az_benchmarks").glob("*.json"))) == 1
 
 
 def test_select_best_prefers_fastest_fp32_and_flags_fp16():
