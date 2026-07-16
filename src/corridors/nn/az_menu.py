@@ -144,7 +144,8 @@ def _detect_and_show_hw() -> dict:
                           f"other {gpu_n - 1}, run separate jobs pinned with "
                           f"CUDA_VISIBLE_DEVICES=<n> (see below).[/dim]")
         console.print(f"[dim]defaults ({source}): workers {hw['workers']} · inference batch "
-                      f"{hw['inference_batch']} · games/iter {hw['games_per_iter']} · "
+                      f"{hw['inference_batch']} · servers {hw.get('inference_servers', 1)} · "
+                      f"games/iter {hw['games_per_iter']} · "
                       f"train batch {hw['train_batch']}[/dim]")
     else:
         console.print(f"\n[dim]detected: CPU only ({hw['ncpu']} cores{ram_tag}), no CUDA GPU[/dim]")
@@ -158,7 +159,8 @@ def _detect_and_show_hw() -> dict:
 
 def _prompt_selfplay_params(num_games: int, hw: dict):
     """Prompt for the self-play device and parallelism. Returns
-    (device, workers, batch_size, concurrency).
+    (device, workers, batch_size, concurrency, inference_servers,
+    batch_timeout_ms).
 
     CPU-local self-play (each worker plays full games with its own model, no
     inference server) scales with cores, starts instantly, and streams completed
@@ -186,13 +188,16 @@ def _prompt_selfplay_params(num_games: int, hw: dict):
     batch_size = 64
     concurrency = 0
     inference_servers = 1
+    batch_timeout_ms = 0.0
     if device != "cpu":
         batch_size = _prompt_int("Inference batch size", hw["inference_batch"], 1, 8192)
         concurrency = _prompt_int("Concurrent games per worker (0=auto)",
                                   hw.get("concurrency", 0), 0, 256)
         inference_servers = _prompt_int("Inference servers (parallel, share the GPU)",
                                         hw.get("inference_servers", 1), 1, 64)
-    return device, workers, batch_size, concurrency, inference_servers
+        batch_timeout_ms = _prompt_float("Partial-batch flush timeout ms (0=default)",
+                                         hw.get("batch_timeout_ms", 0.0), 0.0, 1000.0)
+    return device, workers, batch_size, concurrency, inference_servers, batch_timeout_ms
 
 
 def _prompt_search_params() -> dict:
@@ -632,8 +637,8 @@ def _benchmark_selfplay() -> None:
         benchmark_configuration,
         cpu_configurations,
         gpu_configurations,
+        record_benchmark,
     )
-    from .az_selfplay import hardware_tuning_key, save_tuning_profile
     from rich.progress import (
         BarColumn,
         Progress,
@@ -658,13 +663,33 @@ def _benchmark_selfplay() -> None:
     simulations = _prompt_int("MCTS simulations per move", 50, 5, 5000)
     max_plies = _prompt_int("Maximum plies per benchmark game", 12, 2, 1000)
 
+    server_counts = [1]
+    fp16_modes = [False]
+    batch_timeout_ms = 0.0
+    checkpoint = ""
     if device == "cuda":
         configs = gpu_configurations(hw["inference_batch"], workers)
         default_games = max(32, max(workers * c for _, c in configs))
+        max_servers = _prompt_int("Inference servers to sweep up to (1=no sweep)",
+                                  hw.get("inference_servers", 1), 1, 64)
+        server_counts = sorted({1, max(1, max_servers // 2), max_servers})
+        if Confirm.ask("[dim]Also compare fp16 inference? "
+                       "(recorded only — never auto-applied)[/dim]", default=False):
+            fp16_modes = [False, True]
+        batch_timeout_ms = _prompt_float("Partial-batch flush timeout ms (0=default)",
+                                         hw.get("batch_timeout_ms", 0.0), 0.0, 1000.0)
     else:
         configs = cpu_configurations(workers)
         default_games = max(32, max(configs) * 2)
     games = _prompt_int("Games per configuration", default_games, 1, 100_000)
+
+    ckpts = []
+    if CHECKPOINT_ROOT.exists():
+        ckpts = [f.stem for f in ranked_checkpoint_paths(CHECKPOINT_ROOT)
+                 if _is_az_checkpoint(f.stem) and not f.stem.endswith("_candidate")]
+    if ckpts:
+        checkpoint = _select_checkpoint(
+            ckpts, "Checkpoint for realistic tree shapes; blank = random init")
 
     results = []
 
@@ -700,13 +725,21 @@ def _benchmark_selfplay() -> None:
 
     try:
         if device == "cuda":
-            for index, (batch, concurrency) in enumerate(configs, 1):
-                label = f"[{index}/{len(configs)}] batch {batch}, concurrency {concurrency}"
+            combos = [(servers, fp16, batch, concurrency)
+                      for servers in server_counts
+                      for fp16 in fp16_modes
+                      for batch, concurrency in configs]
+            for index, (servers, fp16, batch, concurrency) in enumerate(combos, 1):
+                label = (f"[{index}/{len(combos)}] batch {batch}, "
+                         f"concurrency {concurrency}, servers {servers}"
+                         + (", fp16" if fp16 else ""))
                 results.append(run_with_progress(
                     label,
                     device=device, games=games, simulations=simulations,
                     max_plies=max_plies, workers=workers,
                     batch_size=batch, concurrency=concurrency,
+                    checkpoint=checkpoint, inference_servers=servers,
+                    fp16=fp16, batch_timeout_ms=batch_timeout_ms,
                 ))
         else:
             for index, worker_count in enumerate(configs, 1):
@@ -715,6 +748,7 @@ def _benchmark_selfplay() -> None:
                     label,
                     device=device, games=games, simulations=simulations,
                     max_plies=max_plies, workers=worker_count,
+                    checkpoint=checkpoint,
                 ))
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]benchmark interrupted[/dim]")
@@ -724,6 +758,8 @@ def _benchmark_selfplay() -> None:
     if device == "cuda":
         table.add_column("Batch", justify="right")
         table.add_column("Concurrency", justify="right")
+        table.add_column("Servers", justify="right")
+        table.add_column("fp16", justify="center")
         table.add_column("Avg batch", justify="right")
         table.add_column("Request", justify="right")
         table.add_column("Eval/s", justify="right")
@@ -738,6 +774,8 @@ def _benchmark_selfplay() -> None:
             inference = result["inference"]
             row = [
                 str(result["batch_size"]), str(result["concurrency"]),
+                str(result["inference_servers"]),
+                "y" if result["fp16"] else "-",
                 f"{inference.get('avg_batch', 0):.1f}",
                 f"{result['avg_request_wait_ms']:.1f} ms",
                 f"{result['evals_per_s']:.0f}", *common,
@@ -747,27 +785,24 @@ def _benchmark_selfplay() -> None:
         table.add_row(*row)
     console.print(table)
 
-    best = max(results, key=lambda result: result["positions_per_s"])
+    record = record_benchmark(
+        hw, device=device, simulations=simulations, max_plies=max_plies,
+        games=games, checkpoint=checkpoint, results=results)
+    best = record["best"]
     if device == "cuda":
         recommendation = (
-            f"batch {best['batch_size']}, concurrency {best['concurrency']}, "
-            f"workers {best['workers']}"
+            f"batch {best['inference_batch']}, concurrency {best['concurrency']}, "
+            f"servers {best['inference_servers']}, workers {best['workers']}"
         )
     else:
         recommendation = f"{best['workers']} workers"
-    if device == "cuda":
-        key = hardware_tuning_key(
-            "cuda", hw["ncpu"], hw["gpu_name"], hw["vram_gb"], hw["gpu_count"])
-        save_tuning_profile(key, {
-            "workers": int(best["workers"]),
-            "inference_batch": int(best["batch_size"]),
-            "concurrency": int(best["concurrency"]),
-        })
-    else:
-        key = hardware_tuning_key("cpu", hw["ncpu"])
-        save_tuning_profile(key, {"workers": int(best["workers"])})
     console.print(f"[green]Recommended for this host:[/green] {recommendation}")
+    if record["fp16_recommended"]:
+        console.print("[yellow]fp16 was fastest[/yellow] [dim]— never applied "
+                      "automatically (it changes network outputs); enable it "
+                      "explicitly when configuring a run.[/dim]")
     console.print("[green]Saved as the default for matching hardware.[/green]")
+    console.print("[dim]Recorded to benchmark history (menu: View benchmark history).[/dim]")
     console.print("[dim]No training data or checkpoints were written.[/dim]")
 
 
@@ -785,8 +820,8 @@ def _selfplay() -> None:
     num_games = _prompt_int("Number of games", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    sp_device, workers, batch_size, concurrency, inference_servers = \
-        _prompt_selfplay_params(num_games, hw)
+    sp_device, workers, batch_size, concurrency, inference_servers, \
+        batch_timeout_ms = _prompt_selfplay_params(num_games, hw)
     search_params = _prompt_search_params()
 
     # Check for existing checkpoint
@@ -814,6 +849,7 @@ def _selfplay() -> None:
         batch_size=batch_size,
         concurrent_games=concurrency,
         inference_servers=inference_servers,
+        batch_timeout_ms=batch_timeout_ms,
         checkpoint=checkpoint,
         device=sp_device,
         **search_params,
@@ -1099,8 +1135,8 @@ def _full_loop() -> None:
     epochs_per_iter = _prompt_int("Target training epochs per iteration (adaptive)", 10, 1, 1000)
     train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
-    device, workers, sp_batch_size, concurrency, inference_servers = \
-        _prompt_selfplay_params(games_per_iter, hw)
+    device, workers, sp_batch_size, concurrency, inference_servers, \
+        batch_timeout_ms = _prompt_selfplay_params(games_per_iter, hw)
     search_params = _prompt_search_params()
     max_positions = _prompt_int(
         "Replay buffer: keep last N positions (0=all; e.g. 300000 ≈ recent games)",
@@ -1151,6 +1187,7 @@ def _full_loop() -> None:
         min_mcts=min_mcts, max_mcts=max_mcts, max_plies=max_plies,
         workers=workers, batch_size=sp_batch_size,
         concurrent_games=concurrency, inference_servers=inference_servers,
+        batch_timeout_ms=batch_timeout_ms,
         device=device,
         **search_params,
     )
@@ -1424,6 +1461,91 @@ def _full_loop() -> None:
     ))
 
 
+def _benchmark_history_table(key: str, history: list, *, current: bool) -> Table:
+    """Stored benchmark runs for one hardware fingerprint, oldest first."""
+    tag = "this machine" if current else "other hardware"
+    table = Table(title=f"Benchmark history ({tag})", box=box.SIMPLE_HEAVY,
+                  header_style="dim")
+    table.add_column("When (UTC)", no_wrap=True)
+    table.add_column("Games", justify="right")
+    table.add_column("Sims", justify="right")
+    table.add_column("Plies", justify="right")
+    table.add_column("Ckpt", max_width=20, overflow="ellipsis", no_wrap=True)
+    table.add_column("Eval/s", justify="right")
+    table.add_column("Pos/s", justify="right")
+    table.add_column("Chosen", no_wrap=True)
+    table.add_column("fp16", justify="center")
+    for record in history:
+        params = record.get("params", {})
+        best = record.get("best", {})
+        rows = record.get("rows", [])
+        best_evals = max((r.get("evals_per_s", 0.0) for r in rows), default=0.0)
+        best_pos = max((r.get("positions_per_s", 0.0) for r in rows), default=0.0)
+        parts = [f"w{best['workers']}"] if "workers" in best else []
+        if "inference_batch" in best:
+            parts += [f"b{best['inference_batch']}", f"c{best.get('concurrency', 0)}",
+                      f"srv{best.get('inference_servers', 1)}"]
+            if best.get("batch_timeout_ms"):
+                parts.append(f"t{best['batch_timeout_ms']:g}ms")
+        table.add_row(
+            str(record.get("timestamp", "-")).replace("T", " ").rstrip("Z"),
+            str(params.get("games", "-")),
+            str(params.get("simulations", "-")),
+            str(params.get("max_plies", "-")),
+            params.get("checkpoint") or "-",
+            f"{best_evals:.0f}",
+            f"{best_pos:.1f}",
+            " ".join(parts) or "-",
+            "[yellow]y[/yellow]" if record.get("fp16_recommended") else "-",
+        )
+    return table
+
+
+def _view_benchmark_history() -> None:
+    """Stored benchmark runs plus the tuned defaults new loops will pick up."""
+    from .az_bench_store import load_store
+    from .az_selfplay import _load_tuning_profile, detect_hardware
+
+    console = _console()
+    console.print("\n[bold]Benchmark history[/bold]")
+    hw = detect_hardware()
+    store = load_store()
+    current_key = hw["hardware_key"]
+
+    console.print(f"[dim]this machine:[/dim] [white]{current_key}[/white]")
+    history = store.get(current_key, [])
+    if history:
+        console.print(_benchmark_history_table(current_key, history, current=True))
+    else:
+        console.print("[dim]no benchmark runs recorded for this hardware — "
+                      "run 'Benchmark and tune self-play' first[/dim]")
+
+    profile = _load_tuning_profile(current_key)
+    if profile:
+        active = " · ".join(f"{k} {v:g}" if isinstance(v, float) else f"{k} {v}"
+                            for k, v in sorted(profile.items()))
+        console.print(f"[green]active defaults for new self-play/loops:[/green] {active}")
+    else:
+        console.print("[dim]no tuned defaults saved — hardware heuristics apply[/dim]")
+    if history and history[-1].get("fp16_recommended"):
+        console.print("[yellow]fp16 ran fastest here[/yellow] [dim]— never applied "
+                      "automatically (it changes network outputs); enable it "
+                      "explicitly when configuring a run.[/dim]")
+
+    others = sorted(k for k in store if k != current_key)
+    if others:
+        console.print(f"\n[dim]other recorded hardware:[/dim]")
+        for index, key in enumerate(others, 1):
+            console.print(f"  [bold]{index}[/bold] [dim]{key} · "
+                          f"{len(store[key])} runs[/dim]")
+        raw = Prompt.ask("[dim]Show history for # (blank = back)[/dim]",
+                         default="").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(others):
+            key = others[int(raw) - 1]
+            console.print(f"[dim]hardware:[/dim] [white]{key}[/white]")
+            console.print(_benchmark_history_table(key, store[key], current=False))
+
+
 # ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
@@ -1438,11 +1560,13 @@ def az_menu() -> None:
         table.add_row("2", "Train network")
         table.add_row("3", "Full loop (self-play → train → repeat)")
         table.add_row("4", "Benchmark and tune self-play")
-        table.add_row("5", "View checkpoint ancestry")
+        table.add_row("5", "View benchmark history")
+        table.add_row("6", "View checkpoint ancestry")
         table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]AlphaZero pipeline[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "q"], default="3")
+        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6", "q"],
+                            default="3")
         if choice == "1":
             _selfplay()
         elif choice == "2":
@@ -1452,6 +1576,8 @@ def az_menu() -> None:
         elif choice == "4":
             _benchmark_selfplay()
         elif choice == "5":
+            _view_benchmark_history()
+        elif choice == "6":
             _show_checkpoint_ancestry()
         elif choice == "q":
             return

@@ -641,6 +641,26 @@ def _cgroup_available_gb() -> float:
     return 0.0
 
 
+def _windows_memory_gb() -> Optional[Tuple[float, float]]:
+    """(total, available) RAM in GB via GlobalMemoryStatusEx, None off-Windows."""
+    try:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        ms = _MS()
+        ms.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
+            return ms.ullTotalPhys / (1024 ** 3), ms.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        pass
+    return None
+
+
 def available_memory_gb() -> float:
     """Best-effort available RAM in GB (0.0 if it can't be determined). Takes the
     min of host-available and the cgroup limit so it's correct inside containers."""
@@ -658,22 +678,33 @@ def available_memory_gb() -> float:
         candidates.append(cg)
     if candidates:
         return min(candidates)
-    try:
-        import ctypes  # Windows
+    win = _windows_memory_gb()
+    return win[1] if win else 0.0
 
-        class _MS(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        ms = _MS()
-        ms.dwLength = ctypes.sizeof(_MS)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):
-            return ms.ullAvailPhys / (1024 ** 3)
+
+def total_memory_gb() -> float:
+    """Best-effort total RAM in GB (0.0 if unknown). Takes the min of the host
+    total and the cgroup limit so pods fingerprint by their memory allocation
+    rather than the host's — the allocation is what stays stable per pod class."""
+    _NO_LIMIT = 1 << 62
+    candidates = []
+    try:
+        with open("/proc/meminfo") as f:  # Linux host view
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    candidates.append(int(line.split()[1]) / (1024 * 1024))  # kB -> GB
+                    break
     except Exception:
         pass
-    return 0.0
+    limit = _read_int_file("/sys/fs/cgroup/memory.max")  # cgroup v2
+    if limit is None:
+        limit = _read_int_file("/sys/fs/cgroup/memory/memory.limit_in_bytes")  # v1
+    if limit is not None and 0 < limit < _NO_LIMIT:
+        candidates.append(limit / (1024 ** 3))
+    if candidates:
+        return min(candidates)
+    win = _windows_memory_gb()
+    return win[0] if win else 0.0
 
 
 def memory_worker_cap(per_worker_mb: int = _WORKER_MEM_MB) -> Optional[int]:
@@ -715,11 +746,16 @@ def _auto_concurrency(batch_size: int, num_workers: int) -> int:
 
 
 def hardware_tuning_key(device: str, ncpu: int, gpu_name: str = "",
-                        vram_gb: float = 0.0, gpu_count: int = 0) -> str:
-    """Stable hardware-class key; intentionally excludes volatile host names."""
+                        vram_gb: float = 0.0, gpu_count: int = 0,
+                        ram_gb: int = 0) -> str:
+    """Stable hardware-class key; intentionally excludes volatile identity
+    (hostnames, pod names, free-memory snapshots). ram_gb is the rounded TOTAL
+    system RAM, so the same box always produces the same key."""
+    ram = f"|ram={ram_gb}" if ram_gb > 0 else ""
     if device == "cuda":
-        return f"cuda|cpu={ncpu}|gpu={gpu_name}|vram={vram_gb:.1f}|count={gpu_count}"
-    return f"cpu|cpu={ncpu}"
+        return (f"cuda|cpu={ncpu}|gpu={gpu_name}|vram={vram_gb:.1f}"
+                f"|count={gpu_count}{ram}")
+    return f"cpu|cpu={ncpu}{ram}"
 
 
 def save_tuning_profile(hardware_key: str, values: Dict[str, object]) -> None:
@@ -737,6 +773,9 @@ def _load_tuning_profile(hardware_key: str) -> dict:
     if not isinstance(profiles, dict):
         return {}
     profile = profiles.get(hardware_key, {})
+    if not profile and "|ram=" in hardware_key:
+        # Profiles saved before total RAM joined the fingerprint stay usable.
+        profile = profiles.get(hardware_key.split("|ram=", 1)[0], {})
     return profile if isinstance(profile, dict) else {}
 
 
@@ -744,11 +783,17 @@ def _apply_tuning_profile(result: dict) -> dict:
     profile = _load_tuning_profile(result["hardware_key"])
     if not profile:
         return result
-    allowed = {"workers", "inference_batch", "concurrency", "games_per_iter"}
+    allowed = {"workers", "inference_batch", "concurrency", "games_per_iter",
+               "inference_servers"}
     for key in allowed:
         value = profile.get(key)
         if isinstance(value, int) and value > 0:
             result[key] = value
+    timeout = profile.get("batch_timeout_ms")
+    if isinstance(timeout, (int, float)) and timeout > 0:
+        result["batch_timeout_ms"] = float(timeout)
+    # inference_fp16 is deliberately never applied from a profile: it changes
+    # network outputs, so enabling it stays an explicit per-run choice.
     result["benchmark_tuned"] = True
     return result
 
@@ -764,6 +809,9 @@ def detect_hardware() -> dict:
     """
     ncpu = os.cpu_count() or 4
     avail_gb = available_memory_gb()
+    # Rounded TOTAL RAM is part of the hardware fingerprint; available-at-the-
+    # time memory is transient and stays out of it.
+    ram_gb = int(round(total_memory_gb()))
     device, gpu_name, vram_gb, gpu_count = "cpu", "", 0.0, 0
     try:
         import torch
@@ -779,7 +827,8 @@ def detect_hardware() -> dict:
     mode = "gpu" if device == "cuda" else "cpu"
     workers = auto_workers(mode)
     cpu_workers = auto_workers("cpu")
-    cpu_profile = _load_tuning_profile(hardware_tuning_key("cpu", ncpu))
+    cpu_profile = _load_tuning_profile(hardware_tuning_key("cpu", ncpu,
+                                                           ram_gb=ram_gb))
     if isinstance(cpu_profile.get("workers"), int) and cpu_profile["workers"] > 0:
         cpu_workers = cpu_profile["workers"]
 
@@ -790,11 +839,13 @@ def detect_hardware() -> dict:
         result = {
             "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
             "gpu_count": gpu_count, "ncpu": ncpu, "avail_gb": avail_gb,
+            "ram_gb": ram_gb,
             "mem_capped": mem_capped, "workers": workers,
             "cpu_workers": cpu_workers,
             "inference_batch": 64, "concurrency": 1,
+            "batch_timeout_ms": 0.0,
             "games_per_iter": max(64, workers * 4), "train_batch": 256,
-            "hardware_key": hardware_tuning_key(device, ncpu),
+            "hardware_key": hardware_tuning_key(device, ncpu, ram_gb=ram_gb),
             "benchmark_tuned": False,
         }
         return _apply_tuning_profile(result)
@@ -826,12 +877,15 @@ def detect_hardware() -> dict:
     result = {
         "device": device, "gpu_name": gpu_name, "vram_gb": vram_gb,
         "gpu_count": gpu_count, "ncpu": ncpu, "avail_gb": avail_gb,
+        "ram_gb": ram_gb,
         "mem_capped": mem_capped, "workers": workers,
         "cpu_workers": cpu_workers,
         "inference_batch": inference_batch, "concurrency": concurrency,
         "inference_servers": inference_servers,
+        "batch_timeout_ms": 0.0,
         "games_per_iter": games_per_iter, "train_batch": train_batch,
-        "hardware_key": hardware_tuning_key(device, ncpu, gpu_name, vram_gb, gpu_count),
+        "hardware_key": hardware_tuning_key(device, ncpu, gpu_name, vram_gb,
+                                            gpu_count, ram_gb=ram_gb),
         "benchmark_tuned": False,
     }
     return _apply_tuning_profile(result)

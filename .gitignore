@@ -25,6 +25,7 @@ htmlcov/
 
 # Corridors runtime state
 corridors.json
+az_benchmarks.json
 corridors_tt.sqlite3
 corridors_tt.sqlite3-journal
 corridors_tt.sqlite3-wal
