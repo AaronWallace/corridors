@@ -194,11 +194,13 @@ def compute_elo(results: List[Tuple[str, str, float]],
             delta = K_FACTOR * (score - ea) / ELO_PASSES * 40  # scaled per-pass K
             ratings[a] += delta
             ratings[b] -= delta
-            if anchor in ratings:
-                shift = ratings.get(anchor, 0.0)
-                if shift:
-                    for k in ratings:
-                        ratings[k] -= shift
+        # Re-anchor once per pass: the update only reads rating differences,
+        # which a uniform shift never changes, so this matches per-game
+        # re-anchoring while keeping the inner loop O(1) per game.
+        shift = ratings.get(anchor, 0.0)
+        if shift:
+            for k in ratings:
+                ratings[k] -= shift
     return {k: round(v, 1) for k, v in ratings.items()}
 
 
@@ -331,8 +333,6 @@ def run_tournament(
                 os.environ.pop(v, None)
             else:
                 os.environ[v] = val
-
-    ratings = compute_elo(results)
 
     data = load_elo()
     prior_games = data.get("games", [])
