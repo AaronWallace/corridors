@@ -244,6 +244,13 @@ class SelfPlayConfig:
     # round differently at the ulp level, so like fp16 it is opt-in and
     # recorded, never auto-applied.
     inference_compile: bool = False
+    # Training target for drawn games (threefold repetition or the ply cap),
+    # applied to BOTH sides. Negative values teach the net that shuffling to a
+    # draw is a bad outcome. Deliberately NOT applied to in-search draw
+    # adjudication: MCTS backup is zero-sum (values negate per level), so a
+    # both-sides penalty is inexpressible there — the aversion reaches search
+    # through the learned value head instead.
+    draw_value: float = -0.2
 
 
 def resolve_batch_timeout(config: SelfPlayConfig) -> float:
@@ -550,7 +557,7 @@ def _play_one_game(
     outcomes = []
     for t in record.turns:
         if record.winner is None:
-            outcomes.append(0.0)
+            outcomes.append(config.draw_value)
         elif record.winner == t:
             outcomes.append(1.0)
         else:
@@ -1234,7 +1241,7 @@ def run_selfplay_single(
             outcomes = []
             for t in turns:
                 if winner is None:
-                    outcomes.append(0.0)
+                    outcomes.append(config.draw_value)
                 elif winner == t:
                     outcomes.append(1.0)
                 else:
