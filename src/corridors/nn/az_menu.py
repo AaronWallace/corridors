@@ -1387,9 +1387,13 @@ def _full_loop() -> None:
                 promote_candidate(candidate_name, ckpt_name, arena)
                 console.print("  [green]→ bootstrap candidate promoted[/green]")
             else:
+                from .tournament import auto_tournament_workers
+                arena_workers = max(1, min(auto_tournament_workers("cpu"),
+                                           arena_games))
                 console.print(
                     f"\n  [bold]Arena[/bold] [dim]· {arena_games} games · candidate must score "
-                    f"{promotion_score:.0%} · {max_plies} max plies · CPU inference[/dim]"
+                    f"{promotion_score:.0%} · {max_plies} max plies · CPU inference · "
+                    f"{arena_workers} workers[/dim]"
                 )
                 console.print(_arena_matchup_table(ckpt_name, candidate_name))
                 console.print(
@@ -1417,6 +1421,7 @@ def _full_loop() -> None:
                 arena = run_arena(
                     ckpt_name, candidate_name, games=arena_games,
                     max_plies=max_plies, device="cpu", on_game=on_arena_game,
+                    workers=arena_workers,
                 )
                 if arena["score"] >= promotion_score:
                     promote_candidate(candidate_name, ckpt_name, arena)

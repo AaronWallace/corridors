@@ -6,7 +6,7 @@ from corridors.nn import az_arena
 def test_arena_scores_candidate_across_color_swaps(monkeypatch):
     results = iter([1.0, 1.0, 0.5, 0.0])
     monkeypatch.setattr(az_arena, "play_pair_game", lambda *args, **kwargs: next(results))
-    arena = az_arena.run_arena("incumbent", "candidate", games=4)
+    arena = az_arena.run_arena("incumbent", "candidate", games=4, workers=1)
     # Odd games return the incumbent's score and are inverted for the candidate.
     assert arena["wins"] == 2
     assert arena["draws"] == 1
@@ -26,7 +26,7 @@ def test_arena_reports_plies_sides_time_and_terminations(monkeypatch):
         az_arena, "play_pair_game", lambda *args, **kwargs: next(raw_games))
 
     arena = az_arena.run_arena(
-        "incumbent", "candidate", games=4,
+        "incumbent", "candidate", games=4, workers=1,
         on_game=lambda done, total, result, info: seen.append(info),
     )
 

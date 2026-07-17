@@ -24,6 +24,7 @@ import os
 import random
 import sys
 import time
+import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,7 +120,9 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
     Threefold repetition or reaching `max_plies` half-moves scores 0.5.
     ``return_details`` adds plies, duration, colors, and termination reason."""
     started = time.monotonic()
-    seed = hash((a.name, b.name, game_idx)) & 0x7FFFFFFF
+    # Process-stable seed (str hash() is salted per process): the same pairing
+    # plays the same game whether it runs here or in any pool worker.
+    seed = zlib.crc32(f"{a.name}|{b.name}|{game_idx}".encode()) & 0x7FFFFFFF
     rng = random.Random(seed)
     p1_col = rng.randint(0, NCOLS - 1)
     p2_col = rng.randint(0, NCOLS - 1)
