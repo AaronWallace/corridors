@@ -1,4 +1,7 @@
-"""Round-robin tournament: all checkpoints vs each other + the classical engine.
+"""Round-robin tournament: selected checkpoints vs each other + the classical
+engine (the menu defaults to all checkpoints). Rated checkpoints left out of the
+latest round robin are surfaced with a stale Elo flag (see
+checkpoints.stale_elo_checkpoints).
 
 - Every pair plays games_per_pair games, colors alternating.
 - Games are distributed across worker processes (full CPU utilization).

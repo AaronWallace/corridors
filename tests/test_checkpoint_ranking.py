@@ -1,6 +1,8 @@
 import json
 
-from corridors.nn.checkpoints import ranked_checkpoint_paths, resolve_checkpoint_path
+from corridors.nn.checkpoints import (
+    ranked_checkpoint_paths, resolve_checkpoint_path, stale_elo_checkpoints,
+)
 
 
 def _checkpoint(root, name, elo=None):
@@ -44,3 +46,22 @@ def test_curated_checkpoints_are_discovered_and_local_copy_takes_priority(tmp_pa
     _checkpoint(tmp_path, "curated", 100)
     assert resolve_checkpoint_path(tmp_path, "curated") == tmp_path / "curated.safetensors"
     assert ranked_checkpoint_paths(tmp_path) == [tmp_path / "curated.safetensors"]
+
+
+def test_stale_elo_flags_rated_checkpoints_absent_from_latest_round_robin(tmp_path):
+    (tmp_path / "elo.json").write_text(json.dumps({
+        "anchor": "classical",
+        "ratings": {"classical": 0.0, "a": 120.0, "b": 80.0, "c": -30.0},
+        "last_run": {"checkpoints": ["a", "c"]},
+    }), encoding="utf-8")
+
+    assert stale_elo_checkpoints(tmp_path) == {"b"}
+
+
+def test_stale_elo_is_empty_without_a_recorded_round_robin(tmp_path):
+    assert stale_elo_checkpoints(tmp_path) == set()  # no elo.json at all
+
+    (tmp_path / "elo.json").write_text(json.dumps({
+        "ratings": {"classical": 0.0, "a": 120.0},
+    }), encoding="utf-8")
+    assert stale_elo_checkpoints(tmp_path) == set()  # no last_run participant list

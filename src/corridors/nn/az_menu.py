@@ -22,7 +22,7 @@ from rich.tree import Tree
 from . import datasets as ds_mod
 from .checkpoints import (
     checkpoint_elo, load_elo_ratings, ranked_checkpoint_paths,
-    resolve_checkpoint_path,
+    resolve_checkpoint_path, stale_elo_checkpoints,
 )
 
 STYLE_GRID = "grey35"
@@ -260,7 +260,8 @@ def _checkpoint_table(checkpoints, title: str = "AZ checkpoints") -> Table:
         table.add_row(
             str(index),
             name,
-            f"{elo:+.0f}" if isinstance(elo, (int, float)) else "-",
+            (f"{elo:+.0f}" + (" [yellow]stale[/yellow]" if item.get("elo_stale") else ""))
+            if isinstance(elo, (int, float)) else "-",
             str(item.get("epoch") or "-"),
             str(item.get("dataset") or "-"),
             ancestry,
@@ -284,6 +285,7 @@ def _select_checkpoint(checkpoints, prompt: str,
 def _arena_matchup_table(incumbent: str, candidate: str) -> Table:
     """Describe the exact weights entering an arena gate."""
     ratings = load_elo_ratings(CHECKPOINT_ROOT)
+    stale_rated = stale_elo_checkpoints(CHECKPOINT_ROOT)
     elo_path = CHECKPOINT_ROOT / "elo.json"
     elo_mtime = elo_path.stat().st_mtime if elo_path.exists() else 0.0
     table = Table(box=box.SIMPLE, header_style="dim", title="Arena matchup")
@@ -301,8 +303,9 @@ def _arena_matchup_table(incumbent: str, candidate: str) -> Table:
             elo_text = "unrated (new)"
         else:
             elo = checkpoint_elo(weights, ratings)
-            stale = (name in ratings and weights.exists()
-                     and weights.stat().st_mtime > elo_mtime)
+            stale = ((name in ratings and weights.exists()
+                      and weights.stat().st_mtime > elo_mtime)
+                     or name in stale_rated)
             elo_text = (f"{elo:+.0f}{' stale' if stale else ''}"
                         if isinstance(elo, (int, float)) else "unrated")
         lineage = (meta.get("seeded_from") or meta.get("resumed_from")

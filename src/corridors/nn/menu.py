@@ -61,6 +61,13 @@ def _format_modified(value) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(value))
 
 
+def _format_elo(elo, stale: bool = False) -> str:
+    """Elo table cell; rated-but-absent-from-latest-round-robin shows as stale."""
+    if not isinstance(elo, (int, float)):
+        return "-"
+    return f"{elo:+.0f}" + (" [yellow]stale[/yellow]" if stale else "")
+
+
 # ---------------------------------------------------------------------------
 # 1. Generate self-play data
 # ---------------------------------------------------------------------------
@@ -231,11 +238,37 @@ def _tournament() -> None:
     from .tournament import auto_tournament_workers
     from .az_selfplay import resolve_device
 
-    ckpts = [c["name"] for c in model_mod.list_checkpoints()]
-    if not ckpts:
+    items = model_mod.list_checkpoints()
+    if not items:
         console.print("[yellow]no checkpoints yet — train a model first.[/yellow]")
         return
-    console.print(f"[dim]{len(ckpts)} checkpoint(s) + classical anchor[/dim]")
+
+    t = Table(box=box.SIMPLE, header_style="dim", title="Checkpoints",
+              title_style="bold")
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("name")
+    t.add_column("Elo", justify="right")
+    t.add_column("Modified", no_wrap=True)
+    for i, c in enumerate(items, 1):
+        t.add_row(str(i), c["name"], _format_elo(c.get("elo"), c.get("elo_stale")),
+                  _format_modified(c.get("modified")))
+    console.print(t)
+
+    raw = Prompt.ask(
+        "[dim]Checkpoints to include (comma-separated #s, Enter = all)[/dim]",
+        default="",
+    ).strip()
+    if raw:
+        selected = _numbered_selections(items, raw)
+        if not selected:
+            console.print("[yellow]no valid checkpoint numbers selected.[/yellow]")
+            return
+        items = selected
+    ckpts = [c["name"] for c in items]
+    skipped = len(model_mod.list_checkpoints()) - len(ckpts)
+    console.print(f"[dim]{len(ckpts)} checkpoint(s) + classical anchor"
+                  + (f" ({skipped} excluded — their Elo will show as stale)"
+                     if skipped else "") + "[/dim]")
     games_per_pair = _prompt_int("Games per pair (even)", 4, 2, 200)
     if games_per_pair % 2:
         games_per_pair += 1
@@ -474,7 +507,7 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
             lineage = "-"
         t.add_row(
             str(i), c["name"],
-            f"{e:+.0f}" if isinstance(e, (int, float)) else "-",
+            _format_elo(e, c.get("elo_stale")),
             str(c.get("epoch") or "-"),
             str(c.get("dataset") or "-"),
             lineage,
@@ -530,7 +563,18 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
         except (ValueError, FileExistsError) as exc:
             console.print(f"[red]{exc}[/red]")
         return
-    for item in _numbered_selections(items, raw):
+    selected = _numbered_selections(items, raw)
+    if not selected:
+        return
+    for item in selected:
+        console.print(f"  {item['name']}" + (" [dim](has a best/ copy)[/dim]"
+                                             if item.get("in_best") else ""))
+    if not Confirm.ask(
+            f"[bold red]Permanently delete {len(selected)} checkpoint(s)?[/bold red]",
+            default=False):
+        console.print("[dim]cancelled[/dim]")
+        return
+    for item in selected:
         name = item["name"]
         if model_mod.delete_checkpoint(name):
             note = (" (including its best/ copy — commit to remove it from Git)"

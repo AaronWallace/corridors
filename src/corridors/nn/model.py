@@ -29,6 +29,7 @@ from .checkpoints import (
     load_elo_ratings,
     ranked_checkpoint_paths,
     resolve_checkpoint_path,
+    stale_elo_checkpoints,
 )
 from .encoding import NUM_PLANES
 
@@ -150,6 +151,7 @@ def list_checkpoints() -> list:
         return []
     out = []
     ratings = load_elo_ratings(CHECKPOINT_ROOT)
+    stale = stale_elo_checkpoints(CHECKPOINT_ROOT)
     for f in ranked_checkpoint_paths(CHECKPOINT_ROOT):
         name = f.stem
         meta = read_meta(name)
@@ -165,6 +167,7 @@ def list_checkpoints() -> list:
             "seeded_from": meta.get("seeded_from"),
             "resumed_from": meta.get("resumed_from"),
             "elo": checkpoint_elo(f, ratings),
+            "elo_stale": name in stale,
             "in_best": curated_checkpoint_path(CHECKPOINT_ROOT, name).exists(),
         })
     return out

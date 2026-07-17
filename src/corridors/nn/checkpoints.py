@@ -52,6 +52,27 @@ def load_elo_ratings(root: Path) -> dict[str, float]:
     }
 
 
+def stale_elo_checkpoints(root: Path) -> set[str]:
+    """Rated checkpoints that sat out the latest round robin.
+
+    Their Elo still comes from full-history recomputation, but it wasn't
+    refreshed with new games, so surfaces flag it as stale. Empty when no
+    tournament has recorded its participant list yet."""
+    try:
+        data = json.loads((root / "elo.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    participants = set((data.get("last_run") or {}).get("checkpoints") or [])
+    if not participants:
+        return set()
+    anchor = data.get("anchor", "classical")
+    return {
+        str(name)
+        for name in data.get("ratings", {})
+        if name not in participants and name != anchor
+    }
+
+
 def checkpoint_elo(path: Path, ratings: dict[str, float] | None = None) -> float | None:
     ratings = ratings if ratings is not None else load_elo_ratings(path.parent)
     if path.stem in ratings:
