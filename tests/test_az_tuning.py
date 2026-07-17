@@ -55,6 +55,32 @@ def test_profile_overrides_only_selfplay_defaults(tmp_path, monkeypatch):
     assert tuned["benchmark_tuned"] is True
 
 
+def test_profile_workers_are_clamped_to_current_free_ram(tmp_path, monkeypatch):
+    """A benchmark winner recorded when RAM was plentiful must not OOM a host
+    that has less free memory today (e.g. 380 workers vs 98 GB free)."""
+    monkeypatch.setattr(settings, "_PATH", tmp_path / "corridors.json")
+    key = az_selfplay.hardware_tuning_key("cuda", 384, "NVIDIA GeForce RTX 5090",
+                                          31.0, 1)
+    az_selfplay.save_tuning_profile(
+        key, {"workers": 380, "inference_batch": 1024, "concurrency": 6})
+    monkeypatch.setattr(az_selfplay, "memory_worker_cap", lambda: 250)
+
+    tuned = az_selfplay._apply_tuning_profile({
+        "hardware_key": key, "workers": 128, "benchmark_tuned": False,
+    })
+    assert tuned["workers"] == 250
+    assert tuned["mem_capped"] is True
+    assert tuned["inference_batch"] == 1024
+
+    # With headroom, the recorded winner applies untouched.
+    monkeypatch.setattr(az_selfplay, "memory_worker_cap", lambda: 1000)
+    tuned = az_selfplay._apply_tuning_profile({
+        "hardware_key": key, "workers": 128, "benchmark_tuned": False,
+    })
+    assert tuned["workers"] == 380
+    assert "mem_capped" not in tuned
+
+
 def _epoch(train, val):
     return SimpleNamespace(train_loss=train, val_loss=val)
 

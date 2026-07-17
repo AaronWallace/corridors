@@ -901,6 +901,14 @@ def _apply_tuning_profile(result: dict) -> dict:
         result["batch_timeout_ms"] = float(timeout)
     # inference_fp16 is deliberately never applied from a profile: it changes
     # network outputs, so enabling it stays an explicit per-run choice.
+    # A profile records the benchmark winner for this hardware class, but the
+    # RAM actually free right now can be far lower (shared box, other jobs,
+    # replay buffers). Re-clamp workers so a stored winner can't OOM the host
+    # it runs on today; auto_workers applies the same cap to heuristics.
+    mem_cap = memory_worker_cap()
+    if mem_cap is not None and result.get("workers", 0) > mem_cap:
+        result["workers"] = mem_cap
+        result["mem_capped"] = True
     result["benchmark_tuned"] = True
     return result
 
