@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "hardware_key": "cuda|cpu=16|gpu=NVIDIA GeForce RTX 3070 Laptop GPU|vram=8.0|count=1|ram=32",
+  "records": [
+    {
+      "timestamp": "2026-07-16T21:36:22Z",
+      "fingerprint": {
+        "device": "cuda",
+        "gpu_name": "NVIDIA GeForce RTX 3070 Laptop GPU",
+        "vram_gb": 8.0,
+        "gpu_count": 1,
+        "ncpu": 16,
+        "ram_gb": 32
+      },
+      "params": {
+        "simulations": 50,
+        "max_plies": 12,
+        "games": 192,
+        "checkpoint": "azloop_20260716-022608_g256_s1000-3000_best"
+      },
+      "rows": [
+        {
+          "workers": 4,
+          "batch": 16,
+          "concurrency": 8,
+          "servers": 1,
+          "fp16": false,
+          "compile": false,
+          "batch_timeout_ms": 0.0,
+          "evals_per_s": 3378.0333839887867,
+          "positions_per_s": 106.16399880932146,
+          "games_per_s": 8.846999900776789,
+          "avg_batch": 14.804321486268174,
+          "fill_pct": 72.4151857835218,
+          "request_wait_ms": 8.391041641732631,
+          "gpu_busy_pct": 87.03452489586628
+        },
+        {
+          "workers": 4,
+          "batch": 32,
+          "concurrency": 16,
+          "servers": 1,
+          "fp16": false,
+          "compile": false,
+          "batch_timeout_ms": 0.0,
+          "evals_per_s": 4559.316948753903,
+          "positions_per_s": 143.01597323288985,
+          "games_per_s": 11.917997769407487,
+          "avg_batch": 20.950085567598403,
+          "fill_pct": 17.541357672561322,
+          "request_wait_ms": 12.310772681148352,
+          "gpu_busy_pct": 82.85478951516386
+        },
+        {
+          "workers": 4,
+          "batch": 64,
+          "concurrency": 16,
+          "servers": 1,
+          "fp16": false,
+          "compile": false,
+          "batch_timeout_ms": 0.0,
+          "evals_per_s": 4536.626165204941,
+          "positions_per_s": 141.66772861078306,
+          "games_per_s": 11.805644050898588,
+          "avg_batch": 20.591962042980743,
+          "fill_pct": 0.0,
+          "request_wait_ms": 12.421327109983272,
+          "gpu_busy_pct": 82.1030002468953
+        },
+        {
+          "workers": 4,
+          "batch": 32,
+          "concurrency": 32,
+          "servers": 1,
+          "fp16": false,
+          "compile": false,
+          "batch_timeout_ms": 0.0,
+          "evals_per_s": 4660.121146518734,
+          "positions_per_s": 145.13665037685752,
+          "games_per_s": 12.094720864738125,
+          "avg_batch": 22.630162129091467,
+          "fill_pct": 34.720097889262775,
+          "request_wait_ms": 20.50277034928442,
+          "gpu_busy_pct": 83.46266075863512
+        },
+        {
+          "workers": 4,
+          "batch": 32,
+          "concurrency": 48,
+          "servers": 1,
+          "fp16": false,
+          "compile": false,
+          "batch_timeout_ms": 0.0,
+          "evals_per_s": 4921.318777508286,
+          "positions_per_s": 152.60930111278876,
+          "games_per_s": 12.717441759399064,
+          "avg_batch": 24.44046052631579,
+          "fill_pct": 53.91447368421053,
+          "request_wait_ms": 34.53023561287206,
+          "gpu_busy_pct": 84.29171267957146
+        }
+      ],
+      "best": {
+        "workers": 4,
+        "inference_batch": 32,
+        "concurrency": 48,
+        "inference_servers": 1,
+        "batch_timeout_ms": 0.0
+      },
+      "fp16_recommended": false,
+      "compile_recommended": false
+    }
+  ]
+}
