@@ -1481,6 +1481,7 @@ def _game_worker_persistent(
     ("stop",) exits."""
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import gc
     import itertools
     import threading
 
@@ -1491,6 +1492,7 @@ def _game_worker_persistent(
     metric_lock = threading.Lock()
     eval_requests = 0
     inference_wait_s = 0.0
+    slots_peak = 0  # high-water mark of in-flight inference requests
 
     def _reader() -> None:
         while not stop_reader.is_set():
@@ -1506,12 +1508,15 @@ def _game_worker_persistent(
                     slot[0].set()
 
     def evaluate_fn(state: State, board) -> Tuple[np.ndarray, float]:
-        nonlocal eval_requests, inference_wait_s
+        nonlocal eval_requests, inference_wait_s, slots_peak
         rid = next(req_ids)
         ev = threading.Event()
         slot = [ev, None]
         with slots_lock:
             slots[rid] = slot
+            n = len(slots)
+        if n > slots_peak:
+            slots_peak = n  # racy but fine — coarse high-water mark
         wait_t0 = time.monotonic()
         request_queue.put((worker_id, rid, pack_state(state, board)))
         ev.wait()
@@ -1559,7 +1564,12 @@ def _game_worker_persistent(
                 worker_metrics = {
                     "eval_requests": eval_requests,
                     "inference_wait_s": inference_wait_s,
+                    "slots_peak": slots_peak,
+                    "slots_leaked": len(slots),  # >0 => request/response mismatch
+                    "rss_gb": _read_rss_gb(os.getpid()),
+                    "gc_count": sum(gc.get_count()),
                 }
+            slots_peak = 0  # reset for next round
             result_queue.put(("round_done", worker_id, worker_metrics))
     finally:
         stop_reader.set()
@@ -1575,6 +1585,7 @@ def _game_worker_local_persistent(
     """Long-lived CPU-mode worker: runs its own NumPy inference (no torch) and
     reloads weights when the checkpoint changes between rounds. Command:
     ("play", n, seed, ckpt, base)."""
+    import gc
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     _limit_blas_threads(1)  # one BLAS thread per worker — parallelism is per-process
@@ -1602,7 +1613,10 @@ def _game_worker_local_persistent(
         for i in range(num_games):
             _play_one_game(base_game + i, worker_id, config, evaluate_fn,
                            rng, result_queue)
-        result_queue.put(("round_done", worker_id))
+        result_queue.put(("round_done", worker_id, {
+            "rss_gb": _read_rss_gb(os.getpid()),
+            "gc_count": sum(gc.get_count()),
+        }))
 
 
 class SelfPlayPool:
@@ -1780,8 +1794,22 @@ class SelfPlayPool:
             agg["avg_batch"] = agg["positions"] / agg["batches"] if agg["batches"] else 0.0
             agg["num_servers"] = self.num_servers
             inference = agg
-        requests = sum(m["eval_requests"] for m in worker_metrics)
-        wait_s = sum(m["inference_wait_s"] for m in worker_metrics)
+        requests = sum(m.get("eval_requests", 0) for m in worker_metrics)
+        wait_s = sum(m.get("inference_wait_s", 0.0) for m in worker_metrics)
+        # Per-worker diagnostics for detecting leaks (see round_done payload).
+        rss = [m.get("rss_gb", 0.0) for m in worker_metrics if m.get("rss_gb", 0)]
+        slots_peaks = [m.get("slots_peak", 0) for m in worker_metrics if "slots_peak" in m]
+        slots_leaked = sum(m.get("slots_leaked", 0) for m in worker_metrics)
+        gc_counts = [m.get("gc_count", 0) for m in worker_metrics if "gc_count" in m]
+        diag = {
+            "worker_rss_min_gb": min(rss) if rss else 0.0,
+            "worker_rss_max_gb": max(rss) if rss else 0.0,
+            "worker_rss_avg_gb": sum(rss) / len(rss) if rss else 0.0,
+            "workers_reporting": len(worker_metrics),
+            "slots_peak_max": max(slots_peaks) if slots_peaks else 0,
+            "slots_leaked_total": slots_leaked,
+            "gc_count_max": max(gc_counts) if gc_counts else 0,
+        }
         self.last_metrics = {
             "elapsed_s": elapsed,
             "games": done_count,
@@ -1790,6 +1818,7 @@ class SelfPlayPool:
             "worker_inference_wait_s": wait_s,
             "avg_request_wait_ms": 1000.0 * wait_s / requests if requests else 0.0,
             "inference": inference,
+            "diag": diag,
         }
         return writer.get_all()
 
