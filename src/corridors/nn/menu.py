@@ -295,7 +295,9 @@ def _tournament() -> None:
 
     def on_progress(done: int, total: int, res) -> None:
         a, b, score = res
-        tag = "1-0" if score == 1.0 else ("0-1" if score == 0.0 else "½-½")
+        # ASCII "draw" — the ½ glyph renders as junk (e.g. "_") in terminals or
+        # captures without Unicode font support, making draws look blank.
+        tag = "1-0" if score == 1.0 else ("0-1" if score == 0.0 else "draw ")
         console.print(f"  [dim]{done:>4}/{total}[/dim]  {a} vs {b}  {tag}")
 
     try:
