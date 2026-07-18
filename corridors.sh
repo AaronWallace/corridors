@@ -17,4 +17,11 @@ _find_python() {
 }
 PY=$(_find_python) || { echo "Python 3.10+ not found"; exit 1; }
 
+# Force glibc's malloc (not Python's arena) and aggressively return freed pages
+# to the OS. Without this, many-worker self-play accumulates freed memory in the
+# arena across iterations — workers appear to "leak" until OOM even when nothing
+# actually leaks. Users can override either variable in the environment.
+export PYTHONMALLOC="${PYTHONMALLOC:-malloc}"
+export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-100000}"
+
 PYTHONPATH="${ROOT}/src:${PYTHONPATH:-}" exec "$PY" -m corridors "$@"
