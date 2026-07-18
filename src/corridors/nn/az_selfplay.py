@@ -757,6 +757,19 @@ def _windows_memory_gb() -> Optional[Tuple[float, float]]:
     return None
 
 
+def _read_rss_gb(pid: int) -> float:
+    """Read a process's RSS from /proc/<pid>/status (Linux). Returns GB, 0 on
+    failure (dead process, permissions, or non-Linux)."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1024 * 1024)  # kB -> GB
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    return 0.0
+
+
 def available_memory_gb() -> float:
     """Best-effort available RAM in GB (0.0 if it can't be determined). Takes the
     min of host-available and the cgroup limit so it's correct inside containers."""
@@ -1779,6 +1792,23 @@ class SelfPlayPool:
             "inference": inference,
         }
         return writer.get_all()
+
+    def memory_snapshot(self) -> dict:
+        """Sample RSS for the coordinator + workers + inference servers, plus the
+        system's currently-available RAM. Linux-only (/proc/<pid>/status); returns
+        zeros on other platforms. Bounded cost: one small read per PID."""
+        coord_gb = _read_rss_gb(os.getpid())
+        workers_gb = sum(_read_rss_gb(w.pid) for w in self.workers if w.pid)
+        servers_gb = sum(_read_rss_gb(s.pid) for s in self.servers if s.pid)
+        return {
+            "coord_gb": coord_gb,
+            "workers_gb": workers_gb,
+            "servers_gb": servers_gb,
+            "total_gb": coord_gb + workers_gb + servers_gb,
+            "avail_gb": available_memory_gb(),
+            "num_workers": len([w for w in self.workers if w.pid]),
+            "num_servers": len([s for s in self.servers if s.pid]),
+        }
 
     def close(self, grace_period: float = 2.0) -> None:
         """Stop the pool within one bounded grace period.

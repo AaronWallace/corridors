@@ -465,13 +465,18 @@ def _select_seed_datasets(current_run: str) -> list[str]:
 
 
 def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
-                   max_plies: int, run_fn):
+                   max_plies: int, run_fn, mem_source=None):
     """Drive `run_fn(on_game, on_status, on_heartbeat)` behind one self-refreshing
     status line (no per-game or per-heartbeat spam). `run_fn` returns the
     (states, policies, outcomes) arrays. Returns ((states, policies, outcomes),
     stats); stats holds done/positions/plies_sum plus wins={1,2} and draws for the
     caller's summary. Propagates KeyboardInterrupt/EOFError (completed games are
-    saved by the runner)."""
+    saved by the runner).
+
+    mem_source: optional zero-arg callable returning a memory-snapshot dict (see
+    SelfPlayPool.memory_snapshot). Sampled in a background thread every ~2s so
+    the render can display coordinator/worker/server RSS + free RAM without
+    blocking or spamming /proc reads."""
     console = _console()
     from rich.live import Live
 
@@ -481,6 +486,7 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
         "wins": {1: 0, 2: 0}, "draws": 0, "plies_sum": 0,
         "workers": effective_workers, "online": set(), "t0": None,
         "hb": {}, "play_t0": None,  # heartbeat plies + when play started
+        "mem": None, "mem_start_gb": None, "mem_peak_gb": 0.0,
     }
 
     def _hcount(n: float) -> str:
@@ -499,6 +505,43 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
         if s < 3600:
             return f"{s // 60}m{s % 60:02d}s"
         return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+    def _hgb(gb: float) -> str:
+        if gb >= 100:
+            return f"{gb:.0f}G"
+        if gb >= 10:
+            return f"{gb:.1f}G"
+        return f"{gb:.2f}G"
+
+    def _mem_line():
+        """Second-line memory breakdown (Text), or None if no data yet.
+        Highlights growth (delta from first sample) and warns near OOM."""
+        m = stats["mem"]
+        if not m:
+            return None
+        total = m["total_gb"]
+        start = stats["mem_start_gb"] or total
+        delta = total - start
+        # Warn color if free memory is low, else neutral
+        avail = m["avail_gb"]
+        avail_color = "red" if avail < 8 else ("yellow" if avail < 20 else "green")
+        delta_color = ("red" if delta > 20 else "yellow" if delta > 5 else "dim")
+        delta_sign = "+" if delta >= 0 else ""
+        sep = ("  ·  ", STYLE_GRID)
+        parts = [
+            ("    mem  ", STYLE_GRID),
+            (f"total {_hgb(total)}", "white"),
+            (f" ({delta_sign}{_hgb(delta)} since start)", delta_color),
+            sep, (f"workers {_hgb(m['workers_gb'])}", "white"),
+            sep, (f"coord {_hgb(m['coord_gb'])}", "white"),
+        ]
+        if m["servers_gb"] > 0:
+            parts += [sep, (f"servers {_hgb(m['servers_gb'])}", "white")]
+        parts += [
+            sep, (f"peak {_hgb(stats['mem_peak_gb'])}", "dim"),
+            sep, (f"free {_hgb(avail)}", avail_color),
+        ]
+        return Text.assemble(*parts)
 
     def _render() -> Text:
         sep = ("  ·  ", STYLE_GRID)
@@ -566,8 +609,13 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
         )
 
     class _StatusView:
-        def __rich__(self) -> Text:
-            return _render()
+        def __rich__(self):
+            main = _render()
+            mem = _mem_line()
+            if mem is None:
+                return main
+            from rich.console import Group
+            return Group(main, mem)
 
     def on_status(msg):
         console.print(f"[dim]{msg}[/dim]")
@@ -591,9 +639,46 @@ def _selfplay_live(*, effective_workers: int, num_games: int, sims: int,
         # keying by worker alone would only track one game's plies per worker.
         stats["hb"][(wid, game_num)] = ply
 
-    with Live(_StatusView(), console=console, refresh_per_second=4,
-              transient=False):
-        states, policies, outcomes = run_fn(on_game, on_status, on_heartbeat)
+    # Background memory sampler: /proc reads are cheap but per-worker×4Hz would
+    # be silly; sample every 2s and let the render pick up the cached dict.
+    import threading
+    mem_stop = threading.Event()
+
+    def _sample_mem():
+        while not mem_stop.wait(2.0):
+            if mem_source is None:
+                return
+            try:
+                snap = mem_source()
+            except Exception:
+                continue
+            stats["mem"] = snap
+            if stats["mem_start_gb"] is None:
+                stats["mem_start_gb"] = snap["total_gb"]
+            if snap["total_gb"] > stats["mem_peak_gb"]:
+                stats["mem_peak_gb"] = snap["total_gb"]
+
+    mem_thread = None
+    if mem_source is not None:
+        # First sample synchronously so the memory line appears immediately.
+        try:
+            snap = mem_source()
+            stats["mem"] = snap
+            stats["mem_start_gb"] = snap["total_gb"]
+            stats["mem_peak_gb"] = snap["total_gb"]
+        except Exception:
+            pass
+        mem_thread = threading.Thread(target=_sample_mem, daemon=True)
+        mem_thread.start()
+
+    try:
+        with Live(_StatusView(), console=console, refresh_per_second=4,
+                  transient=False):
+            states, policies, outcomes = run_fn(on_game, on_status, on_heartbeat)
+    finally:
+        mem_stop.set()
+        if mem_thread is not None:
+            mem_thread.join(timeout=3)
 
     return (states, policies, outcomes), stats
 
@@ -632,7 +717,8 @@ def _run_pool_round_live(pool, *, num_games: int, checkpoint: str, sims: int,
 
     (s, p, o), stats = _selfplay_live(
         effective_workers=pool.num_workers, num_games=num_games, sims=sims,
-        max_plies=pool.config.max_plies, run_fn=run_fn)
+        max_plies=pool.config.max_plies, run_fn=run_fn,
+        mem_source=pool.memory_snapshot)
     stats["pipeline"] = pool.last_metrics
     return s, p, o, stats
 
