@@ -19,6 +19,7 @@ install_packages() {
     local missing=()
     command -v git >/dev/null 2>&1 || missing+=(git)
     command -v gh >/dev/null 2>&1 || missing+=(gh)
+    command -v vim >/dev/null 2>&1 || missing+=(vim)
     if ((${#missing[@]} == 0)); then
         return
     fi
@@ -61,6 +62,14 @@ prompt_identity() {
     git config --global user.email "$current_email"
     git config --global init.defaultBranch main
     git config --global pull.rebase false
+    # Default editor -> vim for interactive git prompts (commit messages, rebase,
+    # etc.) and the shell's EDITOR/VISUAL. Only set if not already customized.
+    if [[ -z "$(git config --global core.editor || true)" ]]; then
+        git config --global core.editor vim
+    fi
+    if ! grep -q '^export EDITOR=' "$HOME/.bashrc" 2>/dev/null; then
+        printf '\n# corridors/gh_setup.sh: default editor for shells and CLI tools\nexport EDITOR=vim\nexport VISUAL=vim\n' >> "$HOME/.bashrc"
+    fi
 }
 
 authenticate() {

@@ -118,6 +118,11 @@ if "$PYTHON" -c 'import torch' 2>/dev/null; then
 else
     echo "  torch:       MISSING — CPU self-play works, but training/tournaments need it"
 fi
+if command -v vim >/dev/null 2>&1; then
+    echo "  vim:         $(command -v vim)"
+else
+    echo "  vim:         MISSING — run ./gh_setup.sh to install and set as default editor"
+fi
 echo ""
 echo "Setup complete. Run with:"
 echo "  ./corridors.sh"
