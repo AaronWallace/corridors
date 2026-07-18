@@ -1357,6 +1357,23 @@ def _full_loop() -> None:
                     f"{pipeline.get('avg_request_wait_ms', 0):.1f} ms · "
                     f"GPU inference {gpu_pct:.0f}%{srv_tag}[/dim]"
                 )
+            # Per-worker leak-diagnostic line: watch these across iterations.
+            # rss growing = per-worker leak (uniformly if allocator, outliers if
+            # process-specific); slots_leaked > 0 = request/response mismatch;
+            # gc_count large = reference cycle buildup.
+            diag = pipeline.get("diag", {})
+            if diag and diag.get("workers_reporting", 0) > 0:
+                slots_tag = ""
+                if diag.get("slots_peak_max"):
+                    slots_tag = (f" · slots peak {diag['slots_peak_max']}"
+                                 f" leaked {diag['slots_leaked_total']}")
+                console.print(
+                    f"  [dim]  workers: rss "
+                    f"min {diag['worker_rss_min_gb']:.2f}G "
+                    f"avg {diag['worker_rss_avg_gb']:.2f}G "
+                    f"max {diag['worker_rss_max_gb']:.2f}G · "
+                    f"gc {diag['gc_count_max']}{slots_tag}[/dim]"
+                )
 
             cumulative_games += games_per_iter
             cumulative_positions += positions
