@@ -909,6 +909,97 @@ def _benchmark_selfplay() -> None:
     console.print("[dim]No training data or checkpoints were written.[/dim]")
 
 
+def _benchmark_rmcts() -> None:
+    """Run the experimental breadth-first RMCTS benchmark."""
+    from .rmcts_benchmark import benchmark_rmcts
+
+    console = _console()
+    console.print("\n[bold]Experimental RMCTS benchmark[/bold]")
+    console.print(
+        "[dim]Recursive MCTS builds each search breadth-first so every tree "
+        "level becomes a large neural-inference batch. This benchmark uses "
+        "the real Corridors rules and writes no training data.[/dim]"
+    )
+    hw = _detect_and_show_hw()
+    if hw["device"] == "cuda":
+        device = Prompt.ask("[dim]Inference device[/dim]",
+                            choices=["cpu", "cuda"], default="cuda")
+    else:
+        device = "cpu"
+    games = _prompt_int("Concurrent benchmark games", 16, 1, 4096)
+    simulations = _prompt_int("RMCTS simulations per move", 200, 2, 50_000)
+    max_plies = _prompt_int("Maximum plies per benchmark game", 40, 1, 1000)
+    default_batch = (hw["inference_batch"] if device == "cuda"
+                     else min(64, games * simulations))
+    inference_batch = _prompt_int("Maximum inference batch", default_batch, 1, 8192)
+    fp16 = (device == "cuda" and Confirm.ask(
+        "[dim]Use fp16 inference?[/dim]", default=False))
+
+    checkpoint = ""
+    if CHECKPOINT_ROOT.exists():
+        ckpts = [f.stem for f in ranked_checkpoint_paths(CHECKPOINT_ROOT)
+                 if _is_az_checkpoint(f.stem) and not f.stem.endswith("_candidate")]
+        if ckpts:
+            checkpoint = _select_checkpoint(
+                ckpts, "Checkpoint; blank = random initialization",
+                title="Checkpoint for RMCTS benchmark")
+
+    def _rate(value: float) -> str:
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.2f}M"
+        if value >= 1000:
+            return f"{value / 1000:.1f}K"
+        return f"{value:.1f}"
+
+    try:
+        with console.status("[cyan]warming model and building RMCTS trees...[/cyan]") as status:
+            def on_ply(info):
+                elapsed = info["elapsed_s"]
+                status.update(
+                    f"[cyan]{info['active_games']} games active[/cyan] · "
+                    f"{info['plies']:,} plies · "
+                    f"{_rate(info['simulations'] / elapsed)} sims/s · "
+                    f"{_rate(info['evaluations'] / elapsed)} evals/s · "
+                    f"{elapsed:.0f}s"
+                )
+
+            result = benchmark_rmcts(
+                checkpoint=checkpoint, device=device, games=games,
+                simulations=simulations, max_plies=max_plies,
+                inference_batch=inference_batch, fp16=fp16, on_ply=on_ply,
+            )
+    except (KeyboardInterrupt, EOFError):
+        console.print("\n[dim]RMCTS benchmark interrupted[/dim]")
+        return
+
+    table = Table(title="RMCTS throughput", box=box.SIMPLE_HEAVY)
+    table.add_column("Elapsed", justify="right")
+    table.add_column("Games/s", justify="right")
+    table.add_column("Plies/s", justify="right")
+    table.add_column("Sims/s", justify="right")
+    table.add_column("NN evals/s", justify="right")
+    table.add_column("Avg batch", justify="right")
+    table.add_column("Tree depth", justify="right")
+    table.add_row(
+        f"{result['elapsed_s']:.2f}s",
+        f"{result['games_per_s']:.3f}",
+        f"{result['plies_per_s']:.1f}",
+        f"{result['simulations_per_s']:,.0f}",
+        f"{result['evaluations_per_s']:,.0f}",
+        f"{result['avg_inference_batch']:.1f}",
+        str(result["max_depth"]),
+    )
+    console.print(table)
+    console.print(
+        f"[dim]{result['games']} games · {result['plies']:,} plies · "
+        f"{result['simulations']:,} requested simulations · "
+        f"{result['evaluations']:,} actual neural evaluations · "
+        f"model: {result['checkpoint']}[/dim]"
+    )
+    console.print("[dim]Experimental only: this result does not alter tuned "
+                  "PUCT defaults or the training loop.[/dim]")
+
+
 # ---------------------------------------------------------------------------
 # 1. Self-play
 # ---------------------------------------------------------------------------
@@ -1687,10 +1778,11 @@ def az_menu() -> None:
         table.add_row("4", "Benchmark and tune self-play")
         table.add_row("5", "View benchmark history")
         table.add_row("6", "View checkpoint ancestry")
+        table.add_row("7", "Benchmark RMCTS (experimental)")
         table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]AlphaZero pipeline[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6", "q"],
+        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6", "7", "q"],
                             default="3")
         if choice == "1":
             _selfplay()
@@ -1704,5 +1796,7 @@ def az_menu() -> None:
             _view_benchmark_history()
         elif choice == "6":
             _show_checkpoint_ancestry()
+        elif choice == "7":
+            _benchmark_rmcts()
         elif choice == "q":
             return
