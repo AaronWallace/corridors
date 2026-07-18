@@ -1899,6 +1899,25 @@ class SelfPlayPool:
             except Exception:
                 pass
 
+        # Each mp.Queue registers ~3 POSIX semaphores with the resource_tracker
+        # at creation time; the semaphores are only unlinked from /dev/shm when
+        # the Queue's Finalize hook runs (triggered by GC of the Queue object).
+        # Just calling queue.close() leaves the objects alive in self.*, so
+        # cleanup is deferred to process exit — by which point resource_tracker
+        # has already run its atexit sweep and complains about the "leaks".
+        # Drop every reference and force a full GC so Finalize runs NOW and the
+        # semaphores are released into /dev/shm before this process ends.
+        import gc
+        self.result_queue = None
+        self.cmd_queues = []
+        self.request_queues = []
+        self.response_queues = None
+        self.ack_queue = None
+        self.workers = []
+        self.servers = []
+        del queues
+        gc.collect()
+
     def __enter__(self) -> "SelfPlayPool":
         return self
 
