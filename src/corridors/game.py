@@ -160,7 +160,17 @@ def blocked_mask_for(walls) -> int:
     return m
 
 
-@lru_cache(maxsize=200_000)
+# NOTE: This cache is process-wide (module-level lru_cache), so it persists
+# for the entire lifetime of a self-play worker across all iterations. Each
+# entry is a Dict[Pos, int] of ~99 cells for our 11x9 board and costs ~1.66 KB
+# (measured). At the old maxsize=200_000 that's ~6.5 GB per worker; with 200+
+# workers running a long loop, workers steadily filled the cache and OOM'd the
+# host despite MALLOC_TRIM (memory was genuinely referenced by lru_cache, not
+# arena fragmentation). At 5,000 entries the cache is capped at ~8 MB per
+# worker (~2 GB across 251 workers) while still catching most within-game
+# transpositions — MCTS bursts >5k unique masks per game are rare and LRU
+# eviction covers them.
+@lru_cache(maxsize=5_000)
 def _dist_table_from(goal: Pos, blocked_mask: int) -> Dict[Pos, int]:
     dist: Dict[Pos, int] = {goal: 0}
     frontier = [goal]
