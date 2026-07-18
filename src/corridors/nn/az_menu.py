@@ -160,7 +160,7 @@ def _detect_and_show_hw() -> dict:
 def _prompt_selfplay_params(num_games: int, hw: dict):
     """Prompt for the self-play device and parallelism. Returns
     (device, workers, batch_size, concurrency, inference_servers,
-    batch_timeout_ms).
+    batch_timeout_ms, fp16, compile_inference).
 
     CPU-local self-play (each worker plays full games with its own model, no
     inference server) scales with cores, starts instantly, and streams completed
@@ -189,6 +189,8 @@ def _prompt_selfplay_params(num_games: int, hw: dict):
     concurrency = 0
     inference_servers = 1
     batch_timeout_ms = 0.0
+    fp16 = False
+    compile_inference = False
     if device != "cpu":
         batch_size = _prompt_int("Inference batch size", hw["inference_batch"], 1, 8192)
         concurrency = _prompt_int("Concurrent games per worker (0=auto)",
@@ -197,7 +199,19 @@ def _prompt_selfplay_params(num_games: int, hw: dict):
                                         hw.get("inference_servers", 1), 1, 64)
         batch_timeout_ms = _prompt_float("Partial-batch flush timeout ms (0=default)",
                                          hw.get("batch_timeout_ms", 0.0), 0.0, 1000.0)
-    return device, workers, batch_size, concurrency, inference_servers, batch_timeout_ms
+        # GPU-only accel: fp16 (~2x on modern GPUs, tiny numeric drift ok for
+        # self-play sampling) + torch.compile (fuses ops, CUDA-graph capture).
+        # Both change results at the ulp level — deliberately opt-in, but the
+        # right default on GPU.
+        console.print("[dim]GPU accel: fp16 (~2×) + torch.compile (op fusion, ~1.3–2× more). "
+                      "Both are numerically non-identical to fp32 eager but well within "
+                      "MCTS sampling noise; recommended for GPU self-play.[/dim]")
+        fp16 = Confirm.ask("[dim]Use fp16 inference?[/dim]", default=True)
+        compile_inference = Confirm.ask(
+            "[dim]torch.compile the inference model? (first eval slow, then faster)[/dim]",
+            default=True)
+    return (device, workers, batch_size, concurrency, inference_servers,
+            batch_timeout_ms, fp16, compile_inference)
 
 
 def _prompt_search_params() -> dict:
@@ -1014,8 +1028,8 @@ def _selfplay() -> None:
     num_games = _prompt_int("Number of games", hw["games_per_iter"], 1, 100_000)
     sims = _prompt_int("MCTS simulations per move", 200, 10, 5000)
     max_plies = _prompt_int("Max plies per game", 150, 20, 1000)
-    sp_device, workers, batch_size, concurrency, inference_servers, \
-        batch_timeout_ms = _prompt_selfplay_params(num_games, hw)
+    (sp_device, workers, batch_size, concurrency, inference_servers,
+     batch_timeout_ms, sp_fp16, sp_compile) = _prompt_selfplay_params(num_games, hw)
     search_params = _prompt_search_params()
 
     # Check for existing checkpoint
@@ -1044,6 +1058,8 @@ def _selfplay() -> None:
         concurrent_games=concurrency,
         inference_servers=inference_servers,
         batch_timeout_ms=batch_timeout_ms,
+        inference_fp16=sp_fp16,
+        inference_compile=sp_compile,
         checkpoint=checkpoint,
         device=sp_device,
         **search_params,
@@ -1329,8 +1345,8 @@ def _full_loop() -> None:
     epochs_per_iter = _prompt_int("Target training epochs per iteration (adaptive)", 10, 1, 1000)
     train_batch_size = _prompt_int("Training batch size", hw["train_batch"], 8, 65536)
     lr = _prompt_float("Learning rate", 2e-3, 1e-6, 1.0)
-    device, workers, sp_batch_size, concurrency, inference_servers, \
-        batch_timeout_ms = _prompt_selfplay_params(games_per_iter, hw)
+    (device, workers, sp_batch_size, concurrency, inference_servers,
+     batch_timeout_ms, sp_fp16, sp_compile) = _prompt_selfplay_params(games_per_iter, hw)
     search_params = _prompt_search_params()
     max_positions = _prompt_int(
         "Replay buffer: keep last N positions (0=all; e.g. 300000 ≈ recent games)",
@@ -1382,6 +1398,8 @@ def _full_loop() -> None:
         workers=workers, batch_size=sp_batch_size,
         concurrent_games=concurrency, inference_servers=inference_servers,
         batch_timeout_ms=batch_timeout_ms,
+        inference_fp16=sp_fp16,
+        inference_compile=sp_compile,
         device=device,
         **search_params,
     )
