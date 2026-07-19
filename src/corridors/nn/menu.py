@@ -239,7 +239,9 @@ def _print_head_to_head(console, results, ratings, modified=None) -> None:
         return
     rec = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))  # rec[a][b] = [W,L,D]
     names = set()
-    for a, b, score in results:
+    for res in results:
+        # results are (a, b, score) or (a, b, score, termination) — accept both
+        a, b, score = res[0], res[1], res[2]
         names.add(a); names.add(b)
         if score == 1.0:
             rec[a][b][0] += 1; rec[b][a][1] += 1      # a wins, b loses
