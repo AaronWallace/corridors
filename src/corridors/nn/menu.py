@@ -372,20 +372,38 @@ def _tournament() -> None:
 # ---------------------------------------------------------------------------
 
 def _numbered_selections(items: List[dict], raw: str) -> List[dict]:
-    """Return unique, valid numbered selections in the order entered."""
+    """Return unique, valid numbered selections in the order entered.
+
+    Accepts individual numbers, ranges, comma- or space-separated lists, and
+    the literal 'all' — so bulk operations don't need `d 12` typed repeatedly.
+    Examples: '1', '1,3,5', '1 3 5', '1-5', '1-3,7,9-11', 'all'.
+    """
+    if raw.strip().lower() == "all":
+        return list(items)
     selected = []
     seen = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            index = int(part) - 1
-        except ValueError:
-            continue
-        if 0 <= index < len(items) and index not in seen:
-            selected.append(items[index])
-            seen.add(index)
+    # Comma-, space-, or mixed-separated tokens all work.
+    for part in raw.replace(",", " ").split():
+        if "-" in part and part.count("-") == 1 and not part.startswith("-"):
+            lo_s, hi_s = part.split("-", 1)
+            try:
+                lo, hi = int(lo_s) - 1, int(hi_s) - 1
+            except ValueError:
+                continue
+            if lo > hi:
+                lo, hi = hi, lo
+            for i in range(lo, hi + 1):
+                if 0 <= i < len(items) and i not in seen:
+                    selected.append(items[i])
+                    seen.add(i)
+        else:
+            try:
+                index = int(part) - 1
+            except ValueError:
+                continue
+            if 0 <= index < len(items) and index not in seen:
+                selected.append(items[index])
+                seen.add(index)
     return selected
 
 def _print_datasets(items: List[dict], title: str = "Datasets") -> None:
@@ -452,7 +470,8 @@ def _manage_archived_datasets() -> None:
         return
     _print_datasets(items, "Archived datasets")
     raw = Prompt.ask(
-        "[dim]r # to restore, d # to permanently delete, or q to go back[/dim]",
+        "[dim]r <sel> restore · d <sel> permanently delete "
+        "(sel: #, 1-5, 1,3,7, or 'all') · q back[/dim]",
         default="q",
     ).strip()
     if raw.lower() == "q":
@@ -486,9 +505,9 @@ def _manage_datasets() -> None:
         return
     _print_datasets(items)
     raw = Prompt.ask(
-        f"[dim]s # to share in Git, a # to archive, d # to delete, "
-        f"v to view archive ({len(archived)}), "
-        "or q to go back[/dim]",
+        f"[dim]s <sel> share · a <sel> archive · d <sel> delete "
+        f"(sel: #, 1-5, 1,3,7, or 'all') · "
+        f"v view archive ({len(archived)}) · q back[/dim]",
         default="q",
     ).strip()
     if raw.lower() == "q":
@@ -582,8 +601,8 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
         console.print(f"[dim]copied {name} to {target.parent.name}/[/dim]")
         return
     raw = Prompt.ask(
-        "[dim]Delete # (comma-separated), r # to rename, c # to copy to best, "
-        "or q to go back[/dim]",
+        "[dim]Delete <sel> · r <sel> rename · c <sel> copy to best "
+        "(sel: #, 1-5, 1,3,7, or 'all') · q back[/dim]",
         default="q",
     ).strip()
     if raw.lower() == "q":
