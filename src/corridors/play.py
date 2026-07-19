@@ -586,6 +586,38 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
     )
     workers = min(workers, num_games)
 
+    # Persistent transposition table: worth sharing across a few workers, but
+    # at bulk scale (many workers, random starts) it becomes pure contention
+    # with negligible cache-hit benefit — collapses classical solver nps by
+    # ~300x in real runs. Only prompt when it actually applies (classical
+    # player + multiple workers), and default off past the threshold where
+    # contention overtakes hit-rate benefit.
+    uses_classical = "classical" in (p1_agent, p2_agent)
+    if uses_classical and workers > 1:
+        threshold = 16
+        saved_pt = cfg.get("use_persistent_tt", True)
+        if workers > threshold:
+            default_pt = "n"
+            hint = f"n recommended: contention >> hit rate above {threshold} workers"
+        else:
+            default_pt = "y" if saved_pt else "n"
+            hint = "shares the classical TT (sqlite) across workers"
+        raw = Prompt.ask(
+            Text.assemble(
+                ("Share persistent transposition table? ", "dim"),
+                (f"[y/n] ({hint})", "dim"),
+            ),
+            choices=["y", "n"], default=default_pt,
+        )
+        use_persistent_tt = (raw == "y")
+        # Mutate cfg so _spawn_workers (which reads cfg["use_persistent_tt"])
+        # sees this run's choice, and persist it as the new default.
+        cfg["use_persistent_tt"] = use_persistent_tt
+    else:
+        # No prompt: single-worker runs and non-classical setups don't benefit
+        # from the shared TT, so we neither ask nor change the saved default.
+        use_persistent_tt = bool(cfg.get("use_persistent_tt", True))
+
     display_default = str(cfg.get("display", "live")).lower()
     if display_default not in ("live", "headless"):
         display_default = "live"
@@ -602,6 +634,7 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
         tiebreak_epsilon=tiebreak, max_plies=max_plies,
         workers=workers, display=display,
         p1_agent=p1_agent, p2_agent=p2_agent,
+        use_persistent_tt=use_persistent_tt,
     )
     return AutoplayParams(
         num_games=num_games, starts=starts, p1_col=p1_col, p2_col=p2_col,
