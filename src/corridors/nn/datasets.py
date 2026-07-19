@@ -156,14 +156,19 @@ def next_shard_index(name: str) -> int:
 
 
 def write_shard(name: str, shard_index: int,
-                tensors: np.ndarray, outcomes: np.ndarray, tt_scores: np.ndarray) -> Path:
+                tensors: np.ndarray, outcomes: np.ndarray, tt_scores: np.ndarray,
+                moves: Optional[np.ndarray] = None) -> Path:
+    """Write a classical-autoplay shard. `moves` (int16 action indices) is
+    optional for backward compatibility; new runs record it so the shard can
+    be converted to AlphaZero training format later."""
     d = dataset_dir(name)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"shard_{shard_index:03d}.npz"
-    # np.savez appends ".npz" unless the name already ends with it, so the temp
-    # file must carry the suffix; leading "." keeps it out of shard globs.
     tmp = d / f".tmp_shard_{shard_index:03d}.npz"
-    np.savez_compressed(tmp, tensors=tensors, outcomes=outcomes, tt_scores=tt_scores)
+    arrays = {"tensors": tensors, "outcomes": outcomes, "tt_scores": tt_scores}
+    if moves is not None:
+        arrays["moves"] = moves
+    np.savez_compressed(tmp, **arrays)
     os.replace(tmp, path)
     return path
 

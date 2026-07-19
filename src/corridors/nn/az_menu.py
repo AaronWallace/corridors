@@ -1784,6 +1784,74 @@ def _view_benchmark_history() -> None:
 # Menu
 # ---------------------------------------------------------------------------
 
+def _convert_classical_menu() -> None:
+    """Turn a classical-autoplay dataset into an AZ-shaped run for warm-start.
+
+    Only shards recorded with a 'moves' array are convertible — the converter
+    needs the move actually played to build a one-hot policy target. Runs from
+    before that feature landed are silently skipped shard-by-shard.
+    """
+    console = _console()
+    from .convert_classical import convert
+    console.print("\n[bold]Convert classical → AZ warm-start[/bold]")
+    console.print("[dim]Turns classical-autoplay shards (state, played_move, "
+                  "outcome) into AZ shards (state, one-hot policy, outcome). "
+                  "The result appears as an AZ run under nn_data/alphazero/ and "
+                  "can be selected in Train Network.[/dim]\n")
+
+    # List candidate source datasets — classical or unknown-kind, not already
+    # AZ (an AZ run has kind="alphazero").
+    candidates = [item for item in ds_mod.list_datasets()
+                  if item.get("kind") != "alphazero"]
+    if not candidates:
+        console.print("[yellow]no classical datasets found — run classical "
+                      "autoplay first (main menu → Neural network training → "
+                      "Generate classical self-play data).[/yellow]")
+        return
+    for i, item in enumerate(candidates, 1):
+        pos = item.get("positions", "?")
+        pos_str = f"{pos:,}" if isinstance(pos, int) else str(pos)
+        console.print(f"  [dim]{i}.[/dim] {item['name']} "
+                      f"[dim]({item['shards']} shards, {pos_str} positions, "
+                      f"kind={item.get('kind', '?')})[/dim]")
+
+    raw = Prompt.ask("[dim]Source dataset (# or name)[/dim]",
+                     default=candidates[0]["name"]).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+        source = candidates[int(raw) - 1]["name"]
+    elif any(item["name"] == raw for item in candidates):
+        source = raw
+    else:
+        console.print("[red]unknown source[/red]")
+        return
+
+    default_dst = source.replace("/", "_") + "_az"
+    az_run_name = Prompt.ask("[dim]Destination AZ run name[/dim]",
+                             default=default_dst).strip() or default_dst
+    try:
+        result = convert(source, az_run_name)
+    except FileExistsError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        return
+    console.print(Panel(
+        Text.assemble(
+            ("source ", "dim"), (result["source"], "white"),
+            ("\ndestination ", "dim"), (result["destination"], STYLE_HINT),
+            ("\nshards ", "dim"), (str(result["shards_written"]), "white"),
+            ("   positions ", "dim"), (f"{result['positions']:,}", "white"),
+            ("   ", "dim"), (f"{result['elapsed_s']:.1f}s", "white"),
+        ),
+        title="[bold]Conversion complete[/bold]", border_style=STYLE_GRID,
+    ))
+    if result["shards_written"] == 0:
+        console.print("[yellow]no shards were convertible — this dataset likely "
+                      "predates 'moves' recording. Re-run classical autoplay to "
+                      "generate new shards.[/yellow]")
+
+
 def az_menu() -> None:
     console = _console()
     while True:
@@ -1797,10 +1865,12 @@ def az_menu() -> None:
         table.add_row("5", "View benchmark history")
         table.add_row("6", "View checkpoint ancestry")
         table.add_row("7", "Benchmark RMCTS (experimental)")
+        table.add_row("8", "Convert classical data → AZ warm-start")
         table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]AlphaZero pipeline[/bold]",
                             border_style=STYLE_GRID))
-        choice = Prompt.ask("Choose", choices=["1", "2", "3", "4", "5", "6", "7", "q"],
+        choice = Prompt.ask("Choose",
+                            choices=["1", "2", "3", "4", "5", "6", "7", "8", "q"],
                             default="3")
         if choice == "1":
             _selfplay()
@@ -1816,5 +1886,7 @@ def az_menu() -> None:
             _show_checkpoint_ancestry()
         elif choice == "7":
             _benchmark_rmcts()
+        elif choice == "8":
+            _convert_classical_menu()
         elif choice == "q":
             return

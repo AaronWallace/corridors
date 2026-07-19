@@ -70,6 +70,7 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
     rec_turns: list = []       # side to move at each recorded position
     rec_scores: list = []      # normalized search score (mover's perspective)
     rec_outcomes: list = []    # filled at game end
+    rec_moves: list = []       # action index of the move actually played (0..226)
     games_recorded = 0
     agents = {}
     if cfg.p1_agent != "classical" or cfg.p2_agent != "classical":
@@ -90,11 +91,16 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
             return
         import numpy as np
         from .nn import datasets
+        # Trim to the shortest completed list — an interrupted game may leave
+        # a state recorded without an outcome/move.
+        n = min(len(rec_tensors), len(rec_outcomes), len(rec_scores),
+                len(rec_moves))
         datasets.write_shard(
             cfg.record_dataset, cfg.record_shard_index,
-            np.stack(rec_tensors),
-            np.asarray(rec_outcomes, dtype=np.int8),
-            np.asarray(rec_scores, dtype=np.float32),
+            np.stack(rec_tensors[:n]),
+            np.asarray(rec_outcomes[:n], dtype=np.int8),
+            np.asarray(rec_scores[:n], dtype=np.float32),
+            moves=np.asarray(rec_moves[:n], dtype=np.int16),
         )
         shard_flushed = True
         queue.put(("shard", cfg.worker_id, cfg.record_shard_index,
@@ -145,9 +151,14 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                     mv = agents[mover].pick_move(state, board)
                     elapsed, nodes, depth_reached, score = time.monotonic() - think_t0, 0, 0, 0
                 if cfg.record_dataset:
+                    from .nn.actions import move_to_index
                     rec_tensors.append(encoding.encode_state(state, board))
                     rec_turns.append(mover)
                     rec_scores.append(encoding.normalize_score(score))
+                    # Record the move as an action index so the AZ converter can
+                    # turn it into a one-hot policy target without needing the
+                    # original Move object (also fixed-width, small).
+                    rec_moves.append(move_to_index(mv))
                 state = apply_move(state, mv)
                 states_seen.append(state)
                 plies += 1
