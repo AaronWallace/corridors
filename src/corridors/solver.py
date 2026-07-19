@@ -168,6 +168,13 @@ class TT:
             # Multiple worker processes share this file; wait instead of erroring
             # when another writer holds the lock.
             self.conn.execute("PRAGMA busy_timeout=5000")
+            # Memory-map the DB. Each worker's read hits kernel-mapped pages, so
+            # the OS shares one copy of the file across ALL worker processes via
+            # the page cache — instead of every worker duplicating the hot set
+            # in its own Python dict as it warms up. Cap at 2 GB (well above
+            # current DB size) — the kernel maps lazily, so we only pay for
+            # pages actually touched. Cheap; wins big with many workers.
+            self.conn.execute("PRAGMA mmap_size=2147483648")
             self.conn.executescript(_SCHEMA)
 
     def probe(self, key: int) -> Optional[TTEntry]:
