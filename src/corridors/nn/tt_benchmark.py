@@ -51,12 +51,13 @@ def _bench_worker(worker_id: int, tt_path: Optional[str], depth: int,
                   time_limit: float, deadline: float, seed: int,
                   results_q) -> None:
     """One worker: search positions from a deterministic random walk until
-    time budget is exhausted. Reports total searches and total nodes."""
-    import signal
+    time budget is exhausted. Reports total searches and total nodes.
 
-    def _on_sigterm(_sig, _frame):
-        raise SystemExit(0)
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    No SIGTERM handler: unlike autoplay workers there's nothing to flush on
+    shutdown, and installing one causes a benign-but-noisy race — the parent
+    calls terminate() on workers that have already finished posting their
+    results and are mid-Python-shutdown, and SystemExit raised from the
+    handler interrupts threading._shutdown with an ugly traceback."""
     rng = random.Random(seed)
     tt = solver.TT(sqlite_path=tt_path) if tt_path else solver.TT()
     total_searches = 0
@@ -126,11 +127,18 @@ def run_bench(workers: int, tt_shared: bool, duration_s: float = 20.0,
         except Exception:
             pass
     elapsed = time.monotonic() - t0
+    # Give workers a moment to exit cleanly after their results are in — they
+    # check `deadline` inside the loop so they should be exiting on their own.
+    # Only terminate stragglers that don't shut down in the grace window.
+    grace_deadline = time.monotonic() + 2.0
+    for p in procs:
+        remaining = grace_deadline - time.monotonic()
+        if remaining > 0:
+            p.join(timeout=remaining)
     for p in procs:
         if p.is_alive():
             p.terminate()
-    for p in procs:
-        p.join(timeout=2.0)
+            p.join(timeout=2.0)
     total_searches = sum(s for s, _ in reports.values())
     total_nodes = sum(n for _, n in reports.values())
     return BenchResult(
