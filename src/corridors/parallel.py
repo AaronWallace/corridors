@@ -54,6 +54,16 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
     (encoded_state, outcome_for_mover, normalized_tt_score) and written to this
     worker's own shard NPZ at the end (also flushed on interrupt).
     """
+    # Coordinator's p.terminate() sends SIGTERM whose default action is to exit
+    # immediately, skipping the finally block that flushes our shard. Install a
+    # handler that raises SystemExit so unwinding happens and _flush_shard() runs
+    # — otherwise a Ctrl-C on the coordinator loses all in-progress worker data.
+    import signal
+
+    def _on_sigterm(_sig, _frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     rng = random.Random(cfg.seed)
     tt = None
     rec_tensors: list = []
@@ -165,8 +175,9 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                        game_nodes, think_time))
         _flush_shard()
         queue.put(("done", cfg.worker_id))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, SystemExit):
         # Drop the in-flight game's unlabelled positions, keep completed games.
+        # SystemExit fires when the coordinator SIGTERMs us; treat identically.
         del rec_tensors[len(rec_outcomes):]
         del rec_scores[len(rec_outcomes):]
     except Exception as e:  # surface crashes to the parent instead of dying silently

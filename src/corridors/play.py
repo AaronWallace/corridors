@@ -878,6 +878,7 @@ def autoplay_parallel(params: AutoplayParams, cfg: dict,
     featured: Optional[int] = min(active) if active else None
 
     console.clear()
+    interrupted = False
     try:
         with Live(_build_parallel_view(views, featured, session),
                   console=console, refresh_per_second=10, transient=False) as live:
@@ -941,29 +942,53 @@ def autoplay_parallel(params: AutoplayParams, cfg: dict,
                 if now - last_render >= 0.1:
                     live.update(_build_parallel_view(views, featured, session))
                     last_render = now
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[yellow]interrupted — saving partial run…[/yellow]")
     finally:
         for p in procs:
             if p.is_alive():
                 p.terminate()
         for p in procs:
             p.join(timeout=2.0)
+        # Drain any late shard/game_end messages the workers pushed before dying.
+        while True:
+            try:
+                msg = q.get_nowait()
+            except (queue_mod.Empty, OSError):
+                break
+            if msg[0] == "shard":
+                _, _, shard_idx, positions, games = msg
+                name = f"shard_{shard_idx:03d}.npz"
+                if name not in shards:
+                    shards.append(name)
+                    shard_positions += positions
+                    shard_games += games
+            elif msg[0] == "game_end":
+                _, _, _gnum, winner, plies, game_time, *_rest = msg
+                session.record_game(winner, plies, game_time)
+        # Save a manifest even on interrupt so the run shows up in the menus
+        # with real counts instead of "?" (was the cause of "why don't my
+        # classical runs appear" — Ctrl-C skipped register_run entirely).
+        if record_dataset is not None and shards:
+            from .nn import datasets
+            dcfg = datasets.DatasetConfig(
+                depth=params.depth, time_limit=params.time_limit,
+                tiebreak_epsilon=params.tiebreak_epsilon,
+                max_plies=params.max_plies, starts=params.starts,
+            )
+            mismatch = datasets.config_mismatch(record_dataset, dcfg)
+            if mismatch:
+                console.print(f"[yellow]warning: dataset config changed ({mismatch})[/yellow]")
+            datasets.register_run(record_dataset, dcfg, shards, shard_games, shard_positions)
+            console.print(
+                f"[green]dataset '{record_dataset}': +{shard_positions:,} positions "
+                f"from {shard_games} games in {len(shards)} shards"
+                + (" (partial — run was interrupted)" if interrupted else "") + "[/green]"
+            )
 
-    console.print(_final_summary(session))
-    if record_dataset is not None and shards:
-        from .nn import datasets
-        dcfg = datasets.DatasetConfig(
-            depth=params.depth, time_limit=params.time_limit,
-            tiebreak_epsilon=params.tiebreak_epsilon,
-            max_plies=params.max_plies, starts=params.starts,
-        )
-        mismatch = datasets.config_mismatch(record_dataset, dcfg)
-        if mismatch:
-            console.print(f"[yellow]warning: dataset config changed ({mismatch})[/yellow]")
-        datasets.register_run(record_dataset, dcfg, shards, shard_games, shard_positions)
-        console.print(
-            f"[green]dataset '{record_dataset}': +{shard_positions:,} positions "
-            f"from {shard_games} games in {len(shards)} shards[/green]"
-        )
+    if not interrupted:
+        console.print(_final_summary(session))
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1055,7 @@ def autoplay_headless(params: AutoplayParams, cfg: dict,
         f"starts {params.starts}, eps {params.tiebreak_epsilon}",
         flush=True,
     )
+    interrupted = False
     try:
         while active:
             try:
@@ -1065,32 +1091,59 @@ def autoplay_headless(params: AutoplayParams, cfg: dict,
             if now - last_report >= REPORT_EVERY:
                 _emit()
                 last_report = now
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\ninterrupted — saving partial run…", flush=True)
     finally:
         for p in procs:
             if p.is_alive():
                 p.terminate()
         for p in procs:
             p.join(timeout=2.0)
+        # Drain any late shard/game_end messages the workers pushed before dying,
+        # so an interrupted run still records what actually landed on disk.
+        while True:
+            try:
+                msg = q.get_nowait()
+            except (queue_mod.Empty, OSError):
+                break
+            if msg[0] == "shard":
+                _, _, shard_idx, positions, games = msg
+                name = f"shard_{shard_idx:03d}.npz"
+                if name not in shards:
+                    shards.append(name)
+                    shard_positions += positions
+                    shard_games += games
+            elif msg[0] == "game_end":
+                _, _, _gnum, winner, plies, game_time, *_rest = msg
+                session.record_game(winner, plies, game_time)
+        # Register the run whether we finished cleanly OR were interrupted —
+        # writes a manifest so the dataset shows up in Train/View Datasets and
+        # its games/positions counts are real, not "?".
+        if record_dataset is not None and shards:
+            from .nn import datasets
+            dcfg = datasets.DatasetConfig(
+                depth=params.depth, time_limit=params.time_limit,
+                tiebreak_epsilon=params.tiebreak_epsilon,
+                max_plies=params.max_plies, starts=params.starts,
+            )
+            mismatch = datasets.config_mismatch(record_dataset, dcfg)
+            if mismatch:
+                print(f"warning: dataset config changed ({mismatch})", flush=True)
+            datasets.register_run(record_dataset, dcfg, shards, shard_games, shard_positions)
+            print(f"dataset '{record_dataset}': +{shard_positions:,} positions "
+                  f"from {shard_games} games in {len(shards)} shards"
+                  + (" (partial — run was interrupted)" if interrupted else ""),
+                  flush=True)
 
     _emit(final=True)
-    print(
-        f"complete: {session.games_played} games in {_fmt_secs(time.monotonic() - session.started_at)}"
-        f"  (aggregate game time {_fmt_secs(session.total_time)})",
-        flush=True,
-    )
-    if record_dataset is not None and shards:
-        from .nn import datasets
-        dcfg = datasets.DatasetConfig(
-            depth=params.depth, time_limit=params.time_limit,
-            tiebreak_epsilon=params.tiebreak_epsilon,
-            max_plies=params.max_plies, starts=params.starts,
+    if not interrupted:
+        print(
+            f"complete: {session.games_played} games in "
+            f"{_fmt_secs(time.monotonic() - session.started_at)}"
+            f"  (aggregate game time {_fmt_secs(session.total_time)})",
+            flush=True,
         )
-        mismatch = datasets.config_mismatch(record_dataset, dcfg)
-        if mismatch:
-            print(f"warning: dataset config changed ({mismatch})", flush=True)
-        datasets.register_run(record_dataset, dcfg, shards, shard_games, shard_positions)
-        print(f"dataset '{record_dataset}': +{shard_positions:,} positions "
-              f"from {shard_games} games in {len(shards)} shards", flush=True)
 
 
 # ---------------------------------------------------------------------------
