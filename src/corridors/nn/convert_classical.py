@@ -118,10 +118,22 @@ def convert(src_name: str, az_run_name: str) -> dict:
         total_positions += n
 
     # Write a run.json so the AZ Train menu shows a sensible config for the run.
+    # Pull the source dataset's game count from its manifest so the listing
+    # shows the same games N, not "?".
+    source_games = 0
+    source_manifest = src / "manifest.json"
+    if source_manifest.exists():
+        try:
+            m = json.loads(source_manifest.read_text(encoding="utf-8"))
+            source_games = int(m.get("games", 0) or 0)
+        except (OSError, ValueError, TypeError):
+            pass
     run_meta = {
         "mode": "converted_classical",
         "source_dataset": src_name,
-        "selfplay": {"num_games": 0, "notes": "converted from classical autoplay"},
+        "games": source_games,  # top-level for _read_meta's data.get("games")
+        "selfplay": {"num_games": source_games,
+                     "notes": "converted from classical autoplay"},
         "positions": total_positions,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
     }

@@ -204,14 +204,53 @@ def _shard_files(d: Path) -> List[Path]:
     return sorted(d.glob("shard_*.npz")) + sorted(d.glob("iter_*.npz"))
 
 
+def _dir_scan(d: Path) -> Optional[dict]:
+    """Single scandir summarising a dataset dir. Returns npz names + mtimes for
+    the two metadata files. No per-shard stat calls (npz names come straight
+    from readdir), so this is O(1) syscalls regardless of shard count — the
+    right primitive for fast listing over big runs (thousands of shards).
+    Returns None if the dir can't be read."""
+    try:
+        npz_names: List[str] = []
+        manifest_mtime = 0
+        run_mtime = 0
+        for e in os.scandir(d):
+            n = e.name
+            if n.endswith(".npz") and not n.startswith("."):
+                npz_names.append(n)
+            elif n == "manifest.json":
+                try:
+                    manifest_mtime = e.stat().st_mtime_ns
+                except OSError:
+                    pass
+            elif n == "run.json":
+                try:
+                    run_mtime = e.stat().st_mtime_ns
+                except OSError:
+                    pass
+        return {"npz_names": npz_names,
+                "manifest_mtime": manifest_mtime, "run_mtime": run_mtime}
+    except OSError:
+        return None
+
+
 def is_dataset_dir(d: Path) -> bool:
     """A directory holds a dataset iff it directly contains shard files or a
     metadata file. A pure *container* of nested runs (e.g. ``nn_data/alphazero``)
-    holds neither directly, so it is never treated as a deletable dataset."""
-    if not d.is_dir():
+    holds neither directly, so it is never treated as a deletable dataset.
+
+    Single scandir with early exit — cheap even on huge trees."""
+    try:
+        for e in os.scandir(d):
+            n = e.name
+            if n in ("manifest.json", "run.json"):
+                return True
+            if n.endswith(".npz") and not n.startswith("."):
+                if n.startswith("shard_") or n.startswith("iter_"):
+                    return True
         return False
-    return ((d / "manifest.json").exists() or (d / "run.json").exists()
-            or bool(_shard_files(d)))
+    except OSError:
+        return False
 
 
 def _npz_array_rows(path: Path) -> Optional[int]:
@@ -419,47 +458,35 @@ def _read_meta(d: Path, shards: List[Path], records: Dict[str, dict]) -> Optiona
     return _legacy_name_meta(d, shards, records) if shards else None
 
 
-def _dir_signature(d: Path) -> Optional[list]:
-    """A fingerprint of the dataset dir's contents-of-interest — invariant to
-    writes of our own _index.json (which would otherwise create a chicken-and-
-    egg problem with dir-mtime-based caching). Uses a single scandir + N cheap
-    stats; on modern filesystems this is far cheaper than opening any shard."""
-    try:
-        npz_count = 0
-        npz_size = 0
-        manifest_mtime = 0
-        run_mtime = 0
-        for e in os.scandir(d):
-            n = e.name
-            if n.endswith(".npz"):
-                st = e.stat()
-                npz_count += 1
-                npz_size += st.st_size
-            elif n == "manifest.json":
-                manifest_mtime = e.stat().st_mtime_ns
-            elif n == "run.json":
-                run_mtime = e.stat().st_mtime_ns
-    except OSError:
+def _dir_signature_from_scan(scan: Optional[dict]) -> Optional[list]:
+    """Cheap fingerprint from _dir_scan output — npz COUNT (not sizes) plus the
+    two metadata mtimes. Our shards are append-only (write_shard uses atomic
+    tmp+replace, never rewrites in place), so count is enough to detect shard
+    changes without an O(shards) stat loop. That's the whole point of the
+    fast path: one scandir → immediate cache decision."""
+    if scan is None:
         return None
-    return [npz_count, npz_size, manifest_mtime, run_mtime]
+    return [len(scan["npz_names"]), scan["manifest_mtime"], scan["run_mtime"]]
 
 
 def _dataset_entry(d: Path, name: str) -> Dict:
-    # Fast path: skip opening any shards / rebuilding the full index when the
-    # dataset's fingerprint (npz count + total size + manifest/run mtimes) is
-    # unchanged since we last cached the entry. Signature ignores our own
-    # _index.json writes, so it's stable across repeated listings.
-    sig = _dir_signature(d)
+    # Fast path: one scandir, no per-shard stats. Fingerprint is (npz_count,
+    # manifest_mtime, run_mtime) — unchanged since last cache = return cached
+    # entry, done. Cheap even for runs with thousands of shards.
+    scan = _dir_scan(d)
+    sig = _dir_signature_from_scan(scan)
     if sig is not None:
         try:
             cached = _read_index(d).get("entry")
-            if (isinstance(cached, dict) and cached.get("_v") == 1
+            if (isinstance(cached, dict) and cached.get("_v") == 2
                     and cached.get("sig") == sig):
                 return {**cached["entry"], "name": name}
         except OSError:
             pass
 
-    # Slow path — refresh the shard index and persist a cacheable entry.
+    # Slow path — refresh the shard index (this DOES stat every shard so it
+    # can detect content changes) and persist a cacheable entry. Runs only
+    # on first sight of a dataset or when shards are added/removed.
     shards = _shard_files(d)
     records = _refresh_shard_index(d, shards)
     m = _read_meta(d, shards, records)
@@ -486,9 +513,9 @@ def _dataset_entry(d: Path, name: str) -> Dict:
     # index writes so the stored sig reflects the same state we return.
     try:
         data = _read_index(d)
-        final_sig = _dir_signature(d)  # after _refresh_shard_index may have written
+        final_sig = _dir_signature_from_scan(_dir_scan(d))
         data["entry"] = {
-            "_v": 1,
+            "_v": 2,
             "sig": final_sig,
             "entry": {k: v for k, v in entry.items() if k != "name"},
         }
