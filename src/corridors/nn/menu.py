@@ -145,46 +145,80 @@ def _train_model() -> None:
     ds = _choose_dataset()
     if ds is None:
         return
-    from .train import TrainConfig, train, default_checkpoint_name
+    from .train import (TrainConfig, train, default_checkpoint_name,
+                        _resolved_max_epochs, _resolved_min_epochs,
+                        resolve_device)
 
-    epochs = _prompt_int("Epochs", 30, 1, 10000)
+    epochs = _prompt_int("Epochs (soft target — may extend if val is still improving)",
+                         30, 1, 10000)
     batch = _prompt_int("Batch size", 256, 8, 65536)
     lr = _prompt_float("Learning rate", 1e-3, 1e-6, 1.0)
     aux = _prompt_float("Aux weight (tt-score loss)", 0.3, 0.0, 10.0)
-    cfg = TrainConfig(dataset=ds, epochs=epochs, batch_size=batch, lr=lr, aux_weight=aux)
+    cfg = TrainConfig(dataset=ds, epochs=epochs, batch_size=batch, lr=lr,
+                      aux_weight=aux)
     default_name = default_checkpoint_name(cfg)
     name = Prompt.ask("[dim]Checkpoint name[/dim]", default=default_name).strip()
     cfg.checkpoint_name = name or default_name
 
-    from .train import resolve_device
     console.print(f"[dim]device: {resolve_device('auto')}[/dim]")
+    console.print(
+        f"[dim]adaptive epochs: {_resolved_min_epochs(cfg)}-"
+        f"{_resolved_max_epochs(cfg)} · stop patience {cfg.early_stop_patience} · "
+        f"meaningful validation gain >={cfg.early_stop_min_delta:.2%}[/dim]"
+    )
+    console.print(f"[dim]{_FIT_LEGEND}[/dim]")
+
+    fit_trend = _EpochFitTrend()
 
     def on_epoch(e) -> None:
         star = " [green]*best*[/green]" if e.is_best else ""
+        stop = (f"  [yellow]-> stop: {e.stop_reason}[/yellow]"
+                if e.will_stop else "")
+        extend = (f"  [cyan]-> extending beyond target {e.target_epochs}[/cyan]"
+                  if e.extension_started else "")
+        # ValueNet's val metric is MSE (bounded), not the AZ policy+value sum,
+        # so we feed a synthetic "train_loss" to the fit trend that keeps the
+        # same relationship (val - train). Use train_loss as-is.
+        try:
+            fit = fit_trend.update(type("E", (), {
+                "train_loss": e.train_loss, "val_loss": e.val_mse})())
+        except Exception:
+            fit = ""
         console.print(
             f"  [dim]epoch[/dim] {e.epoch:>3}/{e.epochs}  "
             f"[dim]train[/dim] {e.train_loss:.4f}  "
             f"[dim]val[/dim] {e.val_mse:.4f}  "
             f"[dim]sign[/dim] {e.val_sign_acc:.3f}  "
             f"[dim]lr[/dim] {e.lr:.2e}  "
-            f"[dim]{e.elapsed:.0f}s[/dim]{star}"
+            f"[dim]{e.elapsed:.0f}s[/dim]  {fit}{star}{extend}{stop}"
         )
 
     try:
-        res = train(cfg, on_epoch=on_epoch)
+        from rich.live import Live
+        from .az_menu import _batch_progress_text
+        with Live(Text("  preparing training split...", style="dim"),
+                  console=console, refresh_per_second=4, transient=True) as live:
+            res = train(cfg, on_epoch=on_epoch,
+                        on_batch=lambda info: live.update(_batch_progress_text(info)))
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]training interrupted — best checkpoint so far is saved.[/dim]")
         return
+
+    stop_note = (f"   [dim]stopped early: {res['stop_reason']}[/dim]"
+                 if res.get("stopped_early") else "")
     console.print(Panel(
         Text.assemble(
             ("checkpoint ", "dim"), (res["checkpoint"], STYLE_HINT),
             ("   best val ", "dim"), (f"{res['best_val_mse']:.4f}", "white"),
             (" @ epoch ", "dim"), (f"{res['best_epoch']}", "white"),
+            (f"/{res.get('epochs_run', res['best_epoch'])}", "dim"),
             ("   positions ", "dim"), (f"{res['positions']:,}", "white"),
             ("   ", "dim"), (f"{res['elapsed']:.0f}s on {res['device']}", "white"),
         ),
         title="[bold]Training complete[/bold]", border_style=STYLE_GRID,
     ))
+    if stop_note:
+        console.print(stop_note)
 
 
 # ---------------------------------------------------------------------------

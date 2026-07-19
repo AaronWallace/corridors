@@ -112,41 +112,22 @@ class AZBatchInfo:
     loss: float
 
 
-class _ValidationEarlyStopper:
-    """Stop after validation ceases making meaningful relative progress."""
-
-    def __init__(self, patience: int, min_epochs: int,
-                 min_delta: float) -> None:
-        self.patience = max(1, int(patience))
-        self.min_epochs = max(1, int(min_epochs))
-        self.min_delta = max(0.0, float(min_delta))
-        self.best_meaningful = float("inf")
-        self.stale_epochs = 0
-
-    def update(self, epoch: int, val_loss: float) -> tuple[bool, str]:
-        threshold = (abs(self.best_meaningful) * self.min_delta
-                     if math.isfinite(self.best_meaningful) else 0.0)
-        if val_loss < self.best_meaningful - threshold:
-            self.best_meaningful = val_loss
-            self.stale_epochs = 0
-        else:
-            self.stale_epochs += 1
-        should_stop = epoch >= self.min_epochs and self.stale_epochs >= self.patience
-        reason = (f"no ≥{self.min_delta:.2%} validation improvement for "
-                  f"{self.stale_epochs} epochs") if should_stop else ""
-        return should_stop, reason
+# Shared with train.py (classical). Kept local aliases so existing call sites
+# don't have to change.
+from .train_common import (
+    ValidationEarlyStopper as _ValidationEarlyStopper,
+    resolve_min_epochs as _resolve_min_epochs_generic,
+    resolve_max_epochs as _resolve_max_epochs_generic,
+)
 
 
 def _resolved_early_stop_min_epochs(config: AZTrainConfig) -> int:
-    if config.early_stop_min_epochs > 0:
-        return min(config.epochs, config.early_stop_min_epochs)
-    return min(config.epochs, max(5, math.ceil(config.epochs * 0.35)))
+    return _resolve_min_epochs_generic(config.epochs, config.early_stop_min_epochs)
 
 
 def _resolved_max_epochs(config: AZTrainConfig) -> int:
-    if config.max_epochs > 0:
-        return max(config.epochs, config.max_epochs)
-    return max(config.epochs, math.ceil(config.epochs * config.epoch_extension_factor))
+    return _resolve_max_epochs_generic(
+        config.epochs, config.max_epochs, config.epoch_extension_factor)
 
 
 def resolve_device(device: str) -> str:
