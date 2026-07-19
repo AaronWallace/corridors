@@ -414,7 +414,47 @@ def _read_meta(d: Path, shards: List[Path], records: Dict[str, dict]) -> Optiona
     return _legacy_name_meta(d, shards, records) if shards else None
 
 
+def _dir_signature(d: Path) -> Optional[list]:
+    """A fingerprint of the dataset dir's contents-of-interest — invariant to
+    writes of our own _index.json (which would otherwise create a chicken-and-
+    egg problem with dir-mtime-based caching). Uses a single scandir + N cheap
+    stats; on modern filesystems this is far cheaper than opening any shard."""
+    try:
+        npz_count = 0
+        npz_size = 0
+        manifest_mtime = 0
+        run_mtime = 0
+        for e in os.scandir(d):
+            n = e.name
+            if n.endswith(".npz"):
+                st = e.stat()
+                npz_count += 1
+                npz_size += st.st_size
+            elif n == "manifest.json":
+                manifest_mtime = e.stat().st_mtime_ns
+            elif n == "run.json":
+                run_mtime = e.stat().st_mtime_ns
+    except OSError:
+        return None
+    return [npz_count, npz_size, manifest_mtime, run_mtime]
+
+
 def _dataset_entry(d: Path, name: str) -> Dict:
+    # Fast path: skip opening any shards / rebuilding the full index when the
+    # dataset's fingerprint (npz count + total size + manifest/run mtimes) is
+    # unchanged since we last cached the entry. Signature ignores our own
+    # _index.json writes, so it's stable across repeated listings.
+    sig = _dir_signature(d)
+    if sig is not None:
+        try:
+            cached = _read_index(d).get("entry")
+            if (isinstance(cached, dict) and cached.get("_v") == 1
+                    and cached.get("sig") == sig):
+                return {**cached["entry"], "name": name}
+        except OSError:
+            pass
+
+    # Slow path — refresh the shard index and persist a cacheable entry.
     shards = _shard_files(d)
     records = _refresh_shard_index(d, shards)
     m = _read_meta(d, shards, records)
@@ -427,7 +467,7 @@ def _dataset_entry(d: Path, name: str) -> Dict:
         (path.stat().st_mtime for path in dated_files),
         default=d.stat().st_mtime,
     )
-    return {
+    entry = {
         "name": name,
         "games": m["games"] if m else "?",
         "positions": m["positions"] if m else "?",
@@ -437,6 +477,34 @@ def _dataset_entry(d: Path, name: str) -> Dict:
         "config": (m or {}).get("config", {}),
         "kind": (m or {}).get("kind", "unknown"),
     }
+    # Persist for the fast path next time — re-signature AFTER we've done any
+    # index writes so the stored sig reflects the same state we return.
+    try:
+        data = _read_index(d)
+        final_sig = _dir_signature(d)  # after _refresh_shard_index may have written
+        data["entry"] = {
+            "_v": 1,
+            "sig": final_sig,
+            "entry": {k: v for k, v in entry.items() if k != "name"},
+        }
+        _write_index(d, data)
+    except OSError:
+        pass
+    return entry
+
+
+def _iter_dataset_dirs(root: Path):
+    """Yield subdirs under `root` using scandir (much faster than Path.rglob on
+    big trees — scandir returns names + is_dir() from one syscall per parent)."""
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for e in entries:
+        if not e.is_dir(follow_symlinks=False):
+            continue
+        yield Path(e.path)
+        yield from _iter_dataset_dirs(Path(e.path))
 
 
 def list_datasets() -> List[Dict]:
@@ -447,8 +515,9 @@ def list_datasets() -> List[Dict]:
     out: List[Dict] = []
     if not DATA_ROOT.exists():
         return out
-    for d in DATA_ROOT.rglob("*"):
-        if not d.is_dir() or archive_root() == d or archive_root() in d.parents:
+    archive = archive_root()
+    for d in _iter_dataset_dirs(DATA_ROOT):
+        if d == archive or archive in d.parents:
             continue
         if is_dataset_dir(d):
             out.append(_dataset_entry(d, d.relative_to(DATA_ROOT).as_posix()))
