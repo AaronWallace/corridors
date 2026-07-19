@@ -170,12 +170,16 @@ def play_pair_game(a: AgentSpec, b: AgentSpec, game_idx: int,
 
 
 def _pair_game_task(a: AgentSpec, b: AgentSpec, game_idx: int,
-                    swap: bool, device: str, max_plies: int) -> Tuple[str, str, float]:
-    """Worker task. When swap, b plays P1; score is still reported for (a, b)."""
+                    swap: bool, device: str, max_plies: int) -> Tuple[str, str, float, str]:
+    """Worker task. When swap, b plays P1; score is still reported for (a, b).
+    Fourth element is the termination reason (from play_pair_game details)."""
     if swap:
-        score_b = play_pair_game(b, a, game_idx, device, max_plies)
-        return (a.name, b.name, 1.0 - score_b)
-    return (a.name, b.name, play_pair_game(a, b, game_idx, device, max_plies))
+        details = play_pair_game(b, a, game_idx, device, max_plies,
+                                 return_details=True)
+        return (a.name, b.name, 1.0 - details["score"], details["termination"])
+    details = play_pair_game(a, b, game_idx, device, max_plies,
+                             return_details=True)
+    return (a.name, b.name, details["score"], details["termination"])
 
 
 def compute_elo(results: List[Tuple[str, str, float]],
@@ -334,10 +338,18 @@ def run_tournament(
             else:
                 os.environ[v] = val
 
+    # Tally termination breakdown for the summary. Results are 4-tuples
+    # (a, b, score, termination); elo.json's `games` stays 3-tuples for
+    # backward compat with compute_elo and older records.
+    terminations = {"goal": 0, "no legal moves": 0, "threefold": 0, "max plies": 0}
+    for _, _, _, term in results:
+        terminations[term] = terminations.get(term, 0) + 1
+
     data = load_elo()
     prior_games = data.get("games", [])
-    all_games = prior_games + [list(r) for r in results]
-    # Recompute over full history so ratings stabilize across tournaments.
+    # Persist only the (a, b, score) tuple in cross-run history.
+    new_games = [[a, b, score] for (a, b, score, _term) in results]
+    all_games = prior_games + new_games
     ratings = compute_elo([tuple(g) for g in all_games])
     data.update({
         "anchor": CLASSICAL,
@@ -348,7 +360,8 @@ def run_tournament(
             "checkpoints": checkpoints,
             "games_per_pair": games_per_pair,
             "classical_depth": classical_depth,
-            "results": [list(r) for r in results],
+            "results": [list(r) for r in results],  # includes termination
+            "terminations": terminations,
         },
     })
     save_elo(data)

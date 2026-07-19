@@ -230,6 +230,45 @@ def _print_head_to_head(console, results, ratings, modified=None) -> None:
     console.print(t)
 
 
+def _print_termination_summary(console, terminations: dict) -> None:
+    """How did the tournament's games end? Wins (goal reached), losses (opponent
+    boxed in with no legal moves — rare in Corridors), and the two draw kinds:
+    threefold repetition and hitting the max-plies cap. Read the draw split as a
+    training-health signal: lots of max-plies = wandering/underlearned; lots of
+    threefolds = shuffling loops the net doesn't break out of."""
+    if not terminations:
+        return
+    # Terminations use the reason keys from play_pair_game: goal / no legal
+    # moves / threefold / max plies. "goal" is a decisive result for whichever
+    # side reached its goal first; we count it once as a decisive game (not
+    # once per side).
+    decisive = int(terminations.get("goal", 0))
+    blocked = int(terminations.get("no legal moves", 0))
+    threefold = int(terminations.get("threefold", 0))
+    max_plies = int(terminations.get("max plies", 0))
+    total = decisive + blocked + threefold + max_plies
+    if total <= 0:
+        return
+
+    def _pct(n: int) -> str:
+        return f"{100.0 * n / total:5.1f}%"
+
+    t = Table(box=box.SIMPLE, header_style="dim",
+              title="How games ended", title_style="bold")
+    t.add_column("outcome")
+    t.add_column("count", justify="right")
+    t.add_column("share", justify="right")
+    t.add_row("decisive (goal reached)", str(decisive), _pct(decisive))
+    if blocked:
+        t.add_row("decisive (no legal moves)", str(blocked), _pct(blocked))
+    t.add_row(Text("draw — threefold repetition", style="yellow"),
+              str(threefold), _pct(threefold))
+    t.add_row(Text("draw — max plies reached", style="yellow"),
+              str(max_plies), _pct(max_plies))
+    t.add_row(Text("total", style="dim"), str(total), "100.0%")
+    console.print(t)
+
+
 def _tournament() -> None:
     console = _console()
     from . import model as model_mod
@@ -294,10 +333,16 @@ def _tournament() -> None:
                   f"{n_pairs * games_per_pair} games[/dim]")
 
     def on_progress(done: int, total: int, res) -> None:
-        a, b, score = res
-        # ASCII "draw" — the ½ glyph renders as junk (e.g. "_") in terminals or
-        # captures without Unicode font support, making draws look blank.
-        tag = "1-0" if score == 1.0 else ("0-1" if score == 0.0 else "draw ")
+        # res may be (a, b, score) or (a, b, score, termination). Accept both.
+        a, b, score = res[0], res[1], res[2]
+        term = res[3] if len(res) > 3 else ""
+        if score == 1.0:
+            tag = "1-0"
+        elif score == 0.0:
+            tag = "0-1"
+        else:
+            # ASCII draw label; distinguish threefold from max-plies for insight.
+            tag = "3fold" if term == "threefold" else ("maxpl" if term == "max plies" else "draw ")
         console.print(f"  [dim]{done:>4}/{total}[/dim]  {a} vs {b}  {tag}")
 
     try:
@@ -319,6 +364,7 @@ def _tournament() -> None:
         console, data.get("last_run", {}).get("results", []),
         data["ratings"], checkpoint_modified,
     )
+    _print_termination_summary(console, data.get("last_run", {}).get("terminations", {}))
 
 
 # ---------------------------------------------------------------------------
