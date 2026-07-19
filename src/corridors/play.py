@@ -442,27 +442,33 @@ def _auto_workers() -> int:
 
 
 def _prompt_int(label: Text, default: int, lo: int, hi: int) -> int:
+    from .nn.menu import SetupCancelled
     while True:
         raw = Prompt.ask(label, default=str(default))
+        if raw.strip().lower() == "q":
+            raise SetupCancelled
         try:
             v = int(raw)
             if lo <= v <= hi:
                 return v
         except ValueError:
             pass
-        console.print(f"[red]  must be an integer {lo}..{hi}[/red]")
+        console.print(f"[red]  must be an integer {lo}..{hi} (or 'q' to cancel)[/red]")
 
 
 def _prompt_float(label: Text, default: float, lo: float, hi: float) -> float:
+    from .nn.menu import SetupCancelled
     while True:
         raw = Prompt.ask(label, default=f"{default:g}")
+        if raw.strip().lower() == "q":
+            raise SetupCancelled
         try:
             v = float(raw)
             if lo <= v <= hi:
                 return v
         except ValueError:
             pass
-        console.print(f"[red]  must be a number {lo}..{hi}[/red]")
+        console.print(f"[red]  must be a number {lo}..{hi} (or 'q' to cancel)[/red]")
 
 
 def _prompt_col(player: int, endzone_row: int, default: int) -> int:

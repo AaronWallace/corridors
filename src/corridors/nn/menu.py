@@ -28,10 +28,19 @@ def _console():
     return console
 
 
+class SetupCancelled(Exception):
+    """Raised by prompt helpers when the user types 'q' during a setup flow.
+    Setup entry points (self-play, train, full loop, tournament, etc.) catch
+    this and return cleanly to their menu — so users can bail out of any long
+    prompt sequence without Ctrl-C'ing the whole app."""
+
+
 def _prompt_int(label: str, default: int, lo: int, hi: int) -> int:
     console = _console()
     while True:
-        raw = Prompt.ask(f"[dim]{label}[/dim]", default=str(default))
+        raw = Prompt.ask(f"[dim]{label} (q to cancel)[/dim]", default=str(default))
+        if raw.strip().lower() == "q":
+            raise SetupCancelled
         try:
             v = int(raw)
             if lo <= v <= hi:
@@ -44,7 +53,9 @@ def _prompt_int(label: str, default: int, lo: int, hi: int) -> int:
 def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
     console = _console()
     while True:
-        raw = Prompt.ask(f"[dim]{label}[/dim]", default=f"{default:g}")
+        raw = Prompt.ask(f"[dim]{label} (q to cancel)[/dim]", default=f"{default:g}")
+        if raw.strip().lower() == "q":
+            raise SetupCancelled
         try:
             v = float(raw)
             if lo <= v <= hi:
@@ -52,6 +63,15 @@ def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
         except ValueError:
             pass
         console.print(f"[red]  must be a number {lo}..{hi}[/red]")
+
+
+def _prompt_str(label: str, default: str = "") -> str:
+    """Text prompt that respects the 'q'-cancels-setup convention. Use for
+    names/paths so users can back out mid-setup instead of typing through."""
+    raw = Prompt.ask(f"[dim]{label} (q to cancel)[/dim]", default=default).strip()
+    if raw.lower() == "q":
+        raise SetupCancelled
+    return raw
 
 
 def _format_modified(value) -> str:
@@ -673,20 +693,26 @@ def nn_menu() -> None:
             "Choose", choices=["1", "2", "3", "4", "5", "6", "7", "q"],
             default="1",
         )
-        if choice == "1":
-            from .az_menu import az_menu
-            az_menu()
-        elif choice == "2":
-            _generate_data()
-        elif choice == "3":
-            _train_model()
-        elif choice == "4":
-            _tournament()
-        elif choice == "5":
-            _manage_datasets()
-        elif choice == "6":
-            _manage_checkpoints()
-        elif choice == "7":
-            _manage_checkpoints(copy_only=True)
-        elif choice == "q":
+        if choice == "q":
             return
+        # SetupCancelled bubbles up from any 'q' typed inside a setup prompt
+        # sequence — catch it here so we return to this menu instead of
+        # falling out of the app or requiring Ctrl-C.
+        try:
+            if choice == "1":
+                from .az_menu import az_menu
+                az_menu()
+            elif choice == "2":
+                _generate_data()
+            elif choice == "3":
+                _train_model()
+            elif choice == "4":
+                _tournament()
+            elif choice == "5":
+                _manage_datasets()
+            elif choice == "6":
+                _manage_checkpoints()
+            elif choice == "7":
+                _manage_checkpoints(copy_only=True)
+        except SetupCancelled:
+            console.print("[dim]cancelled — back to menu[/dim]")

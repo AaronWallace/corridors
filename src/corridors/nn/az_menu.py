@@ -96,30 +96,9 @@ def _console():
     return console
 
 
-def _prompt_int(label: str, default: int, lo: int, hi: int) -> int:
-    console = _console()
-    while True:
-        raw = Prompt.ask(f"[dim]{label}[/dim]", default=str(default))
-        try:
-            v = int(raw)
-            if lo <= v <= hi:
-                return v
-        except ValueError:
-            pass
-        console.print(f"[red]  must be an integer {lo}..{hi}[/red]")
-
-
-def _prompt_float(label: str, default: float, lo: float, hi: float) -> float:
-    console = _console()
-    while True:
-        raw = Prompt.ask(f"[dim]{label}[/dim]", default=f"{default:g}")
-        try:
-            v = float(raw)
-            if lo <= v <= hi:
-                return v
-        except ValueError:
-            pass
-        console.print(f"[red]  must be a number {lo}..{hi}[/red]")
+# Re-export SetupCancelled + delegate the standard prompt helpers to menu.py
+# so all setup flows across the app share the same 'q'-to-cancel behavior.
+from .menu import SetupCancelled, _prompt_int, _prompt_float  # noqa: F401,E402
 
 
 # ---------------------------------------------------------------------------
@@ -1872,21 +1851,23 @@ def az_menu() -> None:
         choice = Prompt.ask("Choose",
                             choices=["1", "2", "3", "4", "5", "6", "7", "8", "q"],
                             default="3")
-        if choice == "1":
-            _selfplay()
-        elif choice == "2":
-            _train()
-        elif choice == "3":
-            _full_loop()
-        elif choice == "4":
-            _benchmark_selfplay()
-        elif choice == "5":
-            _view_benchmark_history()
-        elif choice == "6":
-            _show_checkpoint_ancestry()
-        elif choice == "7":
-            _benchmark_rmcts()
-        elif choice == "8":
-            _convert_classical_menu()
-        elif choice == "q":
+        # Catch SetupCancelled so 'q' during any setup flow returns to this
+        # menu cleanly instead of falling out of the app (or requiring Ctrl-C).
+        handler = {
+            "1": _selfplay,
+            "2": _train,
+            "3": _full_loop,
+            "4": _benchmark_selfplay,
+            "5": _view_benchmark_history,
+            "6": _show_checkpoint_ancestry,
+            "7": _benchmark_rmcts,
+            "8": _convert_classical_menu,
+        }.get(choice)
+        if choice == "q":
             return
+        if handler is None:
+            continue
+        try:
+            handler()
+        except SetupCancelled:
+            console.print("[dim]cancelled — back to menu[/dim]")
