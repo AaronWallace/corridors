@@ -594,20 +594,19 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
     # contention overtakes hit-rate benefit.
     uses_classical = "classical" in (p1_agent, p2_agent)
     if uses_classical and workers > 1:
-        threshold = 16
-        saved_pt = cfg.get("use_persistent_tt", True)
-        if workers > threshold:
-            default_pt = "n"
-            hint = f"n recommended: contention >> hit rate above {threshold} workers"
-        else:
-            default_pt = "y" if saved_pt else "n"
-            hint = "shares the classical TT (sqlite) across workers"
+        # No baked-in threshold — the "right" answer depends on the workload,
+        # DB size, filesystem, and worker count. Sharing saves classical work
+        # via caching but adds sqlite contention across workers; only you can
+        # measure the tradeoff on your hardware (see the classical-TT
+        # benchmark under Neural network training). Default to the saved value.
+        saved_pt = bool(cfg.get("use_persistent_tt", True))
         raw = Prompt.ask(
             Text.assemble(
                 ("Share persistent transposition table? ", "dim"),
-                (f"[y/n] ({hint})", "dim"),
+                ("[y/n] (y = share sqlite TT across workers; n = per-worker "
+                 "in-memory only. Benchmark first if unsure.)", "dim"),
             ),
-            choices=["y", "n"], default=default_pt,
+            choices=["y", "n"], default=("y" if saved_pt else "n"),
         )
         use_persistent_tt = (raw == "y")
         # Mutate cfg so _spawn_workers (which reads cfg["use_persistent_tt"])

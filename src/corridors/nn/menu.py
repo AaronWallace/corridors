@@ -673,6 +673,117 @@ def _manage_checkpoints(copy_only: bool = False) -> None:
 # Menu loop
 # ---------------------------------------------------------------------------
 
+def _benchmark_persistent_tt() -> None:
+    """Measure classical-solver throughput at several worker counts, with the
+    persistent sqlite TT on vs off, and print a comparison. Directly answers
+    "should I turn the shared TT off on this host?" for a given worker count —
+    no baked-in threshold, real data.
+
+    Total runtime ≈ len(worker_counts) × 2 × duration + startup overhead.
+    """
+    console = _console()
+    from .tt_benchmark import sweep
+    ncpu = os.cpu_count() or 4
+    console.print("\n[bold]Classical persistent-TT benchmark[/bold]")
+    console.print(
+        "[dim]Times classical solver throughput at each worker count with the "
+        "shared sqlite TT on vs off. Higher searches/s and nps/worker are "
+        "better; a big drop with TT on = contention wins over cache hit rate "
+        "at that scale.[/dim]\n"
+    )
+    # Reasonable sweep across the useful range for this host.
+    default_counts = sorted({1, 4, min(16, ncpu), min(64, ncpu),
+                             max(1, ncpu - 1)})
+    counts_raw = Prompt.ask(
+        "[dim]Worker counts to test (comma-separated) "
+        f"(q to cancel)[/dim]",
+        default=",".join(str(c) for c in default_counts),
+    ).strip()
+    if counts_raw.lower() == "q":
+        raise SetupCancelled
+    try:
+        counts = sorted({max(1, min(ncpu, int(x.strip())))
+                         for x in counts_raw.split(",") if x.strip()})
+    except ValueError:
+        console.print("[red]invalid worker list[/red]")
+        return
+    if not counts:
+        console.print("[red]no valid worker counts[/red]")
+        return
+    duration = _prompt_int("Seconds per config (higher = more stable)",
+                           20, 5, 300)
+
+    total_configs = len(counts) * 2
+    est_seconds = total_configs * duration + total_configs * 3  # + spawn overhead
+    console.print(f"[dim]{total_configs} configs × {duration}s ≈ "
+                  f"{est_seconds}s total ({est_seconds // 60}m{est_seconds % 60}s). "
+                  "Ctrl-C to abort.[/dim]\n")
+
+    def on_config(workers, shared, idx, total):
+        tag = "shared" if shared else "per-worker"
+        console.print(f"  [dim][{idx}/{total}][/dim] running: "
+                      f"workers={workers}, TT={tag}…")
+
+    try:
+        results = sweep(counts, duration_s=float(duration),
+                        on_config=on_config)
+    except (KeyboardInterrupt, EOFError):
+        console.print("[dim]benchmark interrupted[/dim]")
+        return
+
+    # Group results by worker count for a clean side-by-side table.
+    grouped: Dict[int, Dict[bool, "BenchResult"]] = {}
+    for r in results:
+        grouped.setdefault(r.workers, {})[r.tt_shared] = r
+
+    t = Table(box=box.SIMPLE, header_style="dim",
+              title="Classical solver throughput (higher = better)",
+              title_style="bold")
+    t.add_column("workers", justify="right")
+    t.add_column("TT shared", justify="right")
+    t.add_column("TT off", justify="right")
+    t.add_column("winner", justify="center")
+    t.add_column("speedup off/on", justify="right")
+    for w in sorted(grouped):
+        pair = grouped[w]
+        on = pair.get(True)
+        off = pair.get(False)
+        on_sps = on.searches_per_sec if on else 0
+        off_sps = off.searches_per_sec if off else 0
+        if on_sps <= 0 and off_sps <= 0:
+            continue
+        winner = "off" if off_sps > on_sps else ("on" if on_sps > off_sps else "tie")
+        color = "green" if winner == "off" else ("yellow" if winner == "on" else "dim")
+        speedup = (off_sps / on_sps) if on_sps > 0 else float("inf")
+        speedup_str = f"{speedup:.2f}×" if speedup < 100 else "∞"
+        t.add_row(
+            str(w),
+            f"{on_sps:.1f}/s ({on.nps_per_worker:,.0f} nps)" if on else "-",
+            f"{off_sps:.1f}/s ({off.nps_per_worker:,.0f} nps)" if off else "-",
+            Text(winner, style=color),
+            speedup_str,
+        )
+    console.print(t)
+
+    # Actionable recommendation based on the largest tested worker count.
+    largest = max(grouped)
+    pair = grouped[largest]
+    if True in pair and False in pair:
+        on_r, off_r = pair[True], pair[False]
+        rec = "off" if off_r.searches_per_sec > on_r.searches_per_sec else "on"
+        console.print(f"\n[bold]At {largest} workers on this host, "
+                      f"persistent TT [/bold][{'green' if rec == 'off' else 'yellow'}]"
+                      f"{rec}[/{'green' if rec == 'off' else 'yellow'}]"
+                      f"[bold] wins.[/bold]")
+        save = Confirm.ask(
+            "[dim]Save this as the default for future runs?[/dim]",
+            default=(rec == "off"),
+        )
+        if save:
+            settings.save(use_persistent_tt=(rec == "on"))
+            console.print(f"[dim]saved use_persistent_tt={rec == 'on'}[/dim]")
+
+
 def nn_menu() -> None:
     console = _console()
     while True:
@@ -686,11 +797,12 @@ def nn_menu() -> None:
         table.add_row("5", "List / manage datasets")
         table.add_row("6", "List / manage checkpoints")
         table.add_row("7", "Copy checkpoint to shared best")
+        table.add_row("8", "Benchmark classical persistent-TT (measure on this host)")
         table.add_row("q", "Back")
         console.print(Panel(table, title="[bold]Neural network training[/bold]",
                             border_style=STYLE_GRID))
         choice = Prompt.ask(
-            "Choose", choices=["1", "2", "3", "4", "5", "6", "7", "q"],
+            "Choose", choices=["1", "2", "3", "4", "5", "6", "7", "8", "q"],
             default="1",
         )
         if choice == "q":
@@ -714,5 +826,7 @@ def nn_menu() -> None:
                 _manage_checkpoints()
             elif choice == "7":
                 _manage_checkpoints(copy_only=True)
+            elif choice == "8":
+                _benchmark_persistent_tt()
         except SetupCancelled:
             console.print("[dim]cancelled — back to menu[/dim]")
