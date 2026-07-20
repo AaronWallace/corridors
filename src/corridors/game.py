@@ -603,6 +603,36 @@ def dist_and_alt(pos: Pos, goal: Pos, blocked_mask: int) -> Tuple[int, int]:
     return d, cnt
 
 
+def dist_and_alt_pair(p1: Pos, g1: Pos, p2: Pos, g2: Pos,
+                      blocked_mask: int) -> Tuple[int, int, int, int]:
+    """dist_and_alt for both players in one call: (d1, alt1, d2, alt2)."""
+    if _ENGINE is not None:
+        return _ENGINE.dist_and_alt_pair(
+            p1[0] * NCOLS + p1[1], g1[0] * NCOLS + g1[1],
+            p2[0] * NCOLS + p2[1], g2[0] * NCOLS + g2[1], blocked_mask)
+    d1, a1 = dist_and_alt(p1, g1, blocked_mask)
+    d2, a2 = dist_and_alt(p2, g2, blocked_mask)
+    return d1, a1, d2, a2
+
+
+def order_moves(moves: List[Move], tt_move: Optional[Move],
+                killers: Tuple[Optional[Move], Optional[Move]],
+                history: Dict[Move, int], me: Pos, my_goal: Pos,
+                opp: Pos, opp_goal: Pos,
+                blocked_mask: int) -> Optional[List[Move]]:
+    """Engine-accelerated solver move ordering; None when the compiled
+    engine is unavailable (caller falls back to the pure Python sort)."""
+    if _ENGINE is None:
+        return None
+    opp_path = _ENGINE.shortest_path_mask(
+        opp[0] * NCOLS + opp[1], opp_goal[0] * NCOLS + opp_goal[1],
+        blocked_mask)
+    return _ENGINE.order_moves(
+        moves, tt_move, killers[0], killers[1], history,
+        me[0] * NCOLS + me[1], my_goal[0] * NCOLS + my_goal[1],
+        opp_path, blocked_mask)
+
+
 def dist_reader(goal: Pos, blocked_mask: int):
     """pos -> distance callable for one (goal, walls) pair; 10_000 = unreachable.
 

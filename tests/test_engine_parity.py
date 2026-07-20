@@ -94,3 +94,26 @@ def test_solver_evaluate_parity(monkeypatch):
         with monkeypatch.context() as mp:
             mp.setattr(game, "_ENGINE", None)
             assert solver.evaluate(state, board) == got
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_solver_move_ordering_parity(seed, monkeypatch):
+    """order_moves must reproduce the pure sorted(key=score) list exactly,
+    including stable tie-breaking, with tt/killer/history signals present."""
+    from corridors import solver
+    rng = random.Random(2000 + seed)
+    for board, state in _playout_positions(seed, max_moves=40):
+        moves = game.legal_moves(state, board)
+        if not moves:
+            continue
+        tt_move = rng.choice(moves) if rng.random() < 0.5 else None
+        k0 = rng.choice(moves) if rng.random() < 0.5 else None
+        k1 = rng.choice(moves) if rng.random() < 0.3 else None
+        history = {mv: rng.randint(1, 900) for mv in
+                   rng.sample(moves, k=min(len(moves), 5))}
+        got = solver._order_moves(state, board, moves, tt_move, (k0, k1),
+                                  history)
+        with monkeypatch.context() as mp:
+            mp.setattr(game, "_ENGINE", None)
+            assert solver._order_moves(
+                state, board, moves, tt_move, (k0, k1), history) == got

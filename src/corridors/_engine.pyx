@@ -494,20 +494,15 @@ def legal_wall_moves(int p1, int p2, int p1_goal, int p2_goal, int turn,
 # Evaluation / solver support
 # ---------------------------------------------------------------------------
 
-def dist_and_alt(int pos, int goal, object mask):
-    """(shortest distance, shortest-path branching count) for pos -> goal.
-
-    Distance is 10_000 when unreachable, matching solver semantics.
-    """
-    cdef uint64_t blk[NW]
-    cdef uint8_t* dist
+cdef void _dist_alt(int pos, int goal, uint64_t* blk,
+                    int* dout, int* aout) noexcept:
+    cdef uint8_t* dist = _dist_cached(goal, blk)
     cdef int k, nb, cnt = 0
-    cdef uint8_t d
-    _split(mask, blk)
-    dist = _dist_cached(goal, blk)
-    d = dist[pos]
+    cdef uint8_t d = dist[pos]
     if d == UNREACH:
-        return 10_000, 0
+        dout[0] = 10_000
+        aout[0] = 0
+        return
     for k in range(_ADJN[pos]):
         nb = _ADJI[pos][k]
         if dist[nb] == UNREACH:
@@ -516,7 +511,143 @@ def dist_and_alt(int pos, int goal, object mask):
             continue
         if dist[nb] == d - 1:
             cnt += 1
-    return <int> d, cnt
+    dout[0] = d
+    aout[0] = cnt
+
+
+def dist_and_alt(int pos, int goal, object mask):
+    """(shortest distance, shortest-path branching count) for pos -> goal.
+
+    Distance is 10_000 when unreachable, matching solver semantics.
+    """
+    cdef uint64_t blk[NW]
+    cdef int d, a
+    _split(mask, blk)
+    _dist_alt(pos, goal, blk, &d, &a)
+    return d, a
+
+
+cdef long long _W_DIST = 100
+cdef long long _W_WALLS = 6
+cdef long long _W_ALT = 2
+
+
+def set_eval_weights(int w_dist, int w_walls, int w_alt):
+    """Register the solver's evaluation weights (solver.py owns the values)."""
+    global _W_DIST, _W_WALLS, _W_ALT
+    _W_DIST = w_dist
+    _W_WALLS = w_walls
+    _W_ALT = w_alt
+
+
+def evaluate(object p1, object p2, object g1, object g2,
+             int walls_diff, int turn, object mask):
+    """Full leaf evaluation from the side to move's perspective.
+
+    Takes the Pos tuples raw (converted here, in C) — this runs once per
+    leaf node, so boundary arithmetic in Python is worth avoiding.
+    """
+    cdef uint64_t blk[NW]
+    cdef int d1, a1, d2, a2
+    cdef int p1i = (<int> p1[0]) * NCOLS + <int> p1[1]
+    cdef int p2i = (<int> p2[0]) * NCOLS + <int> p2[1]
+    cdef int g1i = (<int> g1[0]) * NCOLS + <int> g1[1]
+    cdef int g2i = (<int> g2[0]) * NCOLS + <int> g2[1]
+    cdef long long score
+    _split(mask, blk)
+    _dist_alt(p1i, g1i, blk, &d1, &a1)
+    _dist_alt(p2i, g2i, blk, &d2, &a2)
+    # from P1's perspective: P1 wants small d1, opp large d2
+    score = (_W_DIST * (d2 - d1) + _W_WALLS * walls_diff
+             + _W_ALT * (a1 - a2))
+    return score if turn == 1 else -score
+
+
+def dist_and_alt_pair(int p1, int g1, int p2, int g2, object mask):
+    """dist_and_alt for both players in one boundary crossing:
+    (d1, alt1, d2, alt2)."""
+    cdef uint64_t blk[NW]
+    cdef int d1, a1, d2, a2
+    _split(mask, blk)
+    _dist_alt(p1, g1, blk, &d1, &a1)
+    _dist_alt(p2, g2, blk, &d2, &a2)
+    return d1, a1, d2, a2
+
+
+def order_moves(list moves, object tt_move, object k0, object k1,
+                dict history, int me, int my_goal, object opp_path_mask,
+                object mask):
+    """Solver move ordering: same keys and stable descending order as the
+    pure-Python sorted(key=score) in solver._order_moves.
+
+    Wall indices are derived arithmetically from the (r, c, o) tuple, which
+    relies on ALL_WALLS enumeration order (r, then c, then H before V).
+    """
+    cdef uint64_t blk[NW]
+    cdef uint64_t opm[NW]
+    cdef int n = len(moves)
+    cdef long long packed[160]
+    cdef int order[160]
+    cdef int i, j, idx, r, c, dr, dc, w, tmpi
+    cdef long long key, tmpv
+    cdef uint8_t* dist
+    cdef int my_dist_now, new_d, me_r, me_c
+    cdef object mv, arg, hval
+    if n == 0:
+        return []
+    if n > 160:  # 5 pawn + 128 wall max; guard against future rule changes
+        raise ValueError("too many moves for order_moves")
+    _split(mask, blk)
+    _split(opp_path_mask, opm)
+    dist = _dist_cached(my_goal, blk)
+    my_dist_now = 10_000 if dist[me] == UNREACH else dist[me]
+    me_r = me // NCOLS
+    me_c = me % NCOLS
+    for i in range(n):
+        mv = moves[i]
+        if tt_move is not None and mv == tt_move:
+            key = 10 ** 9
+        elif k0 is not None and mv == k0:
+            key = 10 ** 8
+        elif k1 is not None and mv == k1:
+            key = 10 ** 8 - 1
+        else:
+            hval = history.get(mv)
+            key = 0 if hval is None else <long long> hval
+            arg = mv[1]
+            if mv[0] == "m":
+                # Pawn moves: prefer advancing along shortest path; jumps get
+                # a modest bonus (selective-extension candidates).
+                r = arg[0]
+                c = arg[1]
+                idx = r * NCOLS + c
+                new_d = 10_000 if dist[idx] == UNREACH else dist[idx]
+                key += 500 * (my_dist_now - new_d)
+                dr = r - me_r
+                dc = c - me_c
+                if (dr if dr >= 0 else -dr) + (dc if dc >= 0 else -dc) >= 2:
+                    key += 200
+            else:
+                # Walls: prefer walls that touch opponent's shortest path.
+                r = arg[0]
+                c = arg[1]
+                w = ((r - 1) * 8 + c) * 2 + (1 if arg[2] == "V" else 0)
+                if _hit(_WMASK[w], opm):
+                    key += 300
+        # Unique sort value: descending by key, ties by original position
+        # (replicates Python's stable sort).
+        packed[i] = key * 256 - i
+    for i in range(n):
+        order[i] = i
+    for i in range(1, n):
+        tmpi = order[i]
+        tmpv = packed[tmpi]
+        j = i - 1
+        while j >= 0 and packed[order[j]] < tmpv:
+            order[j + 1] = order[j]
+            j -= 1
+        order[j + 1] = tmpi
+    return [moves[order[i]] for i in range(n)]
 
 
 def dist_table_bytes(int goal, object mask):

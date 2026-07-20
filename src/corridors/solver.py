@@ -266,13 +266,22 @@ WEIGHT_ALT = 2
 
 
 def evaluate(state: State, board: Board) -> int:
+    if game._ENGINE is not None:
+        return game._ENGINE.evaluate(
+            state.p1, state.p2, board.p1_goal, board.p2_goal,
+            state.p1_walls_left - state.p2_walls_left, state.turn,
+            blocked_mask_for(state.walls))
     mask = blocked_mask_for(state.walls)
-    d1, alt1 = game.dist_and_alt(state.p1, board.p1_goal, mask)
-    d2, alt2 = game.dist_and_alt(state.p2, board.p2_goal, mask)
+    d1, alt1, d2, alt2 = game.dist_and_alt_pair(
+        state.p1, board.p1_goal, state.p2, board.p2_goal, mask)
     walls_diff = state.p1_walls_left - state.p2_walls_left
     # from P1's perspective: P1 wants small d1, opp large d2
     score = WEIGHT_DIST * (d2 - d1) + WEIGHT_WALLS * walls_diff + WEIGHT_ALT * (alt1 - alt2)
     return score if state.turn == 1 else -score
+
+
+if game._ENGINE is not None:
+    game._ENGINE.set_eval_weights(WEIGHT_DIST, WEIGHT_WALLS, WEIGHT_ALT)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +301,10 @@ def _order_moves(
     opp = state.p2 if state.turn == 1 else state.p1
     my_goal = board.p1_goal if state.turn == 1 else board.p2_goal
     opp_goal = board.p2_goal if state.turn == 1 else board.p1_goal
+    ordered = game.order_moves(moves, tt_move, killers, history,
+                               me, my_goal, opp, opp_goal, mask)
+    if ordered is not None:
+        return ordered
     my_dist = game.dist_reader(my_goal, mask)
     my_dist_now = my_dist(me)
     opp_path_mask = game.shortest_path_mask(opp, opp_goal, mask)
