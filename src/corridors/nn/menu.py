@@ -367,7 +367,8 @@ def _tournament() -> None:
     games_per_pair = _prompt_int("Games per pair (even)", 4, 2, 200)
     if games_per_pair % 2:
         games_per_pair += 1
-    depth = _prompt_int("Classical depth", 2, 1, 8)
+    depth = _prompt_int("Classical depth (1-30; time_limit usually caps first past ~6)",
+                        2, 1, 30)
     ctime = _prompt_float("Classical time limit (s)", 0.5, 0.0, 60.0)
     max_plies = _prompt_int("Max plies per game (draw if reached)", 120, 20, 2000)
 

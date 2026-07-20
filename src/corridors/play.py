@@ -556,8 +556,9 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
     tiebreak = int(cfg["tiebreak_epsilon"])
     if "classical" in (p1_agent, p2_agent):
         depth = _prompt_int(
-            Text.assemble(("Classical AI ", "dim"), ("depth", "bold"), (" [1-8]", "dim")),
-            default=depth, lo=1, hi=8,
+            Text.assemble(("Classical AI ", "dim"), ("depth", "bold"),
+                          (" [1-30, time_limit usually caps first past ~6]", "dim")),
+            default=depth, lo=1, hi=30,
         )
         time_limit = _prompt_float(
             Text.assemble(("Classical AI ", "dim"), ("time limit", "bold"),
