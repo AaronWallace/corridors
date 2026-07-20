@@ -31,6 +31,29 @@ PYTHON=$(_find_python) || {
 PY_VERSION=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo "Using $PYTHON ($PY_VERSION)"
 
+# The Cython engine needs a C compiler, Python headers, and venv support.
+# On apt-based hosts install whatever is missing (same sudo/root handling as
+# gh_setup.sh). Failure here is non-fatal: the pure-Python engine still works,
+# and the verify step below reports whether the compiled engine is active.
+if command -v apt-get &>/dev/null; then
+    missing=()
+    command -v cc &>/dev/null || missing+=(build-essential)
+    "$PYTHON" -c 'import os, sys, sysconfig
+sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")) else 1)' \
+        || missing+=("python${PY_VERSION}-dev")
+    "$PYTHON" -c 'import ensurepip' &>/dev/null || missing+=("python${PY_VERSION}-venv")
+    if ((${#missing[@]})); then
+        echo "Installing build dependencies: ${missing[*]}"
+        if command -v sudo &>/dev/null && [ "$(id -u)" -ne 0 ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq "${missing[@]}" \
+                || echo "WARNING: apt install failed; Cython engine may not build."
+        else
+            apt-get update -qq && apt-get install -y -qq "${missing[@]}" \
+                || echo "WARNING: apt install failed; Cython engine may not build."
+        fi
+    fi
+fi
+
 # Venv — skip if already in one or running as root (containers)
 if [ -z "${VIRTUAL_ENV:-}" ] && [ "$(id -u)" -ne 0 ]; then
     VENV_DIR=".venv"
