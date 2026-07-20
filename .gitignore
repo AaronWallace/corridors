@@ -6,6 +6,12 @@ __pycache__/
 build/
 dist/
 
+# Cython build artifacts (the .pyx is the source of truth)
+src/corridors/_engine.c
+src/corridors/_engine.html
+*.pyd
+*.so
+
 # Virtual envs
 .venv/
 venv/

@@ -110,6 +110,17 @@ fi
 echo ""
 echo "=== Verifying ==="
 "$PYTHON" -c "from corridors.game import State; print('  game engine: OK')"
+# The Cython engine is optional (pure-Python fallback is identical but much
+# slower). If it failed to build, the most likely cause is a missing C
+# compiler: apt install build-essential, then re-run this script.
+"$PYTHON" -c "
+from corridors import game
+if game._ENGINE is not None:
+    print('  cython engine: OK (compiled hot path active)')
+else:
+    print('  cython engine: MISSING - pure-Python fallback (slow search).')
+    print('                 Install a C compiler (build-essential) and re-run setup.')
+"
 "$PYTHON" -c "from corridors.solver import best_move; print('  solver:      OK')"
 "$PYTHON" -c "from corridors.nn.encoding import encode_state; print('  nn encoding: OK')"
 "$PYTHON" -c "import safetensors; print('  safetensors: OK')"

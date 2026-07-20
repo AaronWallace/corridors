@@ -224,6 +224,13 @@ def has_path(start: Pos, goal: Pos, blocked_mask: int) -> bool:
     a full breadth-first flood. Exact — falls back to exhausting the whole
     reachable component before answering False.
     """
+    if _ENGINE is not None:
+        return _ENGINE.has_path(start[0] * NCOLS + start[1],
+                                goal[0] * NCOLS + goal[1], blocked_mask)
+    return _py_has_path(start, goal, blocked_mask)
+
+
+def _py_has_path(start: Pos, goal: Pos, blocked_mask: int) -> bool:
     if start == goal:
         return True
     neighbors = (_GOAL_ORDERED_NEIGHBORS.get(goal)
@@ -243,6 +250,9 @@ def has_path(start: Pos, goal: Pos, blocked_mask: int) -> bool:
 
 
 def shortest_dist(start: Pos, goal: Pos, blocked_mask: int) -> Optional[int]:
+    if _ENGINE is not None:
+        return _ENGINE.shortest_dist(start[0] * NCOLS + start[1],
+                                     goal[0] * NCOLS + goal[1], blocked_mask)
     return _dist_table_from(goal, blocked_mask).get(start)
 
 
@@ -407,6 +417,16 @@ def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
     if state.winner(board) is not None:
         return []
     blocked = blocked_mask_for(state.walls)
+    if _ENGINE is not None:
+        me, opp, _ = _mover(state)
+        return [_INDEX_POS[i] for i in _ENGINE.legal_pawn_moves(
+            me[0] * NCOLS + me[1], opp[0] * NCOLS + opp[1], state.turn,
+            board.p1_goal[0] * NCOLS + board.p1_goal[1],
+            board.p2_goal[0] * NCOLS + board.p2_goal[1], blocked)]
+    return _py_legal_pawn_moves(state, board, blocked)
+
+
+def _py_legal_pawn_moves(state: State, board: Board, blocked: int) -> List[Pos]:
     if state.turn == 1:
         opp, my_goal = state.p2, board.p1_goal
         opp_own_row, opp_end_row, opp_goal = P2_END_ROW, P1_END_ROW, board.p2_goal
@@ -423,40 +443,12 @@ def legal_pawn_moves(state: State, board: Board) -> List[Pos]:
     return out
 
 
-def _wall_touches_shortest_path(w: Wall, path_edges: FrozenSet[Tuple[Pos, Pos]]) -> bool:
-    e1, e2 = _wall_edges(w)
-    return e1 in path_edges or e2 in path_edges
-
-
-def _shortest_path_edges(pos: Pos, goal: Pos, blocked_mask: int) -> FrozenSet[Tuple[Pos, Pos]]:
-    """Set of edges on ONE shortest path from pos to goal (empty if unreachable)."""
-    dist = _dist_table_from(goal, blocked_mask)
-    if pos not in dist:
-        return frozenset()
-    edges = set()
-    cur = pos
-    while cur != goal:
-        d = dist[cur]
-        for nb in _ADJ[cur]:
-            if nb not in dist:
-                continue
-            bit = _EDGE_BIT.get(_edge_key(cur, nb))
-            if bit is not None and (blocked_mask >> bit) & 1:
-                continue
-            if dist[nb] == d - 1:
-                edges.add(_edge_key(cur, nb))
-                cur = nb
-                break
-        else:
-            break
-    return frozenset(edges)
-
-
 def _shortest_path_mask(pos: Pos, goal: Pos, blocked_mask: int) -> int:
     """Blockable-edge bitmask of ONE shortest path from pos to goal.
 
-    Same path walk as _shortest_path_edges, but returns the edges as a bitmask
-    so wall-touch tests reduce to a single integer AND against _WALL_BITMASK.
+    Greedy walk down the BFS dist table, taking the first neighbor in _ADJ
+    order that is one step closer; the edges come back as a bitmask so
+    wall-touch tests reduce to a single integer AND against _WALL_BITMASK.
     End-zone entry edges have no bit and contribute nothing — walls can never
     touch them anyway.
     """
@@ -488,6 +480,20 @@ def legal_wall_moves(state: State, board: Board) -> List[Wall]:
     _, _, walls_left = _mover(state)
     if walls_left <= 0:
         return []
+    if _ENGINE is not None:
+        placed_bits = 0
+        for w in state.walls:
+            placed_bits |= 1 << _WALL_INDEX[w]
+        return [ALL_WALLS[i] for i in _ENGINE.legal_wall_moves(
+            state.p1[0] * NCOLS + state.p1[1],
+            state.p2[0] * NCOLS + state.p2[1],
+            board.p1_goal[0] * NCOLS + board.p1_goal[1],
+            board.p2_goal[0] * NCOLS + board.p2_goal[1],
+            state.turn, placed_bits, blocked_mask_for(state.walls))]
+    return _py_legal_wall_moves(state, board)
+
+
+def _py_legal_wall_moves(state: State, board: Board) -> List[Wall]:
     placed = state.walls
     m = blocked_mask_for(placed)
     conflicting = set()
@@ -538,14 +544,14 @@ def legal_wall_moves(state: State, board: Board) -> List[Wall]:
             if my_alt_mask is None:
                 my_alt_mask = _shortest_path_mask(me, my_goal, m | my_path_mask)
             if ((not my_alt_mask or wall_mask & my_alt_mask)
-                    and not has_path(me, my_goal, m | wall_mask)):
+                    and not _py_has_path(me, my_goal, m | wall_mask)):
                 continue
         if wall_mask & opp_path_mask:
             if opp_alt_mask is None:
                 opp_alt_mask = _shortest_path_mask(opp, opp_goal,
                                                    m | opp_path_mask)
             if ((not opp_alt_mask or wall_mask & opp_alt_mask)
-                    and not has_path(opp, opp_goal, m | wall_mask)):
+                    and not _py_has_path(opp, opp_goal, m | wall_mask)):
                 continue
         out.append(w)
     return out
@@ -568,6 +574,62 @@ def legal_moves(state: State, board: Board) -> List[Move]:
     return moves
 
 
+# ---------------------------------------------------------------------------
+# Solver support: distance/branching queries that dispatch to the compiled
+# engine when available. Pure fallbacks reuse the cached dict tables.
+# ---------------------------------------------------------------------------
+
+def dist_and_alt(pos: Pos, goal: Pos, blocked_mask: int) -> Tuple[int, int]:
+    """(shortest distance, count of neighbors one step closer to goal).
+
+    Distance is 10_000 when the goal is unreachable.
+    """
+    if _ENGINE is not None:
+        return _ENGINE.dist_and_alt(pos[0] * NCOLS + pos[1],
+                                    goal[0] * NCOLS + goal[1], blocked_mask)
+    dist = _dist_table_from(goal, blocked_mask)
+    d = dist.get(pos)
+    if d is None:
+        return 10_000, 0
+    cnt = 0
+    for nb in _ADJ[pos]:
+        nd = dist.get(nb)
+        if nd is None:
+            continue
+        if _EDGE_MASK[(pos, nb)] & blocked_mask:
+            continue
+        if nd == d - 1:
+            cnt += 1
+    return d, cnt
+
+
+def dist_reader(goal: Pos, blocked_mask: int):
+    """pos -> distance callable for one (goal, walls) pair; 10_000 = unreachable.
+
+    Amortizes the table build across many lookups (move ordering probes every
+    pawn target against the same table).
+    """
+    if _ENGINE is not None:
+        table = _ENGINE.dist_table_bytes(goal[0] * NCOLS + goal[1],
+                                         blocked_mask)
+
+        def _rd(pos: Pos, _t: bytes = table) -> int:
+            d = _t[pos[0] * NCOLS + pos[1]]
+            return 10_000 if d == 255 else d
+        return _rd
+    table = _dist_table_from(goal, blocked_mask)
+    return lambda pos: table.get(pos, 10_000)
+
+
+def shortest_path_mask(pos: Pos, goal: Pos, blocked_mask: int) -> int:
+    """Blockable-edge bitmask of ONE shortest path from pos to goal."""
+    if _ENGINE is not None:
+        return _ENGINE.shortest_path_mask(pos[0] * NCOLS + pos[1],
+                                          goal[0] * NCOLS + goal[1],
+                                          blocked_mask)
+    return _shortest_path_mask(pos, goal, blocked_mask)
+
+
 def apply_move(state: State, move: Move) -> State:
     # Constructs State directly: dataclasses.replace() costs roughly twice as
     # much and this is one of the hottest calls in tree search.
@@ -586,3 +648,48 @@ def apply_move(state: State, move: Move) -> State:
         return State(state.p1, state.p2, state.p1_walls_left,
                      state.p2_walls_left - 1, new_walls, 1)
     raise ValueError(f"bad move: {move}")
+
+
+# ---------------------------------------------------------------------------
+# Compiled engine bootstrap. The optional _engine extension (Cython) holds C
+# reimplementations of the hot functions above; when it is importable, the
+# dispatchers hand off to it, otherwise the pure-Python bodies run. Parity
+# tests exercise both via the _py_* names.
+# ---------------------------------------------------------------------------
+
+_INDEX_POS: Tuple[Pos, ...] = tuple(
+    (i // NCOLS, i % NCOLS) for i in range(NROWS * NCOLS))
+_WALL_INDEX: Dict[Wall, int] = {w: i for i, w in enumerate(ALL_WALLS)}
+
+
+def _engine_tables():
+    """Board topology in the flat index/bitmask form _engine.init expects."""
+    adj_dir = []
+    adj_full = []
+    cell_masks = []
+    for cell in _INDEX_POS:
+        by_dir = []
+        for dr, dc in _DIRS:
+            nb = (cell[0] + dr, cell[1] + dc)
+            m = _EDGE_MASK.get((cell, nb))
+            # m == 0 is a real (unblockable end-zone) edge; None means no edge.
+            by_dir.append((-1, 0) if m is None else (nb[0] * NCOLS + nb[1], m))
+        adj_dir.append(by_dir)
+        adj_full.append([(nb[0] * NCOLS + nb[1], _EDGE_MASK[(cell, nb)])
+                         for nb in _ADJ[cell]])
+        cell_masks.append(_CELL_EDGE_MASK[cell])
+    wall_data = []
+    for w in ALL_WALLS:
+        conf = 0
+        for other in _WALL_CONFLICTS[w]:
+            conf |= 1 << _WALL_INDEX[other]
+        wall_data.append((_WALL_BITMASK[w], conf))
+    return adj_dir, adj_full, cell_masks, wall_data
+
+
+try:
+    from . import _engine as _ENGINE
+except ImportError:
+    _ENGINE = None
+else:
+    _ENGINE.init(*_engine_tables())
