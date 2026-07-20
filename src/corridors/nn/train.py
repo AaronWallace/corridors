@@ -94,6 +94,7 @@ def train(
     on_epoch: Optional[Callable[[EpochInfo], None]] = None,
     on_batch: Optional[Callable[[BatchInfo], None]] = None,
     stop_flag: Optional[Callable[[], bool]] = None,
+    on_load: Optional[Callable[[int, int, str], None]] = None,
 ) -> dict:
     """Train a ValueNet. Returns summary dict. Raises FileNotFoundError if the
     dataset has no shards.
@@ -107,7 +108,8 @@ def train(
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    tensors, outcomes, tt_scores = ds_mod.load_dataset(cfg.dataset)
+    tensors, outcomes, tt_scores = ds_mod.load_dataset(
+        cfg.dataset, on_progress=on_load)
     n = len(tensors)
     idx = np.random.permutation(n)
     n_val = max(1, int(n * cfg.val_frac))
@@ -122,6 +124,9 @@ def train(
 
     train_set = TensorDataset(*_to_tensors(train_idx))
     val_set = TensorDataset(*_to_tensors(val_idx))
+    # The TensorDatasets hold their own (fancy-indexed) copies; free the
+    # loaded originals so steady-state memory during epochs is ~1x, not ~2x.
+    del tensors, outcomes, tt_scores, idx, val_idx, train_idx
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True,
                               drop_last=len(train_set) > cfg.batch_size)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size)
