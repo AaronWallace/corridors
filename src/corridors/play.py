@@ -501,8 +501,8 @@ def _setup(cfg: dict, allow_neural: bool = True) -> AutoplayParams:
     ))
 
     num_games = _prompt_int(
-        Text.assemble(("Number of games ", "dim"), ("[1-10000]", "dim")),
-        default=int(cfg["num_games"]), lo=1, hi=10000,
+        Text.assemble(("Number of games ", "dim"), ("[1-1000000]", "dim")),
+        default=int(cfg["num_games"]), lo=1, hi=1_000_000,
     )
 
     starts_default = str(cfg.get("starts", "random")).lower()

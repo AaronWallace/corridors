@@ -196,9 +196,16 @@ def _train_model() -> None:
     try:
         from rich.live import Live
         from .az_menu import _batch_progress_text
-        with Live(Text("  preparing training split...", style="dim"),
+        with Live(Text("  loading dataset...", style="dim"),
                   console=console, refresh_per_second=4, transient=True) as live:
-            res = train(cfg, on_epoch=on_epoch,
+            def on_load(done: int, total: int, message: str) -> None:
+                # Memory warnings must survive the transient Live display.
+                if message.startswith("WARNING"):
+                    console.print(f"  [yellow]{message}[/yellow]")
+                else:
+                    live.update(Text(f"  {message}", style="dim"))
+
+            res = train(cfg, on_epoch=on_epoch, on_load=on_load,
                         on_batch=lambda info: live.update(_batch_progress_text(info)))
     except (KeyboardInterrupt, EOFError):
         console.print("\n[dim]training interrupted — best checkpoint so far is saved.[/dim]")

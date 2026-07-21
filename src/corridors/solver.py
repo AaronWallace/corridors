@@ -24,7 +24,6 @@ from .game import (
     Pos,
     State,
     Wall,
-    _dist_table_from,
     apply_move,
     blocked_mask_for,
     legal_moves,
@@ -266,39 +265,23 @@ WEIGHT_WALLS = 6
 WEIGHT_ALT = 2
 
 
-def _dist_to_goal(pos: Pos, goal: Pos, mask: int) -> int:
-    return _dist_table_from(goal, mask).get(pos, 10_000)
-
-
-def _alt_count(pos: Pos, goal: Pos, mask: int) -> int:
-    """Number of neighbors that are one step closer to goal (shortest-path branching)."""
-    dist = _dist_table_from(goal, mask)
-    d = dist.get(pos)
-    if d is None:
-        return 0
-    cnt = 0
-    for nb in game._ADJ[pos]:
-        nd = dist.get(nb)
-        if nd is None:
-            continue
-        bit = game._EDGE_BIT.get(game._edge_key(pos, nb))
-        if bit is not None and (mask >> bit) & 1:
-            continue
-        if nd == d - 1:
-            cnt += 1
-    return cnt
-
-
 def evaluate(state: State, board: Board) -> int:
+    if game._ENGINE is not None:
+        return game._ENGINE.evaluate(
+            state.p1, state.p2, board.p1_goal, board.p2_goal,
+            state.p1_walls_left - state.p2_walls_left, state.turn,
+            blocked_mask_for(state.walls))
     mask = blocked_mask_for(state.walls)
-    d1 = _dist_to_goal(state.p1, board.p1_goal, mask)
-    d2 = _dist_to_goal(state.p2, board.p2_goal, mask)
+    d1, alt1, d2, alt2 = game.dist_and_alt_pair(
+        state.p1, board.p1_goal, state.p2, board.p2_goal, mask)
     walls_diff = state.p1_walls_left - state.p2_walls_left
-    alt1 = _alt_count(state.p1, board.p1_goal, mask)
-    alt2 = _alt_count(state.p2, board.p2_goal, mask)
     # from P1's perspective: P1 wants small d1, opp large d2
     score = WEIGHT_DIST * (d2 - d1) + WEIGHT_WALLS * walls_diff + WEIGHT_ALT * (alt1 - alt2)
     return score if state.turn == 1 else -score
+
+
+if game._ENGINE is not None:
+    game._ENGINE.set_eval_weights(WEIGHT_DIST, WEIGHT_WALLS, WEIGHT_ALT)
 
 
 # ---------------------------------------------------------------------------
@@ -318,8 +301,13 @@ def _order_moves(
     opp = state.p2 if state.turn == 1 else state.p1
     my_goal = board.p1_goal if state.turn == 1 else board.p2_goal
     opp_goal = board.p2_goal if state.turn == 1 else board.p1_goal
-    my_dist_now = _dist_to_goal(me, my_goal, mask)
-    opp_path_edges = game._shortest_path_edges(opp, opp_goal, mask)
+    ordered = game.order_moves(moves, tt_move, killers, history,
+                               me, my_goal, opp, opp_goal, mask)
+    if ordered is not None:
+        return ordered
+    my_dist = game.dist_reader(my_goal, mask)
+    my_dist_now = my_dist(me)
+    opp_path_mask = game.shortest_path_mask(opp, opp_goal, mask)
 
     def score(mv: Move) -> int:
         if mv == tt_move:
@@ -332,7 +320,7 @@ def _order_moves(
         if mv[0] == "m":
             # Pawn moves: prefer advancing along shortest path.
             new_pos = mv[1]
-            new_d = _dist_to_goal(new_pos, my_goal, mask)
+            new_d = my_dist(new_pos)
             s += 500 * (my_dist_now - new_d)
             # Jumps get a modest bonus (selective-extension candidates).
             dr = abs(new_pos[0] - me[0])
@@ -342,7 +330,7 @@ def _order_moves(
         else:
             # Walls: prefer walls that touch opponent's shortest path.
             w = mv[1]
-            if game._wall_touches_shortest_path(w, opp_path_edges):
+            if game._WALL_BITMASK[w] & opp_path_mask:
                 s += 300
         return s
 

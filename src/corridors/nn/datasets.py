@@ -658,16 +658,136 @@ def delete_dataset(name: str) -> bool:
     return True
 
 
-def load_dataset(name: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Concatenate all shards. Returns (tensors, outcomes, tt_scores)."""
+def available_memory_bytes() -> Optional[int]:
+    """Best-effort currently-available physical RAM; None when undeterminable."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except ImportError:
+        pass
+    try:  # Linux (MemAvailable accounts for reclaimable page cache)
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    try:  # Windows
+        import ctypes
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_uint64),
+                        ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64),
+                        ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64),
+                        ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+        status = _MemStatus(dwLength=ctypes.sizeof(_MemStatus))
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def _npz_uncompressed_nbytes(path: Path) -> Optional[int]:
+    """Decompressed size of all arrays in an NPZ, from headers only (no data
+    is read, so this is cheap even for multi-GB shards)."""
+    try:
+        total = 0
+        with zipfile.ZipFile(path) as archive:
+            for member in archive.namelist():
+                if not member.endswith(".npy"):
+                    continue
+                with archive.open(member) as stream:
+                    version = np.lib.format.read_magic(stream)
+                    reader = (np.lib.format.read_array_header_1_0
+                              if version == (1, 0)
+                              else np.lib.format.read_array_header_2_0)
+                    shape, _fortran, dtype = reader(stream)
+                total += int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        return total
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+# Loaded arrays are duplicated once more downstream (np.concatenate here, then
+# the train/val fancy-indexed split in train.py), so peak usage is ~2x the
+# array bytes. Budgeting the arrays at 45% of available RAM keeps the peak
+# under ~90% plus headroom for the model, DataLoader, and CUDA host buffers.
+_MEMORY_BUDGET_FRACTION = 0.45
+
+
+def load_dataset(
+    name: str,
+    on_progress=None,
+    memory_budget="auto",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Concatenate all shards. Returns (tensors, outcomes, tt_scores).
+
+    on_progress: optional callable(shards_done, shards_total, message)
+    invoked as shards load, so long loads visibly make progress.
+
+    memory_budget: "auto" (default) caps the loaded arrays at
+    ~45% of currently-available RAM (see _MEMORY_BUDGET_FRACTION); an int
+    caps them at that many bytes; None disables the check. When the
+    header-estimated total exceeds the budget, the OLDEST shards are dropped
+    and only the newest that fit are loaded — the warning goes through
+    on_progress and the load proceeds with the truncated set.
+    """
     d = dataset_dir(name)
     shards = sorted(d.glob("shard_*.npz"))
     if not shards:
         raise FileNotFoundError(f"no shards in {d}")
+
+    def report(done: int, message: str) -> None:
+        if on_progress is not None:
+            on_progress(done, len(shards), message)
+
+    budget: Optional[int] = None
+    if memory_budget == "auto":
+        available = available_memory_bytes()
+        if available is not None:
+            budget = int(available * _MEMORY_BUDGET_FRACTION)
+    elif memory_budget is not None:
+        budget = int(memory_budget)
+
+    est_total: Optional[int] = None
+    if budget is not None:
+        sizes = [_npz_uncompressed_nbytes(s) for s in shards]
+        if all(size is not None for size in sizes):
+            est_total = sum(sizes)
+            if est_total > budget:
+                # Keep the newest shards that fit (at least one, so a single
+                # oversized shard still loads rather than failing empty).
+                keep: List[Path] = []
+                kept_bytes = 0
+                for shard, size in zip(reversed(shards), reversed(sizes)):
+                    if keep and kept_bytes + size > budget:
+                        break
+                    keep.append(shard)
+                    kept_bytes += size
+                keep.reverse()
+                report(0, (
+                    f"WARNING: dataset is ~{est_total / 1e9:.1f} GB decompressed "
+                    f"but the memory budget is ~{budget / 1e9:.1f} GB "
+                    f"(training peaks at ~2x the loaded arrays); "
+                    f"loading newest {len(keep)}/{len(shards)} shards "
+                    f"(~{kept_bytes / 1e9:.1f} GB) and dropping the rest"))
+                shards = keep
+                est_total = kept_bytes
+
+    size_note = f" (~{est_total / 1e9:.1f} GB)" if est_total is not None else ""
+    report(0, f"loading {len(shards)} shards{size_note} from {name}")
     ts, os_, ss = [], [], []
-    for s in shards:
+    for i, s in enumerate(shards, 1):
         with np.load(s) as z:
             ts.append(z["tensors"])
             os_.append(z["outcomes"])
             ss.append(z["tt_scores"])
+        report(i, f"loaded {s.name}  ({i}/{len(shards)}, "
+                  f"{sum(len(t) for t in ts):,} positions)")
+    report(len(shards), "concatenating shards...")
     return np.concatenate(ts), np.concatenate(os_), np.concatenate(ss)
