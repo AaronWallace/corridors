@@ -666,6 +666,9 @@ def _run_one_game(
     board, state = State.start(p1_col=p1_col, p2_col=p2_col, walls=WALLS_PER_PLAYER)
     moves: List[Move] = []
     states_seen: List[State] = [state]
+    # Same anti-loop wiring as the parallel workers: positions seen twice are
+    # passed to the solver so the root avoids completing a threefold draw.
+    seen_hashes: Dict[int, int] = {solver.zobrist(state, board): 1}
     game_t0 = time.monotonic()
 
     banner = Text.assemble(
@@ -704,10 +707,12 @@ def _run_one_game(
         agent = params.p1_agent if state.turn == 1 else params.p2_agent
         if agent == "classical":
             tl = params.time_limit if params.time_limit > 0 else None
+            avoid = {h for h, c in seen_hashes.items() if c >= 2}
             mv, score, stats, _pv = solver.best_move(
                 state, board,
                 max_depth=params.depth, time_limit=tl,
                 tiebreak_epsilon=params.tiebreak_epsilon,
+                avoid_child_hashes=avoid or None,
                 tt=tt, on_iteration=on_iter, verbose=False,
             )
             player_stats.record_turn(stats, score)
@@ -721,6 +726,8 @@ def _run_one_game(
         state = apply_move(state, mv)
         moves.append(mv)
         states_seen.append(state)
+        seen_h = solver.zobrist(state, board)
+        seen_hashes[seen_h] = seen_hashes.get(seen_h, 0) + 1
         plies += 1
         banner = Text.assemble(
             ("last ", "dim"),
