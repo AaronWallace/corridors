@@ -21,7 +21,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import solver
 from .game import NCOLS, State, WALLS_PER_PLAYER, apply_move, is_threefold_repetition
@@ -120,6 +120,11 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
             queue.put(("game_start", cfg.worker_id, game_num, p1_col, p2_col))
 
             states_seen: List[State] = [state]
+            # Position-occurrence counts (zobrist includes side to move).
+            # Positions already seen twice are fed to the solver as
+            # avoid_child_hashes so the root steers away from the threefold
+            # repetition instead of shuffling into a draw.
+            seen_hashes: Dict[int, int] = {solver.zobrist(state, board): 1}
             game_t0 = time.monotonic()
             winner: Optional[int] = None
             plies = 0
@@ -138,10 +143,12 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                 agent_name = cfg.p1_agent if mover == 1 else cfg.p2_agent
                 if agent_name == "classical":
                     tl = cfg.time_limit if cfg.time_limit > 0 else None
+                    avoid = {h for h, c in seen_hashes.items() if c >= 2}
                     mv, score, stats, _pv = solver.best_move(
                         state, board,
                         max_depth=cfg.depth, time_limit=tl,
                         tiebreak_epsilon=cfg.tiebreak_epsilon,
+                        avoid_child_hashes=avoid or None,
                         tt=tt, verbose=False,
                         flush_on_exit=False,
                     )
@@ -161,6 +168,8 @@ def run_worker(cfg: WorkerConfig, queue) -> None:
                     rec_moves.append(move_to_index(mv))
                 state = apply_move(state, mv)
                 states_seen.append(state)
+                h = solver.zobrist(state, board)
+                seen_hashes[h] = seen_hashes.get(h, 0) + 1
                 plies += 1
                 game_nodes += nodes
                 think_time += elapsed

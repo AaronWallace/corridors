@@ -39,7 +39,18 @@ class OptionalBuildExt(build_ext):
         # already been warned about and re-raising here just repeats it.
         self.extensions = [e for e in self.extensions
                            if e.name not in self._failed]
-        super().copy_extensions_to_source()
+        try:
+            super().copy_extensions_to_source()
+        except Exception as exc:  # DistutilsFileError on a locked .pyd
+            # On Windows a loaded .pyd is locked: the compile succeeded but
+            # the copy over the in-use file fails. The existing build stays.
+            print("=" * 72)
+            print("NOTE: compiled engine built, but the existing extension file")
+            print(f"could not be replaced ({exc}).")
+            print("It is likely loaded by a running Python process. The previous")
+            print("build remains in place; re-run after closing corridors sessions")
+            print("if you need the freshly built one.")
+            print("=" * 72)
 
     @staticmethod
     def _warn(exc):
